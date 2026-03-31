@@ -1,0 +1,51 @@
+# Toth et al., ICLR 2020 — mass-spring system
+# Compatible with benchmark_hgn_org.py, benchmark_sho_images.py, hgn_simple.py
+# Usage: python <script>.py --config config.yaml
+
+# ---- Sequence / physics ----
+seq_len: 31
+dt: 0.125
+train_rollout: 30
+spring_constant: 2.0
+mass: 0.5
+max_amplitude: 1.0
+
+# ---- Dataset ----
+n_train: 50000
+n_val: 10000
+
+# ---- Training ----
+batch_size: 16
+n_epochs: 5
+lr: 0.00015
+kl_weight: 0.001
+free_bits: 0.0   # paper uses Lagrange multiplier, not free bits; 0 disables threshold
+grad_clip: 1.0
+log_every: 1
+
+# ---- Rendering ----
+img_size: 32
+blob_sigma: 2.0
+
+# ---- benchmark_hgn_org.py ----
+n_frames: 31        # encode the full sequence (paper design)
+pos_ch: 16
+recon_weight: 1.0
+coord_weight: 0.0
+energy_weight: 0.0
+diag_every: 10
+
+# ---- benchmark_sho_images.py ----
+n_init_frames: 10
+recon_weight: 1.0
+p_init_scale: 3.0
+non_deg_weight: 0.001
+energy_cons_weight: 0.01
+diag_every: 10
+
+# ---- hgn_simple.py ----
+phase_size: 4
+hidden: 8
+n_init: 10
+energy_weight: 0.01
+nondeg_weight: 0.001

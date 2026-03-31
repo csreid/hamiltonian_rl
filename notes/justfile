@@ -1,0 +1,2 @@
+build:
+	pandoc notes.md -t dzslides -s -H style.html --slide-level=2 -o notes.html

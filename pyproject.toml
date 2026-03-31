@@ -1,0 +1,32 @@
+[project]
+name = "hamilton-rl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.0",
+    "drifter-sim",
+    "gymnasium[classic-control]>=0.29",
+    "matplotlib>=3.10.8",
+    "moviepy<2",
+    "pytest>=9.0.2",
+    "pyyaml>=6.0",
+    "ruff>=0.15.5",
+    "setuptools==69.5.1",
+    "stable-baselines3>=2.3",
+    "streamlit>=1.55.0",
+    "tensorboard>=2.20.0",
+    "torchvision>=0.25.0",
+    "tqdm>=4.67.3",
+]
+
+[tool.uv.sources]
+drifter-sim = { path = "../drifter_sim", editable = true }
+
+[tool.ruff]
+line-length = 80
+
+[tool.ruff.format]
+indent-style = "tab"
+

@@ -1,0 +1,19 @@
+img_size: 64
+blob_sigma: 2.5       # pixels
+seq_len: 64           # total frames per trajectory
+n_init_frames: 10     # frames used by LSTM to produce initial (p_0, q_0)
+train_rollout: 20     # rollout steps during training (truncated to save memory)
+dt: 0.1
+n_train: 1000
+n_val: 200
+batch_size: 16        # smaller batch to accommodate longer sequences
+n_epochs: 100
+lr: 1.0e-4
+kl_weight: 1.0e-3
+recon_weight: 1.0
+free_bits: 1.0
+log_every: 10         # epochs
+max_amplitude: 2.0    # used to normalise dot position to canvas
+p_init_scale: 3.0     # scales f_psi p-output weights at init to force early rollout motion
+non_deg_weight: 1.0e-3  # weight for 1/(||dH/dp||^2 + ||dH/dq||^2) penalty
+energy_cons_weight: 1.0e-2  # weight for Var_t(H) along rollout
