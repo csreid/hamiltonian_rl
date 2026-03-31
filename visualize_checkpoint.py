@@ -274,19 +274,34 @@ def _tint_orange(arr: np.ndarray) -> np.ndarray:
     return f.clip(0, 255).astype(np.uint8)
 
 
-def _draw_arrow(img: Image.Image, action: float) -> Image.Image:
-    """Draw a left/right arrow at the bottom of the frame."""
+def _draw_arrow(img: Image.Image, action: float, action_max: float = 1.0) -> Image.Image:
+    """Draw a proportional left/right arrow at the bottom of the frame.
+
+    Arrow length scales linearly with |action| / action_max.
+    A near-zero action produces a small stub; full magnitude fills the lane.
+    """
+    if action == 0.0:
+        return img
+
     img = img.copy()
     draw = ImageDraw.Draw(img)
     W, H = img.size
+
     cy = H - 14
     cx = W // 2
-    half_len = W // 5
+    max_half = W // 5  # half-length at full magnitude
+
+    magnitude = min(abs(action) / max(action_max, 1e-6), 1.0)
+    half_len = max(4, int(max_half * magnitude))  # at least 4 px so it's visible
+
     color = _ARROW_RIGHT if action > 0 else _ARROW_LEFT
     tip_x = cx + half_len if action > 0 else cx - half_len
     tail_x = cx - half_len if action > 0 else cx + half_len
-    draw.line([(tail_x, cy), (tip_x, cy)], fill=color, width=4)
-    head = 8
+
+    shaft_width = max(2, int(4 * magnitude))
+    head = max(5, int(10 * magnitude))
+
+    draw.line([(tail_x, cy), (tip_x, cy)], fill=color, width=shaft_width)
     if action > 0:
         draw.polygon(
             [(tip_x, cy), (tip_x - head, cy - head // 2), (tip_x - head, cy + head // 2)],
@@ -321,8 +336,10 @@ def build_composite_frames(
 
     - Context frames (t < rollout_start): GT only, with a yellow border.
     - Prediction frames: blue-tinted GT blended with orange-tinted model frame.
-    - Action arrow drawn on every frame.
+    - Action arrow drawn on every frame; length proportional to action magnitude.
     """
+    action_max = max(abs(a) for a in actions) if actions else 1.0
+
     composite: list[Image.Image] = []
 
     for t, gt_raw in enumerate(gt_frames):
@@ -347,7 +364,7 @@ def build_composite_frames(
         # Action arrow (use last action for final padding frame)
         action_idx = min(t, len(actions) - 1)
         if actions:
-            frame = _draw_arrow(frame, actions[action_idx])
+            frame = _draw_arrow(frame, actions[action_idx], action_max=action_max)
 
         composite.append(frame)
 
