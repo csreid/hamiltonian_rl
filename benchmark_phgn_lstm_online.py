@@ -7,13 +7,18 @@ Alternates between:
 The replay buffer stores full episodes.  Training samples windows of
 ``seq_len`` frames (+ ``seq_len-1`` actions) and applies three losses:
 
-  recon_loss  — forward rollout from the encoded state vs. subsequent frames
-  state_loss  — decode_state at each forward step vs. true CartPole state
+  recon_loss  — backward rollout from the encoded state vs. reversed frames
+  state_loss  — decode_state at each backward step vs. true CartPole state
   kl_loss     — VAE regularisation
 
-Training signal: LSTM encodes ``anchor_context`` frames to get (q_0, p_0),
-then integrates the port-Hamiltonian forward for seq_len-anchor_context steps,
-supervising decoded frames and states against ground truth at each step.
+The backward rollout covers the full sequence: LSTM encodes seq_len frames to
+get (q, p) at time T, then integrates the port-Hamiltonian backwards seq_len-1
+steps, supervising decoded frames and states at each step.
+
+When ``fwd_weight > 0``, an additional forward-rollout loss is computed: the
+LSTM hidden state after ``anchor_context`` frames is decoded to (q_k, p_k) and
+integrated forward to seq_len-1, with recon and state losses scaled by
+``fwd_weight``.
 
 Warmup: the first ``n_warmup`` episodes are collected with random actions so
 the buffer is populated before MPPI starts planning.  Once the buffer holds
@@ -151,6 +156,7 @@ def train_step(
 	kl_weight: float,
 	recon_weight: float,
 	state_weight: float,
+	fwd_weight: float,
 	anchor_context: int,
 	free_bits: float,
 	grad_clip: float,
@@ -158,9 +164,12 @@ def train_step(
 ) -> tuple[dict[str, float], list[int], np.ndarray]:
 	"""One gradient step with PER IS-weighted loss.
 
-	Encodes anchor_context frames → (q_0, p_0), then rolls the Hamiltonian
-	forward for seq_len-anchor_context steps, supervising decoded frames and
-	states against the ground-truth sequence.
+	Encodes seq_len frames → (q_T, p_T), then rolls backward seq_len-1
+	steps, supervising decoded frames and states against the reversed sequence.
+
+	When fwd_weight > 0 and anchor_context < seq_len, also decodes the LSTM
+	hidden state after anchor_context frames to (q_k, p_k) and rolls the
+	Hamiltonian forward to seq_len-1, supervising against ground truth.
 
 	Returns:
 	    losses:           dict of scalar loss components
@@ -178,6 +187,7 @@ def train_step(
 		states = states.to(device)   # (B, seq_len+1, 4)
 
 	B = frames.shape[0]
+	rollout_steps = seq_len - 1
 	model.train()
 
 	do_state = (
@@ -186,49 +196,100 @@ def train_step(
 		and model.state_decoder is not None
 	)
 
-	# ── Encode anchor_context frames → (q_0, p_0) ─────────────────────────
-	# q_0, p_0 represent the phase-space state after seeing frames 0..anchor_context-1.
-	q, p, kl, *_ = model(frames[:, :anchor_context])
-	kl_per = kl.clamp(min=free_bits)  # (B,)
+	# ── Encode context (seq_len frames) → (q_T, p_T) ──────────────────────
+	use_anchor = fwd_weight > 0 and anchor_context < seq_len - 1
+	if use_anchor:
+		# Capture all intermediate hidden states in a single encoder pass.
+		all_mu, all_logvar = model.encoder.forward_all(frames[:, :seq_len])
+		all_logvar = all_logvar.clamp(-10, 10)
+		mu      = all_mu[:, -1]
+		log_var = all_logvar[:, -1]
+		z       = mu + torch.randn_like(mu) * (0.5 * log_var).exp()
+		s0      = model.f_psi(z)
+		q_T, p_T = model._split(s0)
+		kl_per  = (-0.5 * (1 + log_var - mu.pow(2) - log_var.exp())).sum(dim=[1, 2, 3]).clamp(min=free_bits)
+	else:
+		q_T, p_T, kl, *_ = model(frames[:, :seq_len])
+		kl_per = kl.clamp(min=free_bits)
 
-	# ── Forward rollout: q_0 → q_{seq_len-anchor_context} ─────────────────
-	# pred_frames_list[0] decodes q_0, predicting frames[:, anchor_context-1].
-	# Each subsequent step applies action anchor_context-1+i and predicts
-	# frames[:, anchor_context+i].
-	n_fwd = seq_len - anchor_context
+	# ── Backward reconstruction rollout ───────────────────────────────────
+	q, p = q_T, p_T
 	pred_frames_list = [model.decoder(q)]
-	state_preds      = [model.decode_state(q, p)] if do_state else []
-	for i in range(n_fwd):
-		q, p = model.controlled_step(q, p, actions[:, anchor_context - 1 + i], dt=dt)
+	state_preds = [model.decode_state(q, p)] if do_state else []
+	for i in range(rollout_steps):
+		u_rev = actions[:, seq_len - 2 - i]
+		q, p = model.controlled_step(q, p, u_rev, dt=-dt)
 		pred_frames_list.append(model.decoder(q))
 		if do_state:
 			state_preds.append(model.decode_state(q, p))
 
-	pred_frames   = torch.stack(pred_frames_list, dim=1)        # (B, n_fwd+1, 3, H, W)
-	target_frames = frames[:, anchor_context - 1 : seq_len]     # (B, n_fwd+1, 3, H, W)
+	pred_frames   = torch.stack(pred_frames_list, dim=1)   # (B, seq_len, 3, H, W)
+	target_frames = frames[:, :seq_len].flip(dims=[1])     # (B, seq_len, 3, H, W)
 
-	# Mask padded steps: frame anchor_context-1+t is valid iff its index < lengths[b].
-	t_fwd      = torch.arange(n_fwd + 1, device=device)
-	valid_mask = (anchor_context - 1 + t_fwd < lengths.unsqueeze(1)).float()  # (B, n_fwd+1)
-	denom      = valid_mask.sum(dim=1).clamp(min=1)
+	# Mask out padded time steps.
+	t_bwd      = torch.arange(seq_len, device=device)
+	valid_mask = (t_bwd >= (seq_len - lengths.unsqueeze(1))).float()  # (B, seq_len)
 
-	recon_per = (
-		F.mse_loss(pred_frames, target_frames, reduction="none").mean(dim=[2, 3, 4])
-		* valid_mask
-	).sum(dim=1) / denom  # (B,)
+	recon_elem = F.mse_loss(pred_frames, target_frames, reduction="none").mean(dim=[2, 3, 4])
+	recon_per  = (recon_elem * valid_mask).sum(dim=1) / lengths.float()
 
 	if do_state:
-		pred_states   = torch.stack(state_preds, dim=1)             # (B, n_fwd+1, 4)
-		target_states = states[:, anchor_context - 1 : seq_len]     # (B, n_fwd+1, 4)
-		state_per = (
-			F.mse_loss(pred_states, target_states, reduction="none").mean(dim=2)
-			* valid_mask
-		).sum(dim=1) / denom  # (B,)
+		pred_states   = torch.stack(state_preds, dim=1)        # (B, seq_len, 4)
+		target_states = states[:, :seq_len].flip(dims=[1])     # (B, seq_len, 4)
+		state_elem = F.mse_loss(pred_states, target_states, reduction="none").mean(dim=2)
+		state_per  = (state_elem * valid_mask).sum(dim=1) / lengths.float()
 	else:
 		state_per = torch.zeros(B, device=device)
 
+	# ── Anchor forward rollout from h_{anchor_context} ────────────────────
+	if use_anchor:
+		k    = anchor_context
+		mu_k = all_mu[:, k]          # (B, latent_ch, 4, 4) — posterior mean
+		s_k  = model.f_psi(mu_k)
+		q_k, p_k = model._split(s_k)
+
+		n_fwd = seq_len - 1 - k
+		fwd_pred_list  = [model.decoder(q_k)]
+		fwd_state_list = [model.decode_state(q_k, p_k)] if do_state else []
+		q, p = q_k, p_k
+		for i in range(n_fwd):
+			q, p = model.controlled_step(q, p, actions[:, k + i], dt=dt)
+			fwd_pred_list.append(model.decoder(q))
+			if do_state:
+				fwd_state_list.append(model.decode_state(q, p))
+
+		fwd_pred   = torch.stack(fwd_pred_list, dim=1)  # (B, n_fwd+1, 3, H, W)
+		fwd_target = frames[:, k:seq_len]               # (B, n_fwd+1, 3, H, W)
+
+		t_fwd     = torch.arange(n_fwd + 1, device=device)
+		fwd_valid = (k + t_fwd < lengths.unsqueeze(1)).float()
+		denom_fwd = fwd_valid.sum(dim=1).clamp(min=1)
+
+		anchor_recon_per = (
+			F.mse_loss(fwd_pred, fwd_target, reduction="none").mean(dim=[2, 3, 4])
+			* fwd_valid
+		).sum(dim=1) / denom_fwd
+
+		if do_state:
+			fwd_st_pred = torch.stack(fwd_state_list, dim=1)
+			fwd_st_tgt  = states[:, k:seq_len]
+			anchor_state_per = (
+				F.mse_loss(fwd_st_pred, fwd_st_tgt, reduction="none").mean(dim=2)
+				* fwd_valid
+			).sum(dim=1) / denom_fwd
+		else:
+			anchor_state_per = torch.zeros(B, device=device)
+	else:
+		anchor_recon_per = torch.zeros(B, device=device)
+		anchor_state_per = torch.zeros(B, device=device)
+
 	# ── IS-weighted total loss ─────────────────────────────────────────────
-	per_sample = recon_weight * recon_per + kl_weight * kl_per + state_weight * state_per
+	per_sample = (
+		recon_weight * recon_per
+		+ kl_weight * kl_per
+		+ state_weight * state_per
+		+ fwd_weight * (recon_weight * anchor_recon_per + state_weight * anchor_state_per)
+	)
 
 	loss = (is_weights * per_sample).mean()
 
@@ -244,6 +305,8 @@ def train_step(
 			"recon": recon_per.mean().item(),
 			"kl": kl_per.mean().item(),
 			"state": state_per.mean().item(),
+			"anchor_recon": anchor_recon_per.mean().item(),
+			"anchor_state": anchor_state_per.mean().item(),
 		},
 		sampled_indices,
 		per_sample.detach().cpu().numpy(),
@@ -279,10 +342,75 @@ def evaluate(
 	return float(np.mean(rewards)), rewards, video
 
 
-# ── Forward validation ────────────────────────────────────────────────────────
+# ── Backward rollout visualisation ────────────────────────────────────────────
 
 
 _STATE_LABELS = ["cart_pos (x)", "cart_vel (ẋ)", "pole_angle (θ)", "pole_vel (θ̇)"]
+
+
+def log_backward_rollout(
+	model: ControlledDHGN_LSTM,
+	buffer: PrioritizedEpisodeReplayBuffer,
+	writer: SummaryWriter,
+	seq_len: int,
+	dt: float,
+	device: torch.device,
+	step: int,
+) -> None:
+	"""Replicate the training backward rollout on an eval sample and log
+	ground-truth vs. reconstructed frames and CartPole state trajectories.
+	"""
+	if not buffer.can_sample(seq_len):
+		return
+
+	model.eval()
+	with torch.no_grad():
+		frames, actions, states, *_ = buffer.sample_sequences(1, seq_len=seq_len)
+		frames  = frames.to(device)
+		actions = actions.to(device)
+		if states is not None:
+			states = states.to(device)
+
+		q_T, p_T, *_ = model(frames[:, :seq_len])
+
+		q, p = q_T, p_T
+		pred_frames_list: list[torch.Tensor] = [model.decoder(q)]
+		pred_states_list: list[torch.Tensor] = []
+		if model.state_decoder is not None:
+			pred_states_list.append(model.decode_state(q, p))
+
+		for i in range(seq_len - 1):
+			u_rev = actions[:, seq_len - 2 - i]
+			q, p  = model.controlled_step(q, p, u_rev, dt=-dt)
+			pred_frames_list.append(model.decoder(q))
+			if model.state_decoder is not None:
+				pred_states_list.append(model.decode_state(q, p))
+
+	pred_frames_t = torch.stack(pred_frames_list, dim=1)   # (1, seq_len, 3, H, W)
+	gt_frames     = frames[:, :seq_len].flip(dims=[1])
+
+	writer.add_video("eval/bwd_gt_rollout",   (gt_frames.clamp(0, 1) * 255).to(torch.uint8),   step, fps=15)
+	writer.add_video("eval/bwd_pred_rollout", (pred_frames_t.clamp(0, 1) * 255).to(torch.uint8), step, fps=15)
+
+	if states is not None and pred_states_list:
+		gt_s = states[0, :seq_len].flip(dims=[0]).cpu().numpy()
+		pr_s = torch.cat(pred_states_list, dim=0).cpu().numpy()
+
+		t_range = np.arange(seq_len)
+		fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+		for i, (ax, label) in enumerate(zip(axes.flat, _STATE_LABELS)):
+			ax.plot(t_range, gt_s[:, i], label="ground truth", color="steelblue")
+			ax.plot(t_range, pr_s[:, i], label="predicted",    color="darkorange", linestyle="--")
+			ax.set_title(label)
+			ax.set_xlabel("backward rollout step")
+			ax.legend(fontsize=8)
+		fig.suptitle(f"Backward rollout: GT vs predicted state (iter {step})")
+		fig.tight_layout()
+		writer.add_figure("eval/bwd_state_rollout", fig, step)
+		plt.close(fig)
+
+
+# ── Forward validation ────────────────────────────────────────────────────────
 
 
 def log_forward_validation(
@@ -290,28 +418,28 @@ def log_forward_validation(
 	buffer: PrioritizedEpisodeReplayBuffer,
 	writer: SummaryWriter,
 	seq_len: int,
-	anchor_context: int,
 	dt: float,
 	device: torch.device,
 	step: int,
 ) -> None:
-	"""Mirror the training forward rollout on an eval sample and log
-	ground-truth vs. predicted frames and CartPole state trajectories.
+	"""Validate that the learned dynamics extrapolate forward correctly.
 
-	Encodes anchor_context frames → (q_0, p_0), then rolls forward using
-	all available actions.  A vertical line marks where context ends and
-	true forward prediction begins.
+	Encodes the first seq_len frames to get (q_T, p_T), rolls backward
+	seq_len-1 steps to recover (q_0, p_0), then rolls forward using the
+	recorded actions for the full available horizon and compares decoded
+	states to ground truth.  A vertical line marks where the encoding
+	context ends and true forward prediction begins.
 
-	Tries to sample 2*seq_len transitions for a longer forward horizon.
-	Falls back to any episode of length >= anchor_context if needed.
+	Tries to sample 2*seq_len transitions for a meaningful forward horizon.
+	Falls back to any episode of length >= seq_len if none are long enough.
 	"""
 	long_seq = 2 * seq_len
 
 	if buffer.can_sample(long_seq):
 		frames, actions, states, *_ = buffer.sample_sequences(1, seq_len=long_seq)
-	elif buffer.can_sample(anchor_context):
-		eligible = [ep for ep in buffer._episodes if len(ep) >= anchor_context]
-		ep = random.choice(eligible)
+	elif buffer.can_sample(seq_len):
+		eligible = [ep for ep in buffer._episodes if len(ep) >= seq_len]
+		ep  = random.choice(eligible)
 		end = min(long_seq, len(ep))
 		frames  = ep.frames[: end + 1].unsqueeze(0)
 		actions = ep.actions[:end].unsqueeze(0)
@@ -319,7 +447,7 @@ def log_forward_validation(
 	else:
 		return
 
-	frames = frames.to(device)
+	frames  = frames.to(device)
 	actions = actions.to(device)
 	if states is not None:
 		states = states.to(device)
@@ -328,33 +456,27 @@ def log_forward_validation(
 
 	model.eval()
 	with torch.no_grad():
-		# Encode anchor_context frames → (q_0, p_0)
-		q, p, *_ = model(frames[:, :anchor_context])
+		# 1. Encode first seq_len frames → (q_T, p_T)
+		q_T, p_T, *_ = model(frames[:, :seq_len])
 
-		# Roll forward from q_0 using all available actions
-		pred_frames_list: list[torch.Tensor] = [model.decoder(q)]
+		# 2. Roll backward seq_len-1 steps → (q_0, p_0)
+		q, p = q_T, p_T
+		for i in range(seq_len - 1):
+			u_rev = actions[:, seq_len - 2 - i]
+			q, p  = model.controlled_step(q, p, u_rev, dt=-dt)
+
+		# 3. Roll forward from (q_0, p_0) using all available actions
 		pred_states_list: list[torch.Tensor] = []
 		if model.state_decoder is not None:
 			pred_states_list.append(model.decode_state(q, p))
-		for t in range(anchor_context - 1, total_frames - 1):
+		for t in range(total_frames - 1):
 			q, p = model.controlled_step(q, p, actions[:, t], dt=dt)
-			pred_frames_list.append(model.decoder(q))
 			if model.state_decoder is not None:
 				pred_states_list.append(model.decode_state(q, p))
 
-	n = len(pred_frames_list)
-	pred_frames_t = torch.stack(pred_frames_list, dim=1)   # (1, n, 3, H, W)
-	gt_frames     = frames[:, anchor_context - 1 : anchor_context - 1 + n]
-
-	writer.add_video(
-		"eval/fwd_gt_rollout",   (gt_frames.clamp(0, 1) * 255).to(torch.uint8),   step, fps=15
-	)
-	writer.add_video(
-		"eval/fwd_pred_rollout", (pred_frames_t.clamp(0, 1) * 255).to(torch.uint8), step, fps=15
-	)
-
 	if states is not None and pred_states_list:
-		gt_s = states[0, anchor_context - 1 : anchor_context - 1 + n].cpu().numpy()
+		n    = len(pred_states_list)
+		gt_s = states[0, :n].cpu().numpy()
 		pr_s = torch.cat(pred_states_list, dim=0).cpu().numpy()
 
 		t_range = np.arange(n)
@@ -363,13 +485,13 @@ def log_forward_validation(
 			ax.plot(t_range, gt_s[:, i], label="ground truth", color="steelblue")
 			ax.plot(t_range, pr_s[:, i], label="predicted", color="darkorange", linestyle="--")
 			ax.axvline(
-				seq_len - anchor_context, color="gray", linestyle=":", alpha=0.7,
-				label=f"training horizon end (t={seq_len - anchor_context})"
+				seq_len - 1, color="gray", linestyle=":", alpha=0.7,
+				label=f"context end (t={seq_len - 1})"
 			)
 			ax.set_title(label)
-			ax.set_xlabel("step from context end")
+			ax.set_xlabel("step")
 			ax.legend(fontsize=8)
-		fig.suptitle(f"Forward rollout: GT vs predicted state (iter {step})")
+		fig.suptitle(f"Forward validation: GT vs predicted state (iter {step})")
 		fig.tight_layout()
 		writer.add_figure("eval/fwd_state_rollout", fig, step)
 		plt.close(fig)
@@ -386,9 +508,9 @@ def log_forward_validation(
 @click.option(
 	"--seq-len",
 	type=int,
-	default=16,
+	default=8,
 	show_default=True,
-	help="Total frames sampled per training window (context + forward rollout).",
+	help="Frames fed to the LSTM encoder; backward rollout covers seq_len-1 steps.",
 )
 @click.option("--dt", type=float, default=0.05, show_default=True)
 @click.option(
@@ -453,7 +575,14 @@ def log_forward_validation(
 	type=float,
 	default=0.5,
 	show_default=True,
-	help="Weight for state supervision along the forward rollout.",
+	help="Weight for state supervision along the backward rollout trajectory.",
+)
+@click.option(
+	"--fwd-weight",
+	type=float,
+	default=0.5,
+	show_default=True,
+	help="Weight for anchor forward-rollout supervision loss.",
 )
 @click.option(
 	"--anchor-context",
@@ -461,9 +590,9 @@ def log_forward_validation(
 	default=3,
 	show_default=True,
 	help=(
-		"Number of context frames fed to the LSTM encoder. "
-		"The hidden state after these frames is decoded to (q_0, p_0) and "
-		"integrated forward for seq_len-anchor_context steps."
+		"Number of context frames for the forward-rollout anchor. "
+		"The LSTM hidden state after this many frames is decoded to phase space "
+		"and integrated forward to seq_len-1."
 	),
 )
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
@@ -538,6 +667,7 @@ def main(
 	kl_weight,
 	recon_weight,
 	state_weight,
+	fwd_weight,
 	anchor_context,
 	free_bits,
 	grad_clip,
@@ -553,13 +683,12 @@ def main(
 	log_every,
 	checkpoint_every,
 ):
+	assert seq_len >= 2, "--seq-len must be >= 2"
 	assert img_size % 8 == 0, "--img-size must be a multiple of 8"
-	assert anchor_context >= 1, "--anchor-context must be >= 1"
-	assert anchor_context < seq_len, "--anchor-context must be < --seq-len"
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	print(f"Device: {device}")
-	print(f"Context frames: {anchor_context}  →  forward rollout: {seq_len - anchor_context} steps")
+	print(f"Sequence length: {seq_len}  (backward rollout: {seq_len - 1} steps)")
 
 	writer = SummaryWriter(comment="_phgn_lstm_online")
 	run_dir = make_run_dir("phgn_lstm_online")
@@ -670,7 +799,7 @@ def main(
 		if len(buffer) == 0:
 			continue
 
-		losses = {k: 0.0 for k in ("loss", "recon", "kl", "state")}
+		losses = {k: 0.0 for k in ("loss", "recon", "kl", "state", "anchor_recon", "anchor_state")}
 		for _ in range(train_steps_per_iter):
 			step_losses, ep_indices, per_sample_losses = train_step(
 				model,
@@ -682,6 +811,7 @@ def main(
 				kl_weight=kl_weight,
 				recon_weight=recon_weight,
 				state_weight=state_weight,
+				fwd_weight=fwd_weight,
 				anchor_context=anchor_context,
 				free_bits=free_bits,
 				grad_clip=grad_clip,
@@ -740,12 +870,20 @@ def main(
 				iteration,
 			)
 			writer.add_video("eval/rollout", video, iteration, fps=30)
+			log_backward_rollout(
+				model,
+				buffer,
+				writer,
+				seq_len=seq_len,
+				dt=dt,
+				device=device,
+				step=iteration,
+			)
 			log_forward_validation(
 				model,
 				buffer,
 				writer,
 				seq_len=seq_len,
-				anchor_context=anchor_context,
 				dt=dt,
 				device=device,
 				step=iteration,
