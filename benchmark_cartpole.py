@@ -32,27 +32,31 @@ pixel observations resized to 32×32.  Results are logged to TensorBoard.
 from __future__ import annotations
 
 import random
-from collections import deque
 
 import click
 import gymnasium as gym
-import gymnasium.envs.classic_control.cartpole as _cartpole_mod
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
-from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from data.cartpole import (  # noqa: F401 — re-exported for backward compat
+    CartPoleDataset,
+    CartPolePixelEnv,
+    ContinuousCartPoleEnv,
+    FrameBuffer,
+    SampleEfficiencyCallback,
+    SmallCNN,
+    _pd_action,
+    collect_data,
+    collect_val_trajectories,
+    preprocess_frame,
+)
 from diag_common import log_gt_pred_video
-
 from mppi import MPPI
 from phgn import ControlledDissipativeHGN
 
@@ -61,703 +65,359 @@ _CART_X_LIMIT = 2.4
 _POLE_THETA_LIMIT = 0.2094  # 12 degrees in radians
 
 
-# ── Image preprocessing ──────────────────────────────────────────────────────
-
-
-def preprocess_frame(frame: np.ndarray, img_size: int = 32) -> torch.Tensor:
-	"""Convert a raw CartPole RGB frame to a normalised (3, H, W) tensor.
-
-	Args:
-	    frame:    (H, W, 3) uint8 numpy array from env.render()
-	    img_size: target spatial size (square)
-
-	Returns:
-	    (3, img_size, img_size) float32 in [0, 1]
-	"""
-	t = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-	return TF.resize(t, [img_size, img_size], antialias=True)
-
-
-class FrameBuffer:
-	"""Fixed-length deque of preprocessed frames.
-
-	Initialised by repeating the first frame n_frames times so that
-	the context is always full even at episode start.
-	"""
-
-	def __init__(self, n_frames: int, img_size: int):
-		self.n_frames = n_frames
-		self.img_size = img_size
-		self._buf: deque[torch.Tensor] = deque(maxlen=n_frames)
-
-	def reset(self, frame: np.ndarray) -> None:
-		processed = preprocess_frame(frame, self.img_size)
-		self._buf.clear()
-		for _ in range(self.n_frames):
-			self._buf.append(processed)
-
-	def push(self, frame: np.ndarray) -> None:
-		self._buf.append(preprocess_frame(frame, self.img_size))
-
-	def get(self) -> torch.Tensor:
-		"""Return (n_frames, 3, img_size, img_size) stacked tensor."""
-		return torch.stack(list(self._buf))
-
-
-# ── Continuous-force CartPole ─────────────────────────────────────────────────
-
-
-class ContinuousCartPoleEnv(_cartpole_mod.CartPoleEnv):
-	"""CartPole-v1 with a continuous action in [-1, 1].
-
-	action=1 applies full force rightward; action=-1 applies full force
-	leftward; intermediate values scale linearly.
-	"""
-
-	def __init__(self, **kwargs):
-		super().__init__(**kwargs)
-		self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-
-	def step(self, action):
-		assert self.state is not None, "Call reset before using step method."
-		x, x_dot, theta, theta_dot = self.state
-		force = float(np.asarray(action).flat[0]) * self.force_mag
-		costheta = np.cos(theta)
-		sintheta = np.sin(theta)
-		temp = (force + self.polemass_length * np.square(theta_dot) * sintheta) / self.total_mass
-		thetaacc = (self.gravity * sintheta - costheta * temp) / (
-			self.length * (4.0 / 3.0 - self.masspole * np.square(costheta) / self.total_mass)
-		)
-		xacc = temp - self.polemass_length * thetaacc * costheta / self.total_mass
-		if self.kinematics_integrator == "euler":
-			x = x + self.tau * x_dot
-			x_dot = x_dot + self.tau * xacc
-			theta = theta + self.tau * theta_dot
-			theta_dot = theta_dot + self.tau * thetaacc
-		else:
-			x_dot = x_dot + self.tau * xacc
-			x = x + self.tau * x_dot
-			theta_dot = theta_dot + self.tau * thetaacc
-			theta = theta + self.tau * theta_dot
-		self.state = np.array((x, x_dot, theta, theta_dot), dtype=np.float64)
-		terminated = bool(
-			x < -self.x_threshold
-			or x > self.x_threshold
-			or theta < -self.theta_threshold_radians
-			or theta > self.theta_threshold_radians
-		)
-		if not terminated:
-			reward = 0.0 if self._sutton_barto_reward else 1.0
-		elif self.steps_beyond_terminated is None:
-			self.steps_beyond_terminated = 0
-			reward = -1.0 if self._sutton_barto_reward else 1.0
-		else:
-			self.steps_beyond_terminated += 1
-			reward = -1.0 if self._sutton_barto_reward else 0.0
-		if self.render_mode == "human":
-			self.render()
-		return np.array(self.state, dtype=np.float32), reward, terminated, False, {}
-
-
-# ── CartPole pixel environment wrapper ───────────────────────────────────────
-
-
-class CartPolePixelEnv(gym.Wrapper):
-	"""CartPole-v1 with (3, img_size, img_size) uint8 pixel observations.
-
-	SB3 expects channels-first (C, H, W) uint8 images in the observation
-	space.  The custom SmallCNN feature extractor below handles 32×32
-	inputs (the default NatureCNN requires ≥84px).
-	"""
-
-	def __init__(self, img_size: int = 32):
-		env = ContinuousCartPoleEnv(render_mode="rgb_array")
-		super().__init__(env)
-		self.img_size = img_size
-		self.observation_space = spaces.Box(
-			low=0,
-			high=255,
-			shape=(3, img_size, img_size),
-			dtype=np.uint8,
-		)
-
-	def _obs(self) -> np.ndarray:
-		frame = self.env.render()  # (H, W, 3) uint8
-		t = preprocess_frame(frame, self.img_size)
-		return (t * 255).byte().numpy()  # (3, H, W) uint8
-
-	def reset(self, **kwargs):
-		self.env.reset(**kwargs)
-		return self._obs(), {}
-
-	def step(self, action):
-		_, reward, terminated, truncated, info = self.env.step(action)
-		return self._obs(), reward, terminated, truncated, info
-
-
-class SmallCNN(BaseFeaturesExtractor):
-	"""Minimal CNN feature extractor for 32×32 pixel input.
-
-	Three stride-2 convolutions: 32→16→8→4, then flatten + linear.
-	Compatible with SB3 CnnPolicy when passed as features_extractor_class.
-	"""
-
-	def __init__(self, observation_space: spaces.Box, features_dim: int = 256):
-		super().__init__(observation_space, features_dim)
-		in_ch = observation_space.shape[0]
-		self.cnn = nn.Sequential(
-			nn.Conv2d(in_ch, 32, 3, stride=2, padding=1),
-			nn.ReLU(),
-			nn.Conv2d(32, 64, 3, stride=2, padding=1),
-			nn.ReLU(),
-			nn.Conv2d(64, 64, 3, stride=2, padding=1),
-			nn.ReLU(),
-			nn.Flatten(),
-		)
-		with torch.no_grad():
-			n_flat = self.cnn(torch.zeros(1, *observation_space.shape)).shape[1]
-		self.linear = nn.Sequential(nn.Linear(n_flat, features_dim), nn.ReLU())
-
-	def forward(self, obs: torch.Tensor) -> torch.Tensor:
-		return self.linear(self.cnn(obs.float() / 255.0))
-
-
-# ── Data collection ──────────────────────────────────────────────────────────
-
-
-def _pd_action(state: np.ndarray) -> int:
-	"""Simple pole-angle + angular-velocity PD controller."""
-	_, _, theta, theta_dot = state
-	return 1 if (theta + 0.3 * theta_dot) > 0 else 0
-
-
-def collect_data(
-	n_episodes: int,
-	n_frames: int,
-	img_size: int,
-	scripted_fraction: float = 0.5,
-	max_steps: int = 500,
-) -> list[tuple]:
-	"""Collect CartPole transitions for world-model training.
-
-	Each transition is a tuple:
-	    (context_frames, action_float, next_frame, true_state)
-
-	context_frames : (n_frames, 3, img_size, img_size) float32 [0,1]
-	action_float   : float — encoded as −1.0 (left) or +1.0 (right)
-	next_frame     : (3, img_size, img_size) float32 [0,1]
-	true_state     : (4,) float32 — (x, x_dot, theta, theta_dot)
-
-	Half the episodes use the PD controller; the rest use a random policy.
-	This provides a mix of long (balanced) and short (falling) trajectories.
-	"""
-	env = gym.make("CartPole-v1", render_mode="rgb_array")
-	buf = FrameBuffer(n_frames, img_size)
-	transitions: list[tuple] = []
-
-	for ep in tqdm(range(n_episodes), desc="Collecting data"):
-		use_pd = ep < int(n_episodes * scripted_fraction)
-		_, _ = env.reset()
-		frame = env.render()
-		buf.reset(frame)
-
-		for _ in range(max_steps):
-			true_state = np.array(env.unwrapped.state, dtype=np.float32)
-			context = buf.get()  # (n_frames, 3, H, W)
-
-			action = (
-				_pd_action(true_state) if use_pd else env.action_space.sample()
-			)
-			action_float = float(2 * action - 1)  # 0 → -1.0, 1 → +1.0
-
-			_, _, terminated, truncated, _ = env.step(action)
-			next_frame_raw = env.render()
-			next_frame = preprocess_frame(next_frame_raw, img_size)
-			next_state = np.array(env.unwrapped.state, dtype=np.float32)
-
-			transitions.append((context, action_float, next_frame, next_state))
-			buf.push(next_frame_raw)
-
-			if terminated or truncated:
-				break
-
-	env.close()
-	print(
-		f"  Collected {len(transitions)} transitions from {n_episodes} episodes."
-	)
-	return transitions
-
-
-def collect_val_trajectories(
-	n_episodes: int,
-	n_frames: int,
-	img_size: int,
-	max_steps: int = 500,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-	"""Collect full episode trajectories for visualisation.
-
-	Returns a list of (frames, actions) tuples, one per episode:
-	    frames  : (T+1, 3, img_size, img_size) float32 [0,1] — all frames
-	              including the initial context frames and every subsequent frame
-	    actions : (T,)  float32 — action taken at each step (−1.0 or +1.0)
-
-	Uses the PD controller so episodes are long enough to be interesting.
-	"""
-	env = gym.make("CartPole-v1", render_mode="rgb_array")
-	trajectories = []
-
-	for _ in tqdm(range(n_episodes), desc="Val trajectories"):
-		_, _ = env.reset()
-		frame = env.render()
-		frames = [preprocess_frame(frame, img_size)]
-		actions = []
-
-		for _ in range(max_steps):
-			true_state = np.array(env.unwrapped.state, dtype=np.float32)
-			action = _pd_action(true_state)
-			action_float = float(2 * action - 1)
-
-			_, _, terminated, truncated, _ = env.step(action)
-			frames.append(preprocess_frame(env.render(), img_size))
-			actions.append(action_float)
-
-			if terminated or truncated:
-				break
-
-		trajectories.append(
-			(
-				torch.stack(frames),  # (T+1, 3, H, W)
-				torch.tensor(actions, dtype=torch.float32),  # (T,)
-			)
-		)
-
-	env.close()
-	return trajectories
-
-
-# ── Dataset ──────────────────────────────────────────────────────────────────
-
-
-class CartPoleDataset(Dataset):
-	def __init__(self, transitions: list[tuple]):
-		ctx = torch.stack([t[0] for t in transitions])  # (N, T, 3, H, W)
-		acts = torch.tensor(
-			[t[1] for t in transitions], dtype=torch.float32
-		).unsqueeze(-1)  # (N, 1)
-		nxt = torch.stack([t[2] for t in transitions])  # (N, 3, H, W)
-		states = torch.from_numpy(
-			np.stack([t[3] for t in transitions])
-		)  # (N, 4)
-		self.ctx = ctx
-		self.acts = acts
-		self.nxt = nxt
-		self.states = states
-
-	def __len__(self):
-		return len(self.ctx)
-
-	def __getitem__(self, idx):
-		return self.ctx[idx], self.acts[idx], self.nxt[idx], self.states[idx]
-
-
 # ── World model training ──────────────────────────────────────────────────────
 
 
 def train_world_model(
-	model: ControlledDissipativeHGN,
-	dataset: CartPoleDataset,
-	writer: SummaryWriter,
-	n_epochs: int = 30,
-	batch_size: int = 32,
-	lr: float = 1e-4,
-	kl_weight: float = 1e-3,
-	recon_weight: float = 1.0,
-	state_weight: float = 0.1,
-	free_bits: float = 0.5,
-	grad_clip: float = 1.0,
-	device: torch.device = torch.device("cpu"),
+    model: ControlledDissipativeHGN,
+    dataset: CartPoleDataset,
+    writer: SummaryWriter,
+    n_epochs: int = 30,
+    batch_size: int = 32,
+    lr: float = 1e-4,
+    kl_weight: float = 1e-3,
+    recon_weight: float = 1.0,
+    state_weight: float = 0.1,
+    free_bits: float = 0.5,
+    grad_clip: float = 1.0,
+    device: torch.device = torch.device("cpu"),
 ) -> None:
-	"""Train the PHGN world model on collected CartPole transitions.
+    """Train the PHGN world model on collected CartPole transitions.
 
-	One-step prediction loss:
-	    L = recon_weight  · MSE(pred_frame, actual_next_frame)
-	      + kl_weight     · KL(posterior ‖ N(0,I))
-	      + state_weight  · MSE(decoded_state, true_cartpole_state)
-	"""
-	loader = DataLoader(
-		dataset, batch_size=batch_size, shuffle=True, drop_last=True
-	)
-	optimiser = torch.optim.Adam(model.parameters(), lr=lr)
-	global_step = 0
+    One-step prediction loss:
+        L = recon_weight  · MSE(pred_frame, actual_next_frame)
+          + kl_weight     · KL(posterior ‖ N(0,I))
+          + state_weight  · MSE(decoded_state, true_cartpole_state)
+    """
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, drop_last=True
+    )
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+    global_step = 0
 
-	for epoch in (bar := tqdm(range(n_epochs), desc="World model")):
-		ep_recon = ep_kl = ep_state = ep_total = 0.0
+    for epoch in (bar := tqdm(range(n_epochs), desc="World model")):
+        ep_recon = ep_kl = ep_state = ep_total = 0.0
 
-		for ctx, acts, nxt, states in loader:
-			ctx = ctx.to(device)  # (B, T, 3, H, W)
-			acts = acts.to(device)  # (B, 1)
-			nxt = nxt.to(device)  # (B, 3, H, W)
-			states = states.to(device)  # (B, 4)
+        for ctx, acts, nxt, states in loader:
+            ctx = ctx.to(device)  # (B, T, 3, H, W)
+            acts = acts.to(device)  # (B, 1)
+            nxt = nxt.to(device)  # (B, 3, H, W)
+            states = states.to(device)  # (B, 4)
 
-			# Encode context → (q0, p0)
-			q0, p0, kl, mu, log_var = model(ctx)
-			kl_loss = kl.clamp(min=free_bits).mean()
+            # Encode context → (q0, p0)
+            q0, p0, kl, mu, log_var = model(ctx)
+            kl_loss = kl.clamp(min=free_bits).mean()
 
-			# One controlled step with recorded action
-			q1, p1 = model.controlled_step(q0, p0, acts)
+            # One controlled step with recorded action
+            q1, p1 = model.controlled_step(q0, p0, acts)
 
-			# Pixel reconstruction
-			pred_frame = model.decoder(q1)
-			recon_loss = F.mse_loss(pred_frame, nxt)
+            # Pixel reconstruction
+            pred_frame = model.decoder(q1)
+            recon_loss = F.mse_loss(pred_frame, nxt)
 
-			# State prediction (if decoder present)
-			if model.state_decoder is not None:
-				pred_state = model.decode_state(q1, p1)
-				state_loss = F.mse_loss(pred_state, states)
-			else:
-				state_loss = torch.tensor(0.0, device=device)
+            # State prediction (if decoder present)
+            if model.state_decoder is not None:
+                pred_state = model.decode_state(q1, p1)
+                state_loss = F.mse_loss(pred_state, states)
+            else:
+                state_loss = torch.tensor(0.0, device=device)
 
-			loss = (
-				recon_weight * recon_loss
-				+ kl_weight * kl_loss
-				+ state_weight * state_loss
-			)
+            loss = (
+                recon_weight * recon_loss
+                + kl_weight * kl_loss
+                + state_weight * state_loss
+            )
 
-			optimiser.zero_grad()
-			loss.backward()
-			if grad_clip > 0:
-				torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-			optimiser.step()
+            optimiser.zero_grad()
+            loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimiser.step()
 
-			writer.add_scalar("wm/recon_loss", recon_loss.item(), global_step)
-			writer.add_scalar("wm/kl_loss", kl_loss.item(), global_step)
-			writer.add_scalar("wm/state_loss", state_loss.item(), global_step)
-			writer.add_scalar("wm/total_loss", loss.item(), global_step)
-			global_step += 1
+            writer.add_scalar("wm/recon_loss", recon_loss.item(), global_step)
+            writer.add_scalar("wm/kl_loss", kl_loss.item(), global_step)
+            writer.add_scalar("wm/state_loss", state_loss.item(), global_step)
+            writer.add_scalar("wm/total_loss", loss.item(), global_step)
+            global_step += 1
 
-			ep_recon += recon_loss.item()
-			ep_kl += kl_loss.item()
-			ep_state += state_loss.item()
-			ep_total += loss.item()
+            ep_recon += recon_loss.item()
+            ep_kl += kl_loss.item()
+            ep_state += state_loss.item()
+            ep_total += loss.item()
 
-		n = len(loader)
-		bar.set_postfix(
-			loss=f"{ep_total / n:.4f}",
-			recon=f"{ep_recon / n:.4f}",
-			state=f"{ep_state / n:.4f}",
-		)
+        n = len(loader)
+        bar.set_postfix(
+            loss=f"{ep_total / n:.4f}",
+            recon=f"{ep_recon / n:.4f}",
+            state=f"{ep_state / n:.4f}",
+        )
 
 
 # ── MPPI cost function ────────────────────────────────────────────────────────
 
 
 def make_cartpole_cost(model: ControlledDissipativeHGN, device: torch.device):
-	"""Return an MPPI cost function for CartPole balancing.
+    """Return an MPPI cost function for CartPole balancing.
 
-	Uses model.decode_state to convert each imagined latent state to
-	(x, ẋ, θ, θ̇) and accumulates:
-	    • soft cost: θ² + 0.1 x²   (penalise leaning and off-centre)
-	    • hard cost: 100 · 1[failed]  (penalise predicted failure)
+    Uses model.decode_state to convert each imagined latent state to
+    (x, ẋ, θ, θ̇) and accumulates:
+        • soft cost: θ² + 0.1 x²   (penalise leaning and off-centre)
+        • hard cost: 100 · 1[failed]  (penalise predicted failure)
 
-	Args:
-	    model:  ControlledDissipativeHGN with obs_state_dim=4
-	    device: torch device
+    Args:
+        model:  ControlledDissipativeHGN with obs_state_dim=4
+        device: torch device
 
-	Returns:
-	    cost_fn: callable(qs, ps) → (K,) accumulated costs
-	"""
+    Returns:
+        cost_fn: callable(qs, ps) → (K,) accumulated costs
+    """
 
-	def cost_fn(qs, ps):
-		K = qs[0].shape[0]
-		costs = torch.zeros(K, device=device)
-		for q, p in zip(qs[1:], ps[1:]):  # skip the initial (t=0) state
-			state = model.decode_state(q, p)  # (K, 4)
-			x = state[:, 0]
-			theta = state[:, 2]
-			step_cost = theta.pow(2) + 0.1 * x.pow(2)
-			failed = (x.abs() > _CART_X_LIMIT) | (
-				theta.abs() > _POLE_THETA_LIMIT
-			)
-			costs += step_cost + 100.0 * failed.float()
-		return costs
+    def cost_fn(qs, ps):
+        K = qs[0].shape[0]
+        costs = torch.zeros(K, device=device)
+        for q, p in zip(qs[1:], ps[1:]):  # skip the initial (t=0) state
+            state = model.decode_state(q, p)  # (K, 4)
+            x = state[:, 0]
+            theta = state[:, 2]
+            step_cost = theta.pow(2) + 0.1 * x.pow(2)
+            failed = (x.abs() > _CART_X_LIMIT) | (
+                theta.abs() > _POLE_THETA_LIMIT
+            )
+            costs += step_cost + 100.0 * failed.float()
+        return costs
 
-	return cost_fn
-
-
-# ── PPO periodic eval callback ───────────────────────────────────────────────
-
-
-class SampleEfficiencyCallback(BaseCallback):
-	"""Evaluate PPO at regular intervals and log mean reward vs env steps.
-
-	Logs to the shared ``comparison/mean_reward`` scalar so that the PPO
-	learning curve and the MPPI single data-point appear on the same
-	TensorBoard panel with env steps on the x-axis.
-	"""
-
-	def __init__(
-		self,
-		eval_env: CartPolePixelEnv,
-		writer: SummaryWriter,
-		eval_freq: int = 5_000,
-		n_eval_episodes: int = 10,
-	):
-		super().__init__(verbose=0)
-		self.eval_env = eval_env
-		self.writer = writer
-		self.eval_freq = eval_freq
-		self.n_eval_episodes = n_eval_episodes
-
-	def _on_step(self) -> bool:
-		if self.n_calls % self.eval_freq == 0:
-			rewards = []
-			for _ in range(self.n_eval_episodes):
-				obs = self.eval_env.reset()
-				total_r = 0.0
-				while True:
-					action, _ = self.model.predict(obs, deterministic=True)
-					obs, r, done, _ = self.eval_env.step(action)
-					total_r += float(r[0])
-					if done[0]:
-						break
-				rewards.append(total_r)
-			self.writer.add_scalar(
-				"comparison/mean_reward",
-				float(np.mean(rewards)),
-				self.num_timesteps,  # x-axis = env steps
-			)
-		return True
+    return cost_fn
 
 
 # ── MPPI evaluation ───────────────────────────────────────────────────────────
 
 
 def run_mppi_episode(
-	model: ControlledDissipativeHGN,
-	planner: MPPI,
-	cost_fn,
-	n_frames: int,
-	img_size: int,
-	max_steps: int = 500,
-	device: torch.device = torch.device("cpu"),
+    model: ControlledDissipativeHGN,
+    planner: MPPI,
+    cost_fn,
+    n_frames: int,
+    img_size: int,
+    max_steps: int = 500,
+    device: torch.device = torch.device("cpu"),
 ) -> float:
-	"""Run one CartPole episode under MPPI. Returns total reward."""
-	env = gym.make("CartPole-v1", render_mode="rgb_array")
-	buf = FrameBuffer(n_frames, img_size)
+    """Run one CartPole episode under MPPI. Returns total reward."""
+    env = gym.make("CartPole-v1", render_mode="rgb_array")
+    buf = FrameBuffer(n_frames, img_size)
 
-	_, _ = env.reset()
-	buf.reset(env.render())
-	planner.reset()
-	model.eval()
+    _, _ = env.reset()
+    buf.reset(env.render())
+    planner.reset()
+    model.eval()
 
-	total_reward = 0.0
-	with torch.no_grad():
-		for _ in range(max_steps):
-			ctx = buf.get().unsqueeze(0).to(device)  # (1, T, 3, H, W)
-			q0, p0 = model.encode_mean(ctx)
+    total_reward = 0.0
+    with torch.no_grad():
+        for _ in range(max_steps):
+            ctx = buf.get().unsqueeze(0).to(device)  # (1, T, 3, H, W)
+            q0, p0 = model.encode_mean(ctx)
 
-			action_float = planner.plan(q0, p0, cost_fn)
-			gym_action = 1 if action_float.item() > 0 else 0
+            action_float = planner.plan(q0, p0, cost_fn)
+            gym_action = 1 if action_float.item() > 0 else 0
 
-			_, reward, terminated, truncated, _ = env.step(gym_action)
-			buf.push(env.render())
-			total_reward += reward
-			if terminated or truncated:
-				break
+            _, reward, terminated, truncated, _ = env.step(gym_action)
+            buf.push(env.render())
+            total_reward += reward
+            if terminated or truncated:
+                break
 
-	env.close()
-	return total_reward
+    env.close()
+    return total_reward
 
 
 def evaluate_mppi(
-	model: ControlledDissipativeHGN,
-	planner: MPPI,
-	cost_fn,
-	writer: SummaryWriter,
-	n_episodes: int,
-	n_frames: int,
-	img_size: int,
-	device: torch.device,
-	env_step_budget: int = 0,
+    model: ControlledDissipativeHGN,
+    planner: MPPI,
+    cost_fn,
+    writer: SummaryWriter,
+    n_episodes: int,
+    n_frames: int,
+    img_size: int,
+    device: torch.device,
+    env_step_budget: int = 0,
 ) -> float:
-	"""Evaluate MPPI for n_episodes episodes. Logs to TensorBoard.
+    """Evaluate MPPI for n_episodes episodes. Logs to TensorBoard.
 
-	Logs ``comparison/mean_reward`` at x = env_step_budget so it appears
-	on the same panel as PPO's learning curve with env steps on the x-axis.
-	"""
-	rewards = []
-	for _ in tqdm(range(n_episodes), desc="MPPI eval"):
-		r = run_mppi_episode(
-			model, planner, cost_fn, n_frames, img_size, device=device
-		)
-		rewards.append(r)
+    Logs ``comparison/mean_reward`` at x = env_step_budget so it appears
+    on the same panel as PPO's learning curve with env steps on the x-axis.
+    """
+    rewards = []
+    for _ in tqdm(range(n_episodes), desc="MPPI eval"):
+        r = run_mppi_episode(
+            model, planner, cost_fn, n_frames, img_size, device=device
+        )
+        rewards.append(r)
 
-	mean_r = float(np.mean(rewards))
-	std_r = float(np.std(rewards))
+    mean_r = float(np.mean(rewards))
+    std_r = float(np.std(rewards))
 
-	# Single data point at x = env steps used for data collection.
-	writer.add_scalar("comparison/mean_reward", mean_r, env_step_budget)
+    # Single data point at x = env steps used for data collection.
+    writer.add_scalar("comparison/mean_reward", mean_r, env_step_budget)
 
-	writer.add_text(
-		"eval/mppi_summary",
-		f"mean={mean_r:.1f}  std={std_r:.1f}  "
-		f"min={min(rewards):.0f}  max={max(rewards):.0f}  "
-		f"env_steps={env_step_budget:,}",
-	)
-	print(
-		f"\nMPPI:  mean reward = {mean_r:.1f} ± {std_r:.1f}"
-		f"  (over {n_episodes} episodes, {env_step_budget:,} env steps used)"
-	)
-	return mean_r
+    writer.add_text(
+        "eval/mppi_summary",
+        f"mean={mean_r:.1f}  std={std_r:.1f}  "
+        f"min={min(rewards):.0f}  max={max(rewards):.0f}  "
+        f"env_steps={env_step_budget:,}",
+    )
+    print(
+        f"\nMPPI:  mean reward = {mean_r:.1f} ± {std_r:.1f}"
+        f"  (over {n_episodes} episodes, {env_step_budget:,} env steps used)"
+    )
+    return mean_r
 
 
 # ── Rollout visualisation ─────────────────────────────────────────────────────
 
 
 def log_rollout_reconstructions(
-	model: ControlledDissipativeHGN,
-	trajectories: list[tuple[torch.Tensor, torch.Tensor]],
-	writer: SummaryWriter,
-	epoch: int,
-	n_frames: int,
-	device: torch.device,
-	n_trajs: int = 4,
-	rollout_steps: int = 20,
+    model: ControlledDissipativeHGN,
+    trajectories: list[tuple[torch.Tensor, torch.Tensor]],
+    writer: SummaryWriter,
+    epoch: int,
+    n_frames: int,
+    device: torch.device,
+    n_trajs: int = 4,
+    rollout_steps: int = 20,
 ) -> None:
-	"""Roll out the world model over a recorded action sequence and log GT vs predicted frames.
+    """Roll out the world model over a recorded action sequence and log GT vs predicted frames.
 
-	For each trajectory:
-	  1. Encode the first n_frames frames → (q0, p0) via encode_mean
-	  2. Apply controlled_step for each recorded action, accumulating decoded frames
-	  3. Log a side-by-side GT | predicted video using log_gt_pred_video
+    For each trajectory:
+      1. Encode the first n_frames frames → (q0, p0) via encode_mean
+      2. Apply controlled_step for each recorded action, accumulating decoded frames
+      3. Log a side-by-side GT | predicted video using log_gt_pred_video
 
-	Args:
-	    trajectories:  output of collect_val_trajectories
-	    n_trajs:       how many trajectories to visualise (uses the shortest ones
-	                   so the video length is consistent)
-	    rollout_steps: how many steps to roll out (capped to trajectory length)
-	"""
-	model.eval()
-	n_trajs = min(n_trajs, len(trajectories))
+    Args:
+        trajectories:  output of collect_val_trajectories
+        n_trajs:       how many trajectories to visualise (uses the shortest ones
+                       so the video length is consistent)
+        rollout_steps: how many steps to roll out (capped to trajectory length)
+    """
+    model.eval()
+    n_trajs = min(n_trajs, len(trajectories))
 
-	# Pick the n_trajs longest trajectories up to rollout_steps
-	trajs = sorted(trajectories, key=lambda t: len(t[1]), reverse=True)[
-		:n_trajs
-	]
-	max_steps = min(rollout_steps, min(len(a) for _, a in trajs))
+    # Pick the n_trajs longest trajectories up to rollout_steps
+    trajs = sorted(trajectories, key=lambda t: len(t[1]), reverse=True)[
+        :n_trajs
+    ]
+    max_steps = min(rollout_steps, min(len(a) for _, a in trajs))
 
-	gt_vids = []  # each (T, 3, H, W)
-	pred_vids = []
+    gt_vids = []  # each (T, 3, H, W)
+    pred_vids = []
 
-	with torch.no_grad():
-		for frames, actions in trajs:
-			# Context: first n_frames frames → latent state
-			ctx = frames[:n_frames].unsqueeze(0).to(device)  # (1, T, 3, H, W)
-			q, p = model.encode_mean(ctx)
+    with torch.no_grad():
+        for frames, actions in trajs:
+            # Context: first n_frames frames → latent state
+            ctx = frames[:n_frames].unsqueeze(0).to(device)  # (1, T, 3, H, W)
+            q, p = model.encode_mean(ctx)
 
-			gt_seq = []
-			pred_seq = []
+            gt_seq = []
+            pred_seq = []
 
-			for t in range(max_steps):
-				u = actions[t].reshape(1, 1).to(device)  # (1, 1)
-				q, p = model.controlled_step(q, p, u)
-				pred_frame = model.decoder(q).clamp(0, 1)  # (1, 3, H, W)
+            for t in range(max_steps):
+                u = actions[t].reshape(1, 1).to(device)  # (1, 1)
+                q, p = model.controlled_step(q, p, u)
+                pred_frame = model.decoder(q).clamp(0, 1)  # (1, 3, H, W)
 
-				gt_seq.append(frames[n_frames + t])  # (3, H, W)
-				pred_seq.append(pred_frame.squeeze(0).cpu())  # (3, H, W)
+                gt_seq.append(frames[n_frames + t])  # (3, H, W)
+                pred_seq.append(pred_frame.squeeze(0).cpu())  # (3, H, W)
 
-			gt_vids.append(torch.stack(gt_seq))  # (T, 3, H, W)
-			pred_vids.append(torch.stack(pred_seq))  # (T, 3, H, W)
+            gt_vids.append(torch.stack(gt_seq))  # (T, 3, H, W)
+            pred_vids.append(torch.stack(pred_seq))  # (T, 3, H, W)
 
-	# Stack into (N, T, 3, H, W) for log_gt_pred_video
-	gt_tensor = torch.stack(gt_vids)  # (N, T, 3, H, W)
-	pred_tensor = torch.stack(pred_vids)
+    # Stack into (N, T, 3, H, W) for log_gt_pred_video
+    gt_tensor = torch.stack(gt_vids)  # (N, T, 3, H, W)
+    pred_tensor = torch.stack(pred_vids)
 
-	log_gt_pred_video(
-		writer, "val/gt_vs_pred_rollout", gt_tensor, pred_tensor, epoch
-	)
+    log_gt_pred_video(
+        writer, "val/gt_vs_pred_rollout", gt_tensor, pred_tensor, epoch
+    )
 
 
 # ── PPO baseline ─────────────────────────────────────────────────────────────
 
 
 def train_and_eval_ppo(
-	writer: SummaryWriter,
-	img_size: int,
-	n_train_steps: int,
-	n_eval_episodes: int,
-	n_frames: int = 4,
-	ppo_eval_freq: int = 5_000,
-	device: str = "auto",
+    writer: SummaryWriter,
+    img_size: int,
+    n_train_steps: int,
+    n_eval_episodes: int,
+    n_frames: int = 4,
+    ppo_eval_freq: int = 5_000,
+    device: str = "auto",
 ) -> float:
-	"""Train SB3 PPO on pixel CartPole and evaluate.
+    """Train SB3 PPO on pixel CartPole and evaluate.
 
-	Logs ``comparison/mean_reward`` vs env steps every ``ppo_eval_freq``
-	steps via SampleEfficiencyCallback, so the learning curve lands on the
-	same TensorBoard panel as the MPPI data point.
-	"""
-	env_fn = lambda: CartPolePixelEnv(img_size=img_size)
-	vec_env = VecFrameStack(DummyVecEnv([env_fn]), n_stack=n_frames)
-	eval_env = VecFrameStack(DummyVecEnv([env_fn]), n_stack=n_frames)
+    Logs ``comparison/mean_reward`` vs env steps every ``ppo_eval_freq``
+    steps via SampleEfficiencyCallback, so the learning curve lands on the
+    same TensorBoard panel as the MPPI data point.
+    """
+    env_fn = lambda: CartPolePixelEnv(img_size=img_size)
+    vec_env = VecFrameStack(DummyVecEnv([env_fn]), n_stack=n_frames)
+    eval_env = VecFrameStack(DummyVecEnv([env_fn]), n_stack=n_frames)
 
-	policy_kwargs = dict(
-		features_extractor_class=SmallCNN,
-		features_extractor_kwargs=dict(features_dim=256),
-	)
+    policy_kwargs = dict(
+        features_extractor_class=SmallCNN,
+        features_extractor_kwargs=dict(features_dim=256),
+    )
 
-	ppo = PPO(
-		"CnnPolicy",
-		vec_env,
-		policy_kwargs=policy_kwargs,
-		n_steps=512,
-		batch_size=64,
-		n_epochs=4,
-		learning_rate=3e-4,
-		ent_coef=0.01,
-		verbose=0,
-		device=device,
-	)
+    ppo = PPO(
+        "CnnPolicy",
+        vec_env,
+        policy_kwargs=policy_kwargs,
+        n_steps=512,
+        batch_size=64,
+        n_epochs=4,
+        learning_rate=3e-4,
+        ent_coef=0.01,
+        verbose=0,
+        device=device,
+    )
 
-	callback = SampleEfficiencyCallback(
-		eval_env=eval_env,
-		writer=writer,
-		eval_freq=ppo_eval_freq,
-		n_eval_episodes=n_eval_episodes,
-	)
+    callback = SampleEfficiencyCallback(
+        eval_env=eval_env,
+        writer=writer,
+        eval_freq=ppo_eval_freq,
+        n_eval_episodes=n_eval_episodes,
+    )
 
-	print(
-		f"\nTraining PPO for {n_train_steps:,} env steps "
-		f"(eval every {ppo_eval_freq:,} steps)..."
-	)
-	ppo.learn(total_timesteps=n_train_steps, callback=callback)
+    print(
+        f"\nTraining PPO for {n_train_steps:,} env steps "
+        f"(eval every {ppo_eval_freq:,} steps)..."
+    )
+    ppo.learn(total_timesteps=n_train_steps, callback=callback)
 
-	# Final evaluation point at exactly n_train_steps.
-	rewards = []
-	for _ in tqdm(range(n_eval_episodes), desc="PPO final eval"):
-		obs = eval_env.reset()
-		total_r = 0.0
-		while True:
-			action, _ = ppo.predict(obs, deterministic=True)
-			obs, r, done, _ = eval_env.step(action)
-			total_r += float(r[0])
-			if done[0]:
-				break
-		rewards.append(total_r)
+    # Final evaluation point at exactly n_train_steps.
+    rewards = []
+    for _ in tqdm(range(n_eval_episodes), desc="PPO final eval"):
+        obs = eval_env.reset()
+        total_r = 0.0
+        while True:
+            action, _ = ppo.predict(obs, deterministic=True)
+            obs, r, done, _ = eval_env.step(action)
+            total_r += float(r[0])
+            if done[0]:
+                break
+        rewards.append(total_r)
 
-	eval_env.close()
-	mean_r = float(np.mean(rewards))
-	std_r = float(np.std(rewards))
-	writer.add_scalar("comparison/mean_reward", mean_r, n_train_steps)
-	writer.add_text(
-		"eval/ppo_summary",
-		f"mean={mean_r:.1f}  std={std_r:.1f}  "
-		f"min={min(rewards):.0f}  max={max(rewards):.0f}",
-	)
-	print(
-		f"PPO:   mean reward = {mean_r:.1f} ± {std_r:.1f}"
-		f"  (over {n_eval_episodes} episodes)"
-	)
-	return mean_r
+    eval_env.close()
+    mean_r = float(np.mean(rewards))
+    std_r = float(np.std(rewards))
+    writer.add_scalar("comparison/mean_reward", mean_r, n_train_steps)
+    writer.add_text(
+        "eval/ppo_summary",
+        f"mean={mean_r:.1f}  std={std_r:.1f}  "
+        f"min={min(rewards):.0f}  max={max(rewards):.0f}",
+    )
+    print(
+        f"PPO:   mean reward = {mean_r:.1f} ± {std_r:.1f}"
+        f"  (over {n_eval_episodes} episodes)"
+    )
+    return mean_r
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -766,34 +426,34 @@ def train_and_eval_ppo(
 @click.command()
 @click.option("--img-size", type=int, default=32, show_default=True)
 @click.option(
-	"--n-frames",
-	type=int,
-	default=4,
-	show_default=True,
-	help="Context frames stacked for the encoder.",
+    "--n-frames",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Context frames stacked for the encoder.",
 )
 @click.option(
-	"--pos-ch",
-	type=int,
-	default=4,
-	show_default=True,
-	help="Position channels in the latent state.",
+    "--pos-ch",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Position channels in the latent state.",
 )
 @click.option("--dt", type=float, default=0.05, show_default=True)
 # ── data collection ──
 @click.option(
-	"--n-collect",
-	type=int,
-	default=200,
-	show_default=True,
-	help="Episodes to collect for world-model training.",
+    "--n-collect",
+    type=int,
+    default=200,
+    show_default=True,
+    help="Episodes to collect for world-model training.",
 )
 @click.option(
-	"--scripted-fraction",
-	type=float,
-	default=0.5,
-	show_default=True,
-	help="Fraction of collection episodes using the PD controller.",
+    "--scripted-fraction",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Fraction of collection episodes using the PD controller.",
 )
 # ── world model ──
 @click.option("--wm-epochs", type=int, default=30, show_default=True)
@@ -810,206 +470,206 @@ def train_and_eval_ppo(
 @click.option("--mppi-temperature", type=float, default=0.05, show_default=True)
 @click.option("--mppi-sigma", type=float, default=0.5, show_default=True)
 @click.option(
-	"--n-eval-mppi",
-	type=int,
-	default=20,
-	show_default=True,
-	help="MPPI evaluation episodes.",
+    "--n-eval-mppi",
+    type=int,
+    default=20,
+    show_default=True,
+    help="MPPI evaluation episodes.",
 )
 # ── PPO ──
 @click.option(
-	"--n-ppo-steps",
-	type=int,
-	default=200_000,
-	show_default=True,
-	help="PPO training env steps.",
+    "--n-ppo-steps",
+    type=int,
+    default=200_000,
+    show_default=True,
+    help="PPO training env steps.",
 )
 @click.option(
-	"--n-eval-ppo",
-	type=int,
-	default=20,
-	show_default=True,
-	help="PPO evaluation episodes.",
+    "--n-eval-ppo",
+    type=int,
+    default=20,
+    show_default=True,
+    help="PPO evaluation episodes.",
 )
 @click.option(
-	"--ppo-eval-freq",
-	type=int,
-	default=5_000,
-	show_default=True,
-	help="Log PPO comparison/mean_reward every this many env steps.",
+    "--ppo-eval-freq",
+    type=int,
+    default=5_000,
+    show_default=True,
+    help="Log PPO comparison/mean_reward every this many env steps.",
 )
 @click.option(
-	"--skip-ppo",
-	is_flag=True,
-	default=False,
-	help="Skip the PPO baseline (useful for quick iteration).",
+    "--skip-ppo",
+    is_flag=True,
+    default=False,
+    help="Skip the PPO baseline (useful for quick iteration).",
 )
 def main(
-	img_size,
-	n_frames,
-	pos_ch,
-	dt,
-	n_collect,
-	scripted_fraction,
-	wm_epochs,
-	wm_batch,
-	wm_lr,
-	kl_weight,
-	recon_weight,
-	state_weight,
-	free_bits,
-	grad_clip,
-	mppi_horizon,
-	mppi_samples,
-	mppi_temperature,
-	mppi_sigma,
-	n_eval_mppi,
-	n_ppo_steps,
-	n_eval_ppo,
-	ppo_eval_freq,
-	skip_ppo,
+    img_size,
+    n_frames,
+    pos_ch,
+    dt,
+    n_collect,
+    scripted_fraction,
+    wm_epochs,
+    wm_batch,
+    wm_lr,
+    kl_weight,
+    recon_weight,
+    state_weight,
+    free_bits,
+    grad_clip,
+    mppi_horizon,
+    mppi_samples,
+    mppi_temperature,
+    mppi_sigma,
+    n_eval_mppi,
+    n_ppo_steps,
+    n_eval_ppo,
+    ppo_eval_freq,
+    skip_ppo,
 ):
-	assert img_size == 32, (
-		"PHGN encoder/decoder expects 32×32; set --img-size 32"
-	)
+    assert img_size == 32, (
+        "PHGN encoder/decoder expects 32×32; set --img-size 32"
+    )
 
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	print(f"Device: {device}\n")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}\n")
 
-	writer = SummaryWriter(comment="_phgn_cartpole")
+    writer = SummaryWriter(comment="_phgn_cartpole")
 
-	hparam_text = (
-		"| Hyperparameter | Value |\n|---|---|\n"
-		f"| img_size | {img_size} |\n"
-		f"| n_frames | {n_frames} |\n"
-		f"| pos_ch | {pos_ch} |\n"
-		f"| dt | {dt} |\n"
-		f"| n_collect | {n_collect} |\n"
-		f"| scripted_fraction | {scripted_fraction} |\n"
-		f"| wm_epochs | {wm_epochs} |\n"
-		f"| wm_lr | {wm_lr} |\n"
-		f"| kl_weight | {kl_weight} |\n"
-		f"| recon_weight | {recon_weight} |\n"
-		f"| state_weight | {state_weight} |\n"
-		f"| mppi_horizon | {mppi_horizon} |\n"
-		f"| mppi_samples | {mppi_samples} |\n"
-		f"| mppi_temperature | {mppi_temperature} |\n"
-		f"| mppi_sigma | {mppi_sigma} |\n"
-		f"| n_ppo_steps | {n_ppo_steps} |\n"
-		f"| ppo_eval_freq | {ppo_eval_freq} |\n"
-	)
-	writer.add_text("hparams", hparam_text, 0)
+    hparam_text = (
+        "| Hyperparameter | Value |\n|---|---|\n"
+        f"| img_size | {img_size} |\n"
+        f"| n_frames | {n_frames} |\n"
+        f"| pos_ch | {pos_ch} |\n"
+        f"| dt | {dt} |\n"
+        f"| n_collect | {n_collect} |\n"
+        f"| scripted_fraction | {scripted_fraction} |\n"
+        f"| wm_epochs | {wm_epochs} |\n"
+        f"| wm_lr | {wm_lr} |\n"
+        f"| kl_weight | {kl_weight} |\n"
+        f"| recon_weight | {recon_weight} |\n"
+        f"| state_weight | {state_weight} |\n"
+        f"| mppi_horizon | {mppi_horizon} |\n"
+        f"| mppi_samples | {mppi_samples} |\n"
+        f"| mppi_temperature | {mppi_temperature} |\n"
+        f"| mppi_sigma | {mppi_sigma} |\n"
+        f"| n_ppo_steps | {n_ppo_steps} |\n"
+        f"| ppo_eval_freq | {ppo_eval_freq} |\n"
+    )
+    writer.add_text("hparams", hparam_text, 0)
 
-	# ── Phase 1: Data collection ──────────────────────────────────────────
-	print("=== Phase 1: Data collection ===")
-	transitions = collect_data(
-		n_collect,
-		n_frames,
-		img_size,
-		scripted_fraction=scripted_fraction,
-	)
-	dataset = CartPoleDataset(transitions)
+    # ── Phase 1: Data collection ──────────────────────────────────────────
+    print("=== Phase 1: Data collection ===")
+    transitions = collect_data(
+        n_collect,
+        n_frames,
+        img_size,
+        scripted_fraction=scripted_fraction,
+    )
+    dataset = CartPoleDataset(transitions)
 
-	print("\nCollecting validation trajectories for visualisation...")
-	val_trajectories = collect_val_trajectories(
-		n_episodes=8, n_frames=n_frames, img_size=img_size
-	)
+    print("\nCollecting validation trajectories for visualisation...")
+    val_trajectories = collect_val_trajectories(
+        n_episodes=8, n_frames=n_frames, img_size=img_size
+    )
 
-	# ── Phase 2: World model training ────────────────────────────────────
-	print("\n=== Phase 2: World model training ===")
-	model = ControlledDissipativeHGN(
-		n_frames=n_frames,
-		pos_ch=pos_ch,
-		img_ch=3,
-		dt=dt,
-		control_dim=1,
-		obs_state_dim=4,  # CartPole: (x, x_dot, theta, theta_dot)
-	).to(device)
-	print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-	print(
-		f"State dim D = {model.state_dim}  (J,R are {model.state_dim}×{model.state_dim})\n"
-	)
+    # ── Phase 2: World model training ────────────────────────────────────
+    print("\n=== Phase 2: World model training ===")
+    model = ControlledDissipativeHGN(
+        n_frames=n_frames,
+        pos_ch=pos_ch,
+        img_ch=3,
+        dt=dt,
+        control_dim=1,
+        obs_state_dim=4,  # CartPole: (x, x_dot, theta, theta_dot)
+    ).to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(
+        f"State dim D = {model.state_dim}  (J,R are {model.state_dim}×{model.state_dim})\n"
+    )
 
-	train_world_model(
-		model,
-		dataset,
-		writer,
-		n_epochs=wm_epochs,
-		batch_size=wm_batch,
-		lr=wm_lr,
-		kl_weight=kl_weight,
-		recon_weight=recon_weight,
-		state_weight=state_weight,
-		free_bits=free_bits,
-		grad_clip=grad_clip,
-		device=device,
-	)
+    train_world_model(
+        model,
+        dataset,
+        writer,
+        n_epochs=wm_epochs,
+        batch_size=wm_batch,
+        lr=wm_lr,
+        kl_weight=kl_weight,
+        recon_weight=recon_weight,
+        state_weight=state_weight,
+        free_bits=free_bits,
+        grad_clip=grad_clip,
+        device=device,
+    )
 
-	# ── Phase 2b: Rollout visualisation ──────────────────────────────────
-	print("\n=== Phase 2b: Logging rollout reconstructions ===")
-	log_rollout_reconstructions(
-		model,
-		val_trajectories,
-		writer,
-		epoch=wm_epochs - 1,
-		n_frames=n_frames,
-		device=device,
-	)
+    # ── Phase 2b: Rollout visualisation ──────────────────────────────────
+    print("\n=== Phase 2b: Logging rollout reconstructions ===")
+    log_rollout_reconstructions(
+        model,
+        val_trajectories,
+        writer,
+        epoch=wm_epochs - 1,
+        n_frames=n_frames,
+        device=device,
+    )
 
-	# ── Phase 3: MPPI evaluation ──────────────────────────────────────────
-	print("\n=== Phase 3: MPPI evaluation ===")
-	cost_fn = make_cartpole_cost(model, device)
-	planner = MPPI(
-		model=model,
-		horizon=mppi_horizon,
-		n_samples=mppi_samples,
-		temperature=mppi_temperature,
-		noise_sigma=mppi_sigma,
-		control_dim=1,
-		control_min=-1.0,
-		control_max=1.0,
-		device=device,
-	)
-	mppi_mean = evaluate_mppi(
-		model,
-		planner,
-		cost_fn,
-		writer,
-		n_eval_mppi,
-		n_frames,
-		img_size,
-		device,
-		env_step_budget=len(transitions),
-	)
+    # ── Phase 3: MPPI evaluation ──────────────────────────────────────────
+    print("\n=== Phase 3: MPPI evaluation ===")
+    cost_fn = make_cartpole_cost(model, device)
+    planner = MPPI(
+        model=model,
+        horizon=mppi_horizon,
+        n_samples=mppi_samples,
+        temperature=mppi_temperature,
+        noise_sigma=mppi_sigma,
+        control_dim=1,
+        control_min=-1.0,
+        control_max=1.0,
+        device=device,
+    )
+    mppi_mean = evaluate_mppi(
+        model,
+        planner,
+        cost_fn,
+        writer,
+        n_eval_mppi,
+        n_frames,
+        img_size,
+        device,
+        env_step_budget=len(transitions),
+    )
 
-	# ── Phase 4: PPO baseline ─────────────────────────────────────────────
-	if not skip_ppo:
-		print("\n=== Phase 4: PPO baseline ===")
-		ppo_mean = train_and_eval_ppo(
-			writer,
-			img_size=img_size,
-			n_train_steps=n_ppo_steps,
-			n_eval_episodes=n_eval_ppo,
-			n_frames=n_frames,
-			ppo_eval_freq=ppo_eval_freq,
-			device="cuda" if torch.cuda.is_available() else "cpu",
-		)
+    # ── Phase 4: PPO baseline ─────────────────────────────────────────────
+    if not skip_ppo:
+        print("\n=== Phase 4: PPO baseline ===")
+        ppo_mean = train_and_eval_ppo(
+            writer,
+            img_size=img_size,
+            n_train_steps=n_ppo_steps,
+            n_eval_episodes=n_eval_ppo,
+            n_frames=n_frames,
+            ppo_eval_freq=ppo_eval_freq,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
 
-		# Comparison summary
-		summary = (
-			f"| Method | Mean reward |\n|---|---|\n"
-			f"| PHGN + MPPI | {mppi_mean:.1f} |\n"
-			f"| PPO (SB3) | {ppo_mean:.1f} |\n"
-		)
-		writer.add_text("eval/comparison", summary)
-		print(f"\n{'=' * 40}")
-		print(f"PHGN + MPPI  →  {mppi_mean:.1f}")
-		print(f"PPO (SB3)    →  {ppo_mean:.1f}")
-		print(f"{'=' * 40}")
+        # Comparison summary
+        summary = (
+            f"| Method | Mean reward |\n|---|---|\n"
+            f"| PHGN + MPPI | {mppi_mean:.1f} |\n"
+            f"| PPO (SB3) | {ppo_mean:.1f} |\n"
+        )
+        writer.add_text("eval/comparison", summary)
+        print(f"\n{'=' * 40}")
+        print(f"PHGN + MPPI  →  {mppi_mean:.1f}")
+        print(f"PPO (SB3)    →  {ppo_mean:.1f}")
+        print(f"{'=' * 40}")
 
-	writer.close()
-	print("\nDone. Run: tensorboard --logdir runs")
+    writer.close()
+    print("\nDone. Run: tensorboard --logdir runs")
 
 
 if __name__ == "__main__":
-	main()
+    main()

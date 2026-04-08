@@ -40,7 +40,12 @@ from diag_common import (
 from phgn_lstm import ControlledDHGN_LSTM
 from replay_buffer import Episode, EpisodeReplayBuffer
 
-_STATE_LABELS = ["cart_pos (x)", "cart_vel (ẋ)", "pole_angle (θ)", "pole_vel (θ̇)"]
+_STATE_LABELS = [
+    "cart_pos (x)",
+    "cart_vel (ẋ)",
+    "pole_angle (θ)",
+    "pole_vel (θ̇)",
+]
 
 
 # ── Episode collection ────────────────────────────────────────────────────────
@@ -71,9 +76,11 @@ def collect_episode(img_size: int, max_steps: int) -> Episode:
     states.append(states[-1])  # pad terminal state
 
     return Episode(
-        frames=torch.stack(frames),                                        # (T+1, 3, H, W)
-        actions=torch.tensor(actions, dtype=torch.float32).unsqueeze(-1),  # (T, 1)
-        states=torch.from_numpy(np.stack(states)),                         # (T+1, 4)
+        frames=torch.stack(frames),  # (T+1, 3, H, W)
+        actions=torch.tensor(actions, dtype=torch.float32).unsqueeze(
+            -1
+        ),  # (T, 1)
+        states=torch.from_numpy(np.stack(states)),  # (T+1, 4)
     )
 
 
@@ -104,8 +111,10 @@ def train_step(
     When do_diag is True, logs gradient norms, activation stats, latent
     stats, J/R matrix norms, and weight norms to TensorBoard.
     """
-    frames, _actions, states = buffer.sample_sequences(batch_size, seq_len=seq_len)
-    frames = frames.to(device)   # (B, seq_len+1, 3, H, W)
+    frames, _actions, states = buffer.sample_sequences(
+        batch_size, seq_len=seq_len
+    )
+    frames = frames.to(device)  # (B, seq_len+1, 3, H, W)
     if states is not None:
         states = states.to(device)  # (B, seq_len+1, 4)
 
@@ -124,12 +133,12 @@ def train_step(
     z_flat = z_all.reshape(B * T, ch, h, w)
 
     # f_psi: latent_ch → 2*pos_ch  (position + momentum)
-    s_flat = model.f_psi(z_flat)               # (B*T, 2*pos_ch, 4, 4)
-    q_flat, p_flat = model._split(s_flat)      # (B*T, pos_ch, 4, 4) each
+    s_flat = model.f_psi(z_flat)  # (B*T, 2*pos_ch, 4, 4)
+    q_flat, p_flat = model._split(s_flat)  # (B*T, pos_ch, 4, 4) each
 
     # Decode predicted states
     pred_states_flat = model.decode_state(q_flat, p_flat)  # (B*T, 4)
-    pred_states = pred_states_flat.reshape(B, T, -1)       # (B, seq_len, 4)
+    pred_states = pred_states_flat.reshape(B, T, -1)  # (B, seq_len, 4)
 
     # Ground truth: states[:, 0:seq_len] aligns with frame prefixes 0..seq_len-1
     target_states = states[:, :seq_len]  # (B, seq_len, 4)
@@ -158,12 +167,22 @@ def train_step(
         )
         log_weight_norms(writer, model, step)
         with torch.no_grad():
-            writer.add_scalar("diag/J_frobenius", model.get_J().norm(p="fro").item(), step)
-            writer.add_scalar("diag/R_frobenius", model.get_R().norm(p="fro").item(), step)
+            writer.add_scalar(
+                "diag/J_frobenius", model.get_J().norm(p="fro").item(), step
+            )
+            writer.add_scalar(
+                "diag/R_frobenius", model.get_R().norm(p="fro").item(), step
+            )
             J = model.get_J().cpu()
             R = model.get_R().cpu()
-            writer.add_scalar("diag/J_skew_residual", (J + J.T).norm().item(), step)
-            writer.add_scalar("diag/R_min_eigenvalue", torch.linalg.eigvalsh(R).min().item(), step)
+            writer.add_scalar(
+                "diag/J_skew_residual", (J + J.T).norm().item(), step
+            )
+            writer.add_scalar(
+                "diag/R_min_eigenvalue",
+                torch.linalg.eigvalsh(R).min().item(),
+                step,
+            )
 
     if grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -203,7 +222,7 @@ def evaluate(
         true_states.append(np.array(env.unwrapped.state, dtype=np.float32))
 
         ctx = buf.get().unsqueeze(0).to(device)  # (1, seq_len, 3, H, W)
-        mu, _ = model.encoder(ctx)               # (1, latent_ch, 4, 4)
+        mu, _ = model.encoder(ctx)  # (1, latent_ch, 4, 4)
         s = model.f_psi(mu)
         q, p = model._split(s)
         pred = model.decode_state(q, p).squeeze(0).cpu().numpy()  # (4,)
@@ -230,7 +249,9 @@ def plot_predictions(
     t = np.arange(len(true))
     for i, (ax, label) in enumerate(zip(axes.flat, _STATE_LABELS)):
         ax.plot(t, true[:, i], label="ground truth", color="steelblue")
-        ax.plot(t, pred[:, i], label="predicted", color="darkorange", linestyle="--")
+        ax.plot(
+            t, pred[:, i], label="predicted", color="darkorange", linestyle="--"
+        )
         ax.set_title(label)
         ax.set_xlabel("step")
         ax.legend(fontsize=8)
@@ -244,23 +265,74 @@ def plot_predictions(
 
 
 @click.command()
-@click.option("--img-size",    default=64,     show_default=True, help="Frame resolution")
-@click.option("--pos-ch",      default=8,      show_default=True, help="Latent position channels")
-@click.option("--seq-len",     default=8,      show_default=True, help="LSTM context length")
-@click.option("--feat-dim",    default=256,    show_default=True, help="Per-frame CNN feature dim")
-@click.option("--n-collect",   default=200,    show_default=True, help="Episodes to collect before training")
-@click.option("--n-iters",     default=5000,   show_default=True, help="Gradient steps")
-@click.option("--batch-size",  default=32,     show_default=True, help="Batch size")
-@click.option("--lr",          default=3e-4,   show_default=True, help="Learning rate")
-@click.option("--kl-weight",   default=1e-3,   show_default=True, help="KL loss weight")
-@click.option("--free-bits",   default=0.5,    show_default=True, help="KL free-bits floor")
-@click.option("--grad-clip",   default=10.0,   show_default=True, help="Gradient clip norm (0=off)")
-@click.option("--max-steps",   default=500,    show_default=True, help="Max steps per episode")
-@click.option("--eval-every",  default=500,    show_default=True, help="Eval + checkpoint interval")
-@click.option("--diag-every",  default=100,    show_default=True, help="Gradient/activation/latent diag interval")
-@click.option("--hist-every",  default=1000,   show_default=True, help="Weight/gradient histogram interval")
-@click.option("--buffer-cap",  default=1000,   show_default=True, help="Replay buffer capacity")
-@click.option("--device",      default="cuda", show_default=True, help="torch device")
+@click.option(
+    "--img-size", default=64, show_default=True, help="Frame resolution"
+)
+@click.option(
+    "--pos-ch", default=8, show_default=True, help="Latent position channels"
+)
+@click.option(
+    "--seq-len", default=8, show_default=True, help="LSTM context length"
+)
+@click.option(
+    "--feat-dim",
+    default=256,
+    show_default=True,
+    help="Per-frame CNN feature dim",
+)
+@click.option(
+    "--n-collect",
+    default=200,
+    show_default=True,
+    help="Episodes to collect before training",
+)
+@click.option(
+    "--n-iters", default=5000, show_default=True, help="Gradient steps"
+)
+@click.option("--batch-size", default=32, show_default=True, help="Batch size")
+@click.option("--lr", default=3e-4, show_default=True, help="Learning rate")
+@click.option(
+    "--kl-weight", default=1e-3, show_default=True, help="KL loss weight"
+)
+@click.option(
+    "--free-bits", default=0.5, show_default=True, help="KL free-bits floor"
+)
+@click.option(
+    "--grad-clip",
+    default=10.0,
+    show_default=True,
+    help="Gradient clip norm (0=off)",
+)
+@click.option(
+    "--max-steps", default=500, show_default=True, help="Max steps per episode"
+)
+@click.option(
+    "--eval-every",
+    default=500,
+    show_default=True,
+    help="Eval + checkpoint interval",
+)
+@click.option(
+    "--diag-every",
+    default=100,
+    show_default=True,
+    help="Gradient/activation/latent diag interval",
+)
+@click.option(
+    "--hist-every",
+    default=1000,
+    show_default=True,
+    help="Weight/gradient histogram interval",
+)
+@click.option(
+    "--buffer-cap",
+    default=1000,
+    show_default=True,
+    help="Replay buffer capacity",
+)
+@click.option(
+    "--device", default="cuda", show_default=True, help="torch device"
+)
 def main(
     img_size: int,
     pos_ch: int,
@@ -299,13 +371,20 @@ def main(
     writer = SummaryWriter(comment="_pixels_to_state")
 
     hparams = dict(
-        img_size=img_size, pos_ch=pos_ch, seq_len=seq_len, feat_dim=feat_dim,
-        n_collect=n_collect, n_iters=n_iters, batch_size=batch_size, lr=lr,
-        kl_weight=kl_weight, free_bits=free_bits, grad_clip=grad_clip,
+        img_size=img_size,
+        pos_ch=pos_ch,
+        seq_len=seq_len,
+        feat_dim=feat_dim,
+        n_collect=n_collect,
+        n_iters=n_iters,
+        batch_size=batch_size,
+        lr=lr,
+        kl_weight=kl_weight,
+        free_bits=free_bits,
+        grad_clip=grad_clip,
     )
-    hparam_text = (
-        "| param | value |\n| --- | --- |\n"
-        + "".join(f"| {k} | {v} |\n" for k, v in hparams.items())
+    hparam_text = "| param | value |\n| --- | --- |\n" + "".join(
+        f"| {k} | {v} |\n" for k, v in hparams.items()
     )
     writer.add_text("hparams", hparam_text, 0)
 

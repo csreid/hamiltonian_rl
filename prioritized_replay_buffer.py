@@ -34,6 +34,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from data.base import SampledBatch
 from replay_buffer import Episode
 
 
@@ -161,7 +162,7 @@ class PrioritizedEpisodeReplayBuffer:
         # Priority-proportional sampling over ALL episodes
         n = len(self._episodes)
         raw_pri = np.array(self._priorities[:n], dtype=np.float64)
-        probs = raw_pri ** self.alpha
+        probs = raw_pri**self.alpha
         probs /= probs.sum()
 
         # IS weights: w_i = (N * P(i))^{-beta}, normalised by max weight
@@ -188,8 +189,8 @@ class PrioritizedEpisodeReplayBuffer:
             eff_len = min(seq_len, len(ep))
             start = random.randint(0, len(ep) - eff_len)
 
-            f = ep.frames[start : start + eff_len + 1]   # (eff_len+1, C, H, W)
-            a = ep.actions[start : start + eff_len]       # (eff_len, control_dim)
+            f = ep.frames[start : start + eff_len + 1]  # (eff_len+1, C, H, W)
+            a = ep.actions[start : start + eff_len]  # (eff_len, control_dim)
 
             if eff_len < seq_len:
                 pad = seq_len - eff_len
@@ -206,15 +207,41 @@ class PrioritizedEpisodeReplayBuffer:
                     s = torch.cat([s, s[-1:].expand(pad, *s.shape[1:])], dim=0)
                 states_list.append(s)
 
-        frames = torch.stack(frames_list)   # (B, seq_len+1, C, H, W)
-        actions = torch.stack(actions_list) # (B, seq_len, control_dim)
+        frames = torch.stack(frames_list)  # (B, seq_len+1, C, H, W)
+        actions = torch.stack(actions_list)  # (B, seq_len, control_dim)
         states = torch.stack(states_list) if states_list else None
         lengths = torch.tensor(lengths_list, dtype=torch.long)
 
         # Anneal beta toward 1
         self.beta = min(1.0, self.beta + self.beta_annealing)
 
-        return frames, actions, states, indices, torch.from_numpy(is_weights), lengths
+        return (
+            frames,
+            actions,
+            states,
+            indices,
+            torch.from_numpy(is_weights),
+            lengths,
+        )
+
+    def sample(self, batch_size: int, seq_len: int) -> SampledBatch:
+        """Sample a prioritized batch and return a SampledBatch with commit() support.
+
+        Equivalent to sample_sequences() but returns a SampledBatch whose
+        commit(per_sample_losses) method calls update_priorities() automatically,
+        removing the need for callers to track buffer indices.
+        """
+        frames, actions, states, indices, is_weights, lengths = (
+            self.sample_sequences(batch_size, seq_len)
+        )
+        return SampledBatch(
+            frames=frames,
+            actions=actions,
+            states=states,
+            is_weights=is_weights,
+            lengths=lengths,
+            _commit_fn=lambda losses: self.update_priorities(indices, losses),
+        )
 
     # ── Priority update ───────────────────────────────────────────────────────
 

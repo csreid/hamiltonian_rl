@@ -79,7 +79,9 @@ class PIDController:
         self._integral = 0.0
         self._prev_error = 0.0
 
-    def compute(self, theta: float, theta_dot: float, dt: float = 0.02) -> float:
+    def compute(
+        self, theta: float, theta_dot: float, dt: float = 0.02
+    ) -> float:
         """Return a continuous action in [-1, 1] based on pole angle."""
         error = theta + 0.1 * theta_dot
         self._integral += error * dt
@@ -208,7 +210,9 @@ def run_model_rollout(
     )  # (T+1, 3, H, W)
 
     T = len(actions)
-    ctx = frames_tensor[:anchor_context].unsqueeze(0).to(device)  # (1, k, 3, H, W)
+    ctx = (
+        frames_tensor[:anchor_context].unsqueeze(0).to(device)
+    )  # (1, k, 3, H, W)
 
     model_pixel_frames: list[np.ndarray] = []
     model_states: list[np.ndarray] = []
@@ -253,7 +257,7 @@ def render_states_in_gym(model_states: list[np.ndarray]) -> list[np.ndarray]:
 
 _ARROW_RIGHT = (60, 200, 60)
 _ARROW_LEFT = (220, 60, 60)
-_CONTEXT_BORDER = (180, 180, 60)   # yellow border for context frames
+_CONTEXT_BORDER = (180, 180, 60)  # yellow border for context frames
 
 
 def _tint_blue(arr: np.ndarray) -> np.ndarray:
@@ -274,7 +278,9 @@ def _tint_orange(arr: np.ndarray) -> np.ndarray:
     return f.clip(0, 255).astype(np.uint8)
 
 
-def _draw_arrow(img: Image.Image, action: float, action_max: float = 1.0) -> Image.Image:
+def _draw_arrow(
+    img: Image.Image, action: float, action_max: float = 1.0
+) -> Image.Image:
     """Draw a proportional left/right arrow at the bottom of the frame.
 
     Arrow length scales linearly with |action| / action_max.
@@ -292,7 +298,9 @@ def _draw_arrow(img: Image.Image, action: float, action_max: float = 1.0) -> Ima
     max_half = W // 5  # half-length at full magnitude
 
     magnitude = min(abs(action) / max(action_max, 1e-6), 1.0)
-    half_len = max(4, int(max_half * magnitude))  # at least 4 px so it's visible
+    half_len = max(
+        4, int(max_half * magnitude)
+    )  # at least 4 px so it's visible
 
     color = _ARROW_RIGHT if action > 0 else _ARROW_LEFT
     tip_x = cx + half_len if action > 0 else cx - half_len
@@ -304,12 +312,20 @@ def _draw_arrow(img: Image.Image, action: float, action_max: float = 1.0) -> Ima
     draw.line([(tail_x, cy), (tip_x, cy)], fill=color, width=shaft_width)
     if action > 0:
         draw.polygon(
-            [(tip_x, cy), (tip_x - head, cy - head // 2), (tip_x - head, cy + head // 2)],
+            [
+                (tip_x, cy),
+                (tip_x - head, cy - head // 2),
+                (tip_x - head, cy + head // 2),
+            ],
             fill=color,
         )
     else:
         draw.polygon(
-            [(tip_x, cy), (tip_x + head, cy - head // 2), (tip_x + head, cy + head // 2)],
+            [
+                (tip_x, cy),
+                (tip_x + head, cy - head // 2),
+                (tip_x + head, cy + head // 2),
+            ],
             fill=color,
         )
     return img
@@ -326,7 +342,9 @@ def _draw_context_border(img: Image.Image) -> Image.Image:
 
 def build_composite_frames(
     gt_frames: list[np.ndarray],
-    model_frames: list[np.ndarray],   # either pixel frames or gym-rendered states
+    model_frames: list[
+        np.ndarray
+    ],  # either pixel frames or gym-rendered states
     actions: list[float],
     rollout_start: int,
     display_size: int,
@@ -356,7 +374,9 @@ def build_composite_frames(
                     (display_size, display_size), Image.BILINEAR
                 )
                 gt_tinted = Image.fromarray(_tint_blue(np.array(gt_pil)))
-                model_tinted = Image.fromarray(_tint_orange(np.array(model_pil)))
+                model_tinted = Image.fromarray(
+                    _tint_orange(np.array(model_pil))
+                )
                 frame = Image.blend(gt_tinted, model_tinted, alpha)
             else:
                 frame = gt_pil
@@ -364,7 +384,9 @@ def build_composite_frames(
         # Action arrow (use last action for final padding frame)
         action_idx = min(t, len(actions) - 1)
         if actions:
-            frame = _draw_arrow(frame, actions[action_idx], action_max=action_max)
+            frame = _draw_arrow(
+                frame, actions[action_idx], action_max=action_max
+            )
 
         composite.append(frame)
 
@@ -388,9 +410,7 @@ def frames_to_gif(frames: list[Image.Image], fps: float) -> bytes:
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="PHGN-LSTM Checkpoint Visualiser", layout="wide"
-)
+st.set_page_config(page_title="PHGN-LSTM Checkpoint Visualiser", layout="wide")
 st.title("PHGN-LSTM Checkpoint Visualiser")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -430,7 +450,9 @@ with st.sidebar:
         st.subheader("MPPI")
         mppi_kwargs = dict(
             mppi_horizon=st.slider("Horizon", 5, 50, 20),
-            mppi_samples=st.select_slider("Samples", [32, 64, 128, 256, 512], value=256),
+            mppi_samples=st.select_slider(
+                "Samples", [32, 64, 128, 256, 512], value=256
+            ),
             mppi_temperature=st.number_input(
                 "Temperature λ", value=0.05, min_value=0.001, format="%.4f"
             ),
@@ -538,7 +560,9 @@ ep_data = st.session_state.get("ep_data")
 rollout = st.session_state.get("rollout")
 
 if ep_data is None:
-    st.info("Configure settings in the sidebar and press **▶ Generate episode**.")
+    st.info(
+        "Configure settings in the sidebar and press **▶ Generate episode**."
+    )
     st.stop()
 
 gt_frames = ep_data["gt_frames"]
@@ -569,7 +593,10 @@ with col_fps:
 with col_alpha:
     blend_alpha = st.slider(
         "Blend α  (0 = GT only · 1 = model only)",
-        0.0, 1.0, 0.5, step=0.05,
+        0.0,
+        1.0,
+        0.5,
+        step=0.05,
     )
 with col_size:
     display_size = st.select_slider(
@@ -601,8 +628,8 @@ st.image(gif_bytes, use_container_width=False)
 if rollout["model_states"]:
     st.subheader("CartPole state: ground truth vs model prediction")
 
-    gt_states = np.array(ep_data["gt_states"])           # (T+1, 4)
-    pred_states = np.array(rollout["model_states"])       # (T - k + 2, 4)
+    gt_states = np.array(ep_data["gt_states"])  # (T+1, 4)
+    pred_states = np.array(rollout["model_states"])  # (T - k + 2, 4)
     labels = ["cart_pos (x)", "cart_vel (ẋ)", "pole_angle (θ)", "pole_vel (θ̇)"]
 
     t_gt = np.arange(len(gt_states))
@@ -612,11 +639,17 @@ if rollout["model_states"]:
     for i, (ax, label) in enumerate(zip(axes.flat, labels)):
         ax.plot(t_gt, gt_states[:, i], label="ground truth", color="steelblue")
         ax.plot(
-            t_model, pred_states[:, i],
-            label="model", color="darkorange", linestyle="--",
+            t_model,
+            pred_states[:, i],
+            label="model",
+            color="darkorange",
+            linestyle="--",
         )
         ax.axvline(
-            rollout_start, color="gray", linestyle=":", alpha=0.7,
+            rollout_start,
+            color="gray",
+            linestyle=":",
+            alpha=0.7,
             label=f"context end (t={rollout_start})",
         )
         ax.set_title(label)
