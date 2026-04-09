@@ -11,14 +11,6 @@ where:
 This corresponds to the standard port-Hamiltonian formulation with an
 explicit input port.  For a damped spring actuated at the cart:
     B ≈ [0; 0; ...; 1; ...; 0]   (only the position channel is actuated)
-
-Optionally, a shallow MLP `state_decoder` maps (q, p) → a low-dimensional
-observed state (e.g. CartPole's (x, ẋ, θ, θ̇)).  This head lets MPPI
-cost functions operate on physically interpretable quantities without
-requiring access to ground-truth state at inference time.
-
-The `encode_mean` helper bypasses reparameterisation sampling so that
-planning and evaluation use deterministic latent codes.
 """
 
 import torch
@@ -34,15 +26,11 @@ class ControlledDissipativeHGN(DissipativeHGN):
 	DissipativeHGN.  Adds:
 
 	* B  (D × control_dim) — input matrix, state-independent
-	* state_decoder (optional) — latent → observed state MLP
 
 	The controlled ODE is integrated with RK4 (zero-order hold on u).
 
 	Args:
-	    control_dim:    dimension of the control input u
-	    obs_state_dim:  if > 0, adds a state decoder head that maps
-	                    the flattened latent z → obs_state_dim vector.
-	                    Train with MSE against ground-truth state.
+	    control_dim: dimension of the control input u
 	"""
 
 	def __init__(
@@ -52,7 +40,6 @@ class ControlledDissipativeHGN(DissipativeHGN):
 		img_ch: int = 3,
 		dt: float = 0.05,
 		control_dim: int = 1,
-		obs_state_dim: int = 0,
 	):
 		super().__init__(n_frames=n_frames, pos_ch=pos_ch, img_ch=img_ch, dt=dt)
 		self.control_dim = control_dim
@@ -60,19 +47,6 @@ class ControlledDissipativeHGN(DissipativeHGN):
 		# B: input matrix.  Small init so control starts negligible.
 		self.B = nn.Parameter(torch.zeros(self.state_dim, control_dim))
 		nn.init.normal_(self.B, std=1e-2)
-
-		# Optional state decoder: z → observed state (e.g. 4-D CartPole).
-		self.obs_state_dim = obs_state_dim
-		if obs_state_dim > 0:
-			self.state_decoder = nn.Sequential(
-				nn.Linear(self.state_dim, 256),
-				nn.SiLU(),
-				nn.Linear(256, 128),
-				nn.SiLU(),
-				nn.Linear(128, obs_state_dim),
-			)
-		else:
-			self.state_decoder = None
 
 	# ── Controlled dynamics ──────────────────────────────────────────────
 
@@ -171,33 +145,12 @@ class ControlledDissipativeHGN(DissipativeHGN):
 			return frames, qs, ps
 		return frames
 
-	# ── State decoder ────────────────────────────────────────────────────
-
-	def decode_state(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-		"""Predict observed state from latent (q, p).
-
-		Args:
-		    q, p: (B, pos_ch, 4, 4)
-
-		Returns:
-		    state: (B, obs_state_dim)
-		"""
-		if self.state_decoder is None:
-			raise RuntimeError(
-				"No state_decoder; construct with obs_state_dim > 0"
-			)
-		B = q.shape[0]
-		z = torch.cat([q.reshape(B, -1), p.reshape(B, -1)], dim=1)
-		return self.state_decoder(z)
-
-	# ── Deterministic encoding for planning / eval ───────────────────────
+	# ── Deterministic encoding for eval ─────────────────────────────────
 
 	def encode_mean(
 		self, imgs: torch.Tensor
 	) -> tuple[torch.Tensor, torch.Tensor]:
 		"""Encode using the posterior mean — no reparameterisation noise.
-
-		Use this at evaluation time and during MPPI planning.
 
 		Args:
 		    imgs: (B, T, C, H, W)

@@ -90,9 +90,6 @@ def _infer_kwargs(model_type: str, sd: dict) -> dict:
 	if model_type == "ControlledDissipativeHGN":
 		if "B" in sd:
 			kw["control_dim"] = sd["B"].shape[1]
-		# state_decoder is a 5-layer Sequential: Linear SiLU Linear SiLU Linear
-		if "state_decoder.4.weight" in sd:
-			kw["obs_state_dim"] = sd["state_decoder.4.weight"].shape[0]
 	return kw
 
 

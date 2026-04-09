@@ -242,7 +242,6 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
 		feat_dim: int = 256,
 		img_size: int = 64,
 		control_dim: int = 1,
-		obs_state_dim: int = 0,
 		separable: bool = True,
 	):
 		super().__init__(
@@ -267,18 +266,6 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
 		self.control_dim = control_dim
 		self.B = nn.Parameter(torch.zeros(self.state_dim // 2, control_dim))
 		nn.init.normal_(self.B, std=1e-2)
-
-		self.obs_state_dim = obs_state_dim
-		if obs_state_dim > 0:
-			self.state_decoder = nn.Sequential(
-				nn.Linear(self.state_dim, 256),
-				nn.SiLU(),
-				nn.Linear(256, 128),
-				nn.SiLU(),
-				nn.Linear(128, obs_state_dim),
-			)
-		else:
-			self.state_decoder = None
 
 	# ── Controlled dynamics ──────────────────────────────────────────────────
 
@@ -339,18 +326,7 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
 			return frames, qs, ps
 		return frames
 
-	# ── State decoder ────────────────────────────────────────────────────────
-
-	def decode_state(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-		if self.state_decoder is None:
-			raise RuntimeError(
-				"No state_decoder; construct with obs_state_dim > 0"
-			)
-		B = q.shape[0]
-		z = torch.cat([q.reshape(B, -1), p.reshape(B, -1)], dim=1)
-		return self.state_decoder(z)
-
-	# ── Deterministic encoding for planning / eval ───────────────────────────
+	# ── Deterministic encoding for eval ─────────────────────────────────────
 
 	def encode_mean(
 		self, imgs: torch.Tensor

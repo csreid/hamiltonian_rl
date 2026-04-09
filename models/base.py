@@ -59,12 +59,8 @@ class ControlledHGNModel(HGNModel, Protocol):
 		"""Apply one controlled dynamics step."""
 		...
 
-	def decode_state(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-		"""Decode latent (q, p) → observed state vector (B, obs_state_dim)."""
-		...
-
 	def encode_mean(
 		self, imgs: torch.Tensor
 	) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Deterministic encoding (no reparameterisation) for planning."""
+		"""Deterministic encoding (no reparameterisation) for eval."""
 		...
