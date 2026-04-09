@@ -28,5 +28,5 @@ drifter-sim = { path = "../drifter_sim", editable = true }
 line-length = 80
 
 [tool.ruff.format]
-indent-style = "space"
+indent-style = "tab"
 
