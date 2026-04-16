@@ -4,13 +4,12 @@ Extends DHGN_LSTM with a control input port:
 
     dz/dt = (J − R) ∇H(z) + B u
 
-Adds:
-    B  (D × control_dim)    — learned input matrix
-    state_decoder (optional) — latent z → observed state MLP
+Phase space is a flat latent_dim-dimensional vector (q and p each latent_dim//2).
+All Hamiltonian machinery uses MLPs rather than convolutions — the 4×4 spatial
+scaffolding was arbitrary and caused full receptive field collapse after 2 conv layers.
 
-Also replaces the 32×32-hardcoded encoder/decoder with size-flexible
-versions, so the model can work at whatever resolution the environment
-renders at (no forced downscale to 32px²).
+Adds:
+    B  (q_dim × control_dim)    — learned input matrix
 """
 
 import math
@@ -24,183 +23,314 @@ from dhgn_lstm import DHGN_LSTM
 
 
 # ---------------------------------------------------------------------------
-# Size-flexible encoder
+# Per-frame CNN
 # ---------------------------------------------------------------------------
 
 
 class FlexFrameCNN(nn.Module):
-	"""Per-frame CNN: (B, C, H, W) → (B, feat_dim).
+    """Per-frame CNN: (B, C, H, W) → (B, feat_dim).
 
-	Works for any H, W that are multiples of 8.  The flatten size is
-	computed from a dry-run so no hardcoded 1024 assumption.
-	"""
+    Works for any H, W that are multiples of 8.  The flatten size is
+    computed from a dry-run so no hardcoded assumption.
+    """
 
-	def __init__(
-		self, img_ch: int = 3, feat_dim: int = 256, img_size: int = 64
-	):
-		super().__init__()
-		self.conv = nn.Sequential(
-			nn.Conv2d(img_ch, 32, 3, stride=2, padding=1),  # H/2
-			nn.ReLU(),
-			nn.Conv2d(32, 64, 3, stride=2, padding=1),  # H/4
-			nn.ReLU(),
-			nn.Conv2d(64, 64, 3, stride=2, padding=1),  # H/8
-			nn.ReLU(),
-			nn.Conv2d(64, 64, 3, padding=1),
-			nn.ReLU(),
-			nn.Flatten(),
-		)
-		with torch.no_grad():
-			flat = self.conv(torch.zeros(1, img_ch, img_size, img_size)).shape[
-				1
-			]
-		self.fc = nn.Sequential(nn.Linear(flat, feat_dim), nn.ReLU())
+    def __init__(
+        self, img_ch: int = 3, feat_dim: int = 256, img_size: int = 64
+    ):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(img_ch, 32, 3, stride=2, padding=1),  # H/2
+            nn.LeakyReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # H/4
+            nn.LeakyReLU(),
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),  # H/8
+            nn.LeakyReLU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.LeakyReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            flat = self.conv(torch.zeros(1, img_ch, img_size, img_size)).shape[1]
+        self.fc = nn.Sequential(nn.Linear(flat, feat_dim), nn.LeakyReLU())
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		return self.fc(self.conv(x))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.conv(x))
+
+
+# ---------------------------------------------------------------------------
+# Encoder: image sequence → flat latent vector
+# ---------------------------------------------------------------------------
 
 
 class FlexLSTMEncoder(nn.Module):
-	def __init__(
-		self,
-		img_ch: int = 3,
-		feat_dim: int = 256,
-		latent_ch: int = 32,
-		img_size: int = 64,
-	):
-		super().__init__()
-		self.latent_ch = latent_ch
-		self.hidden_size = latent_ch * 4 * 4
+    """Bidirectional LSTM encoder: image sequence → (mu, logvar) flat vectors.
 
-		self.frame_cnn = FlexFrameCNN(
-			img_ch=img_ch, feat_dim=feat_dim, img_size=img_size
-		)
-		self.lstm = nn.LSTM(
-			input_size=feat_dim,
-			hidden_size=self.hidden_size // 2,
-			num_layers=1,
-			batch_first=True,
-			bidirectional=True,
-		)
-		self.mu_head = nn.Conv2d(latent_ch, latent_ch, 1)
-		self.logvar_head = nn.Conv2d(latent_ch, latent_ch, 1)
+    (B, T, C, H, W) → (B, latent_dim), (B, latent_dim)
 
-	def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
-		B, T, C, H, W = imgs.shape
-		return self.frame_cnn(imgs.reshape(B * T, C, H, W)).reshape(B, T, -1)
+    The LSTM hidden size matches feat_dim per direction (total 2*feat_dim),
+    then linear heads project to latent_dim.
+    """
 
-	def forward(
-		self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
-	) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Encode a sequence of frames to (mu, logvar).
+    def __init__(
+        self,
+        img_ch: int = 3,
+        feat_dim: int = 256,
+        latent_dim: int = 32,
+        img_size: int = 64,
+    ):
+        super().__init__()
+        self.frame_cnn = FlexFrameCNN(img_ch=img_ch, feat_dim=feat_dim, img_size=img_size)
+        self.lstm = nn.LSTM(
+            input_size=feat_dim,
+            hidden_size=feat_dim,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.mu_head = nn.Linear(2 * feat_dim, latent_dim)
+        self.logvar_head = nn.Linear(2 * feat_dim, latent_dim)
 
-		Args:
-		    imgs:    (B, T, C, H, W)
-		    lengths: (B,) actual sequence lengths for packing; if None the
-		             full T is used for every sample.
+    def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = imgs.shape
+        return self.frame_cnn(imgs.reshape(B * T, C, H, W)).reshape(B, T, -1)
 
-		Returns:
-		    mu, logvar: each (B, latent_ch, 4, 4)
+    def forward(
+        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode a sequence of frames to (mu, logvar).
 
-		For a bidirectional LSTM the two final hidden states (forward runs
-		left-to-right to the last valid frame; backward runs right-to-left
-		from the last valid frame) are concatenated to give a single
-		hidden_size vector that captures the full sequence context.
-		"""
-		B, T = imgs.shape[:2]
-		feats = self._embed_frames(imgs)  # (B, T, feat_dim)
+        Args:
+            imgs:    (B, T, C, H, W)
+            lengths: (B,) actual sequence lengths; if None the full T is used.
 
-		if lengths is not None:
-			packed = pack_padded_sequence(
-				feats, lengths.cpu(), batch_first=True, enforce_sorted=False
-			)
-			_, (h_n, _) = self.lstm(packed)
-		else:
-			_, (h_n, _) = self.lstm(feats)
+        Returns:
+            mu, logvar: each (B, latent_dim)
+        """
+        B = imgs.shape[0]
+        feats = self._embed_frames(imgs)  # (B, T, feat_dim)
 
-		# h_n: (2, B, hidden_size//2) — dim 0 is [forward, backward]
-		h = h_n.permute(1, 0, 2).reshape(B, self.hidden_size)
-		h_spatial = h.reshape(B, self.latent_ch, 4, 4)
-		return self.mu_head(h_spatial), self.logvar_head(h_spatial)
+        if lengths is not None:
+            packed = pack_padded_sequence(
+                feats, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            _, (h_n, _) = self.lstm(packed)
+        else:
+            _, (h_n, _) = self.lstm(feats)
 
-	def forward_all(
-		self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
-	) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Like forward() but returns mu/logvar for every LSTM timestep.
+        # h_n: (2, B, feat_dim) — forward and backward final hidden states
+        h = h_n.permute(1, 0, 2).reshape(B, -1)  # (B, 2*feat_dim)
+        return self.mu_head(h), self.logvar_head(h)
 
-		Each output position combines the bidirectional hidden state at that
-		step: forward hidden after step t and backward hidden after step t
-		(i.e. looking back from the end of the valid sequence).
+    def forward_all(
+        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode each timestep → per-step (mu, logvar).
 
-		Args:
-		    imgs:    (B, T, C, H, W)
-		    lengths: (B,) actual sequence lengths; pads output back to T.
+        Runs the full LSTM and projects every output hidden state, giving
+        one latent distribution per frame rather than one per sequence.
 
-		Returns:
-		    all_mu:     (B, T, latent_ch, 4, 4)
-		    all_logvar: (B, T, latent_ch, 4, 4)
-		"""
-		B, T, C, H, W = imgs.shape
-		feats = self._embed_frames(imgs)  # (B, T, feat_dim)
+        Args:
+            imgs:    (B, T, C, H, W)
+            lengths: (B,) actual sequence lengths; if None, full T is used.
 
-		if lengths is not None:
-			packed = pack_padded_sequence(
-				feats, lengths.cpu(), batch_first=True, enforce_sorted=False
-			)
-			outputs_packed, _ = self.lstm(packed)
-			outputs, _ = pad_packed_sequence(
-				outputs_packed, batch_first=True, total_length=T
-			)
-		else:
-			outputs, _ = self.lstm(feats)  # (B, T, hidden_size)
+        Returns:
+            mu_all, logvar_all: each (B, T, latent_dim)
+        """
+        B, T = imgs.shape[:2]
+        feats = self._embed_frames(imgs)  # (B, T, feat_dim)
 
-		h_all = outputs.reshape(B * T, self.latent_ch, 4, 4)
-		all_mu = self.mu_head(h_all).reshape(B, T, self.latent_ch, 4, 4)
-		all_logvar = self.logvar_head(h_all).reshape(B, T, self.latent_ch, 4, 4)
-		return all_mu, all_logvar
+        if lengths is not None:
+            packed = pack_padded_sequence(
+                feats, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            out, _ = self.lstm(packed)
+            out, _ = pad_packed_sequence(out, batch_first=True, total_length=T)
+        else:
+            out, _ = self.lstm(feats)
+
+        # out: (B, T, 2*feat_dim) — all-timestep hidden states
+        return self.mu_head(out), self.logvar_head(out)
 
 
 # ---------------------------------------------------------------------------
-# Size-flexible decoder
+# MLP modules replacing the conv-based HGN components
 # ---------------------------------------------------------------------------
+
+
+class MLPStateTransform(nn.Module):
+    """f_ψ: 3-layer MLP mapping sampled z → initial phase-space state s0.
+
+    (B, latent_dim) → (B, latent_dim)
+    """
+
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, latent_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class MLPHamiltonianNet(nn.Module):
+    """H(q, p) implemented as an MLP.
+
+    Separable mode: H = T(q, p) + V(q), matching the physical structure
+    where kinetic energy depends on both q and p but potential only on q.
+
+    Args:
+        latent_dim: total phase-space dimension (q_dim = p_dim = latent_dim // 2)
+        separable:  if True, use T + V decomposition
+    """
+
+    def __init__(self, latent_dim: int, separable: bool = True):
+        super().__init__()
+        self.separable = separable
+        q_dim = latent_dim // 2
+
+        if separable:
+            self.kinetic = nn.Sequential(
+                nn.Linear(latent_dim, 256),
+                nn.Softplus(),
+                nn.Linear(256, 256),
+                nn.Softplus(),
+                nn.Linear(256, 1),
+            )
+            self.potential = nn.Sequential(
+                nn.Linear(q_dim, 256),
+                nn.Softplus(),
+                nn.Linear(256, 256),
+                nn.Softplus(),
+                nn.Linear(256, 1),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim, 256),
+                nn.Softplus(),
+                nn.Linear(256, 256),
+                nn.Softplus(),
+                nn.Linear(256, 1),
+            )
+
+    def forward(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        if self.separable:
+            T = self.kinetic(torch.cat([q, p], dim=-1)).squeeze(-1)
+            V = self.potential(q).squeeze(-1)
+            return T + V
+        return self.net(torch.cat([q, p], dim=-1)).squeeze(-1)
+
+
+class MLPStateDecoder(nn.Module):
+    """Maps (q, p) → observed state vector (B, obs_state_dim).
+
+    Used for supervised auxiliary loss when ground-truth state labels are
+    available (e.g. CartPole 4-vector).
+
+    Args:
+        latent_dim:    total phase-space dimension (q_dim + p_dim)
+        obs_state_dim: dimensionality of the target state vector
+    """
+
+    def __init__(self, latent_dim: int, obs_state_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, obs_state_dim),
+        )
+
+    def forward(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([q, p], dim=-1))
+
+
+class MLPCoordHead(nn.Module):
+    """Maps position q (B, q_dim) → pixel coords (B, 2) in [0, 1]."""
+
+    def __init__(self, q_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(q_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        return self.net(q)
+
+
+# ---------------------------------------------------------------------------
+# Decoder: flat latent vector → image
+# ---------------------------------------------------------------------------
+
+
+def _leaky_hard_sigmoid(x: torch.Tensor, outer_slope: float = 0.01) -> torch.Tensor:
+    """Hard sigmoid in [-3, 3] (slope=1/6) with a leaky tail outside.
+
+    Exactly matches nn.Hardsigmoid in the inner region:
+        f(x) = x/6 + 0.5   for x ∈ [-3, 3]
+
+    Outside, lines connect continuously at (-3, 0) and (3, 1) with slope
+    `outer_slope`, so gradients never vanish completely.
+    """
+    inner = x / 6.0 + 0.5
+    lo = outer_slope * (x + 3.0)           # passes through (-3, 0)
+    hi = outer_slope * (x - 3.0) + 1.0    # passes through (3, 1)
+    return torch.where(x < -3.0, lo, torch.where(x > 3.0, hi, inner))
 
 
 class _DecoderBlock(nn.Module):
-	def __init__(self, in_ch: int):
-		super().__init__()
-		self.conv1 = nn.Conv2d(in_ch, 64, 3, padding=1)
-		self.conv2 = nn.Conv2d(64, 64, 3, padding=1)
+    def __init__(self, in_ch: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, 64, 3, padding=1)
+        self.conv2 = nn.Conv2d(64, 64, 3, padding=1)
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		x = F.interpolate(x, scale_factor=2, mode="nearest")
-		x = F.leaky_relu(self.conv1(x), negative_slope=0.2)
-		x = F.leaky_relu(self.conv2(x), negative_slope=0.2)
-		return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        x = F.leaky_relu(self.conv1(x), negative_slope=0.2)
+        x = F.leaky_relu(self.conv2(x), negative_slope=0.2)
+        return x
 
 
 class FlexDecoder(nn.Module):
-	"""Decoder from (B, pos_ch, 4, 4) → (B, img_ch, img_size, img_size).
+    """Decoder: (B, q_dim) → (B, img_ch, img_size, img_size).
 
-	img_size must equal 4 * 2^k for some k ≥ 1 (e.g. 8, 16, 32, 64, 128).
-	"""
+    A linear layer expands the flat q vector to pos_ch * 4 * 4, which is
+    reshaped to (B, pos_ch, 4, 4) as the spatial seed for progressive upsampling.
 
-	def __init__(self, pos_ch: int = 16, img_ch: int = 3, img_size: int = 64):
-		super().__init__()
-		n_blocks = int(math.log2(img_size // 4))
-		assert 4 * (2**n_blocks) == img_size, (
-			f"img_size must be 4·2^k, got {img_size}"
-		)
-		blocks = [_DecoderBlock(pos_ch)]
-		for _ in range(n_blocks - 1):
-			blocks.append(_DecoderBlock(64))
-		self.blocks = nn.ModuleList(blocks)
-		self.out_conv = nn.Conv2d(64, img_ch, 1)
+    img_size must equal 4 * 2^k for some k ≥ 1 (e.g. 8, 16, 32, 64, 128).
+    """
 
-	def forward(self, q: torch.Tensor) -> torch.Tensor:
-		x = self.blocks[0](q)
-		for block in self.blocks[1:]:
-			x = block(x)
-		return torch.sigmoid(self.out_conv(x))
+    def __init__(
+        self,
+        q_dim: int = 16,
+        pos_ch: int = 16,
+        img_ch: int = 3,
+        img_size: int = 64,
+    ):
+        super().__init__()
+        self.pos_ch = pos_ch
+        n_blocks = int(math.log2(img_size // 4))
+        assert 4 * (2**n_blocks) == img_size, f"img_size must be 4·2^k, got {img_size}"
+
+        self.expand = nn.Linear(q_dim, pos_ch * 4 * 4)
+        blocks = [_DecoderBlock(pos_ch)]
+        for _ in range(n_blocks - 1):
+            blocks.append(_DecoderBlock(64))
+        self.blocks = nn.ModuleList(blocks)
+        self.out_conv = nn.Conv2d(64, img_ch, 1)
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        B = q.shape[0]
+        x = self.expand(q).reshape(B, self.pos_ch, 4, 4)
+        for block in self.blocks:
+            x = block(x)
+        return _leaky_hard_sigmoid(self.out_conv(x))
 
 
 # ---------------------------------------------------------------------------
@@ -209,136 +339,200 @@ class FlexDecoder(nn.Module):
 
 
 class ControlledDHGN_LSTM(DHGN_LSTM):
-	"""Port-Hamiltonian GN with LSTM encoder, dissipation, and control.
+    """Port-Hamiltonian world model with LSTM encoder, dissipation, and control.
 
-	Inherits J, R structure matrices and RK4 dissipative integrator from
-	DHGN_LSTM.  Adds:
+    Inherits J, R structure matrices and RK4 dissipative integrator from
+    DHGN_LSTM.  Replaces all conv-based components with MLPs operating on a
+    flat latent_dim-dimensional phase space:
 
-	    B  (D × control_dim)        control input matrix
-	    state_decoder (optional)    latent z → obs_state_dim MLP
+        q, p ∈ ℝ^(latent_dim/2)
 
-	The controlled ODE integrated with RK4 (zero-order hold on u):
+    The controlled ODE integrated with RK4 (zero-order hold on u):
 
-	    dz/dt = (J − R) ∇H(z) + B u
+        dz/dt = (J − R) ∇H(z) + B u
 
-	The encoder and decoder are replaced with size-flexible versions so
-	the model is not limited to 32×32 inputs/outputs.
+    Args:
+        pos_ch:      spatial channel depth for the decoder's 4×4 seed
+        img_ch:      image channels (3 for RGB)
+        dt:          default integration step size
+        feat_dim:    per-frame CNN embedding size and LSTM hidden size
+        img_size:    spatial resolution of input/output frames
+        latent_dim:  flat phase-space dimension (q and p each latent_dim//2)
+        control_dim: dimension of control input u
+        separable:   if True, use T + V Hamiltonian decomposition
+    """
 
-	Args:
-	    pos_ch:        latent position channel depth
-	    img_ch:        image channels (3 for RGB)
-	    dt:            default integration step size
-	    feat_dim:      per-frame CNN embedding size
-	    img_size:      spatial resolution of input/output frames
-	    control_dim:   dimension of control input u
-	    obs_state_dim: if > 0, adds an MLP head for observed-state prediction
-	"""
+    def __init__(
+        self,
+        pos_ch: int = 16,
+        img_ch: int = 3,
+        dt: float = 0.05,
+        feat_dim: int = 256,
+        img_size: int = 64,
+        latent_dim: int = 32,
+        control_dim: int = 1,
+        separable: bool = True,
+        obs_state_dim: int | None = None,
+    ):
+        super().__init__(
+            pos_ch=pos_ch,
+            img_ch=img_ch,
+            dt=dt,
+            feat_dim=feat_dim,
+            separable=separable,
+        )
 
-	def __init__(
-		self,
-		pos_ch: int = 16,
-		img_ch: int = 3,
-		dt: float = 0.05,
-		feat_dim: int = 256,
-		img_size: int = 64,
-		control_dim: int = 1,
-		separable: bool = True,
-	):
-		super().__init__(
-			pos_ch=pos_ch,
-			img_ch=img_ch,
-			dt=dt,
-			feat_dim=feat_dim,
-			separable=separable,
-		)
+        self.latent_dim = latent_dim
+        q_dim = latent_dim // 2
 
-		# Replace 32×32-hardcoded encoder/decoder with flexible versions.
-		self.encoder = FlexLSTMEncoder(
-			img_ch=img_ch,
-			feat_dim=feat_dim,
-			latent_ch=self.latent_ch,
-			img_size=img_size,
-		)
-		self.decoder = FlexDecoder(
-			pos_ch=pos_ch, img_ch=img_ch, img_size=img_size
-		)
+        # Override state_dim and structure matrices with flat latent_dim.
+        # (Parent created these sized to latent_ch * 4 * 4; reassignment
+        # via nn.Module.__setattr__ cleanly replaces them in _parameters.)
+        self.state_dim = latent_dim
+        self.A = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+        self.L_param = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+        nn.init.normal_(self.A, std=1e-2)
+        nn.init.normal_(self.L_param, std=1e-2)
 
-		self.control_dim = control_dim
-		self.B = nn.Parameter(torch.zeros(self.state_dim // 2, control_dim))
-		nn.init.normal_(self.B, std=1e-2)
+        # Replace all conv-based modules with flat MLP equivalents.
+        self.encoder = FlexLSTMEncoder(
+            img_ch=img_ch,
+            feat_dim=feat_dim,
+            latent_dim=latent_dim,
+            img_size=img_size,
+        )
+        self.f_psi = MLPStateTransform(latent_dim)
+        self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
+        self.decoder = FlexDecoder(
+            q_dim=q_dim, pos_ch=pos_ch, img_ch=img_ch, img_size=img_size
+        )
+        self.coord_head = MLPCoordHead(q_dim)
 
-	# ── Controlled dynamics ──────────────────────────────────────────────────
+        self.control_dim = control_dim
+        self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
+        nn.init.normal_(self.B, std=1e-2)
 
-	def _controlled_dynamics(
-		self,
-		q: torch.Tensor,
-		p: torch.Tensor,
-		u: torch.Tensor,
-		M: torch.Tensor,
-	) -> tuple[torch.Tensor, torch.Tensor]:
-		"""dz/dt = (J − R) ∇H + B u."""
-		dq, dp = self._dynamics(q, p, M)
-		Bu = u @ self.B.T  # (B_batch, D)
-		dp = dp + Bu.reshape_as(p)
-		return dq, dp
+        self.state_decoder = (
+            MLPStateDecoder(latent_dim, obs_state_dim)
+            if obs_state_dim is not None
+            else None
+        )
 
-	@torch.enable_grad()
-	def controlled_step(
-		self,
-		q: torch.Tensor,
-		p: torch.Tensor,
-		u: torch.Tensor,
-		dt: float | None = None,
-	) -> tuple[torch.Tensor, torch.Tensor]:
-		"""One RK4 step of dz/dt = (J − R) ∇H + B u (zero-order hold on u)."""
-		if dt is None:
-			dt = self.dt
-		M = self.get_J_minus_R()
-		dq1, dp1 = self._controlled_dynamics(q, p, u, M)
-		dq2, dp2 = self._controlled_dynamics(
-			q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u, M
-		)
-		dq3, dp3 = self._controlled_dynamics(
-			q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u, M
-		)
-		dq4, dp4 = self._controlled_dynamics(q + dt * dq3, p + dt * dp3, u, M)
-		q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
-		p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
-		return q_next, p_next
+        with torch.no_grad():
+            self.f_psi.net[-1].weight.data *= 20.0
+            self.f_psi.net[-1].bias.data *= 20.0
 
-	def rollout_controlled(
-		self,
-		q: torch.Tensor,
-		p: torch.Tensor,
-		us: torch.Tensor,
-		dt: float | None = None,
-		return_states: bool = False,
-	):
-		"""Roll out applying control sequence us (B, H, control_dim)."""
-		frames = [self.decoder(q)]
-		qs, ps = [q], [p]
-		for t in range(us.shape[1]):
-			q, p = self.controlled_step(q, p, us[:, t], dt=dt)
-			frames.append(self.decoder(q))
-			qs.append(q)
-			ps.append(p)
-		if return_states:
-			return frames, qs, ps
-		return frames
+    # ── Phase-space helpers ─────────────────────────────────────────────────
 
-	# ── Deterministic encoding for eval ─────────────────────────────────────
+    def _split(self, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        half = self.latent_dim // 2
+        return s[:, :half], s[:, half:]
 
-	def encode_mean(
-		self, imgs: torch.Tensor
-	) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Encode using posterior mean — no reparameterisation noise.
+    # ── Forward (encode → initial state) ───────────────────────────────────
 
-		Args:
-		    imgs: (B, T, C, H, W)
+    def forward(
+        self, imgs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Infer initial phase-space state from an image sequence.
 
-		Returns:
-		    q, p: (B, pos_ch, 4, 4)
-		"""
-		mu, _ = self.encoder(imgs)
-		s0 = self.f_psi(mu)
-		return self._split(s0)
+        Args:
+            imgs: (B, T, C, H, W)
+
+        Returns:
+            q0, p0: (B, latent_dim//2) each
+            kl:     (B,)
+            mu:     (B, latent_dim)
+            log_var:(B, latent_dim)
+        """
+        mu, log_var = self.encoder(imgs)
+        log_var = log_var.clamp(-10, 10)
+        z = mu + torch.randn_like(mu) * (0.5 * log_var).exp()
+        s0 = self.f_psi(z)
+        q0, p0 = self._split(s0)
+        kl = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())
+        kl = kl.sum(dim=1)  # (B,) — sum over latent_dim
+        return q0, p0, kl, mu, log_var
+
+    # ── Controlled dynamics ─────────────────────────────────────────────────
+
+    def _controlled_dynamics(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        u: torch.Tensor,
+        M: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """dz/dt = (J − R) ∇H + B u."""
+        dq, dp = self._dynamics(q, p, M)
+        Bu = u @ self.B.T  # (B, q_dim)
+        dp = dp + Bu
+        return dq, dp
+
+    @torch.enable_grad()
+    def controlled_step(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        u: torch.Tensor,
+        dt: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One RK4 step of dz/dt = (J − R) ∇H + B u (zero-order hold on u)."""
+        if dt is None:
+            dt = self.dt
+        M = self.get_J_minus_R()
+        dq1, dp1 = self._controlled_dynamics(q, p, u, M)
+        dq2, dp2 = self._controlled_dynamics(
+            q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u, M
+        )
+        dq3, dp3 = self._controlled_dynamics(
+            q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u, M
+        )
+        dq4, dp4 = self._controlled_dynamics(q + dt * dq3, p + dt * dp3, u, M)
+        q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
+        p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
+        return q_next, p_next
+
+    def rollout_controlled(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        us: torch.Tensor,
+        dt: float | None = None,
+        return_states: bool = False,
+    ):
+        """Roll out applying control sequence us (B, H, control_dim)."""
+        frames = [self.decoder(q)]
+        qs, ps = [q], [p]
+        for t in range(us.shape[1]):
+            q, p = self.controlled_step(q, p, us[:, t], dt=dt)
+            frames.append(self.decoder(q))
+            qs.append(q)
+            ps.append(p)
+        if return_states:
+            return frames, qs, ps
+        return frames
+
+    # ── Deterministic encoding for eval ────────────────────────────────────
+
+    def decode_state(
+        self, q: torch.Tensor, p: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Decode (q, p) to observed state via state_decoder, or None."""
+        if self.state_decoder is None:
+            return None
+        return self.state_decoder(q, p)
+
+    def encode_mean(
+        self, imgs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode using posterior mean — no reparameterisation noise.
+
+        Args:
+            imgs: (B, T, C, H, W)
+
+        Returns:
+            q, p: (B, latent_dim//2) each
+        """
+        mu, _ = self.encoder(imgs)
+        s0 = self.f_psi(mu)
+        return self._split(s0)

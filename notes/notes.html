@@ -389,6 +389,65 @@ class="math inline">(<em>q</em>,<em>p</em>)<sub><em>k</em>…<em>t</em></sub></s
 <h2>Collapse</h2>
 <p><img src="images/collapse.png" /></p>
 </section>
+
+<section id="section-2" class="title-slide slide level1">
+<h1>4/13</h1>
+
+</section>
+<section id="change-of-plans" class="slide level2">
+<h2>Change of Plans</h2>
+<ul>
+<li>Full CartPole + MPPI pipeline was too ambitious for now</li>
+<li>Backed off to the simpler problem: <strong>learn phase space +
+reconstruction from pixels</strong>
+<ul>
+<li>Same framing as the SHO work, but for Pendulum</li>
+<li>Wrapped <code>Pendulum-v1</code> to add damping</li>
+</ul></li>
+</ul>
+</section>
+<section id="architecture" class="slide level2">
+<h2>Architecture</h2>
+<ol type="1">
+<li>Bidirectional LSTM over the <strong>full trajectory</strong> <span
+class="math inline"> → (<em>q</em><sub>0</sub>,<em>p</em><sub>0</sub>)</span></li>
+<li>Integrate Hamiltonian dynamics forward with
+<strong>RK4</strong></li>
+<li>Decode phase-space trajectory back to pixels</li>
+</ol>
+</section>
+<section id="results" class="slide level2">
+<h2>Results</h2>
+<p><img src="images/pendulum_recon.gif" /></p>
+<p>GT (left) vs. reconstruction (right)</p>
+</section>
+<section id="why-pendulum" class="slide level2">
+<h2>Why Pendulum?</h2>
+<ul>
+<li>Trying to eliminate as many variables as possible</li>
+<li>Pendulum has a <strong>separable Hamiltonian</strong>: <span
+class="math inline">ℋ(<em>q</em>,<em>p</em>) = <em>T</em>(<em>p</em>) + <em>V</em>(<em>q</em>)</span>
+<ul>
+<li>Stronger inductive bias than CartPole</li>
+<li><span class="math inline"><em>T</em></span> and <span
+class="math inline"><em>V</em></span> can be learned independently</li>
+</ul></li>
+<li>CartPole is non-separable — removing that complexity first</li>
+</ul>
+</section>
+<section id="dissipation-structure" class="slide level2">
+<h2>Dissipation Structure</h2>
+<p><img src="images/R_eigenvalues.png" /></p>
+<p>One large eigenvalue, 15 near zero — model correctly concentrates
+dissipation in one mode</p>
+</section>
+<section id="concerns" class="slide level2">
+<h2>Concerns</h2>
+<ul>
+<li>Results might be <strong>too good</strong> — want to check longer
+Hamiltonian rollouts to ensure it generalizes</li>
+</ul>
+</section>
 <!-- {{{{ dzslides core
 #
 #

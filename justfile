@@ -1,2 +1,11 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
 sync:
-	rsync -av --exclude 'post.py' --exclude='.venv' --exclude='__pycache__' --exclude='.git/' --exclude='*.pyc' . workstation:~/src/hamiltonian
+    git add .
+    git commit
+    git push origin main
+
+run script *args:
+    git fetch origin
+    git reset --hard origin/main
+    PYTHONPATH=. uv run python {{script}} {{args}}

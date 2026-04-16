@@ -1,0 +1,128 @@
+
+============================================================
+  0. COLLECT A FEW EPISODES
+============================================================
+  Collected 6 episodes (200 steps each).
+  [INFO] frames dtype=torch.float32  shape=torch.Size([201, 3, 64, 64])
+  [INFO] frames min=0.076  max=1.000  mean=0.991
+  [PASS] frames in [0,1] float32
+  [INFO] Background fraction (pixels > 0.9): 0.976
+  [FAIL] Image is >95% background — MSE with a white prediction will be tiny (~0.0006). Consider a focal/foreground-weighted loss or a darker background.
+  [INFO] Saved sample frame to /tmp/diag_frame0.png
+
+============================================================
+  1. BUILD MODEL
+============================================================
+  [INFO] Parameters: 2,379,639
+  [PASS] model.encoder exists
+  [PASS] model.decoder exists
+  [PASS] model.f_psi exists
+  [PASS] model._split exists
+  [PASS] model.controlled_step exists
+  [PASS] model.encode_mean exists
+  [PASS] model.H exists
+
+============================================================
+  2. ENCODER OUTPUT SANITY
+============================================================
+  [INFO] mu     shape=(1, 16, 4, 4)  min=-0.253  max=0.288  mean=0.1436
+  [INFO] logvar shape=(1, 16, 4, 4)  min=-0.251  max=0.247
+  [PASS] mu is non-trivial
+  [PASS] logvar range looks reasonable: [-0.25, 0.25]
+  [INFO] sigma  min=0.8820  max=1.1314  mean=1.0042
+  [PASS] sigma looks non-trivial
+
+============================================================
+  3. f_psi / _split
+============================================================
+  [INFO] z   shape=(1, 16, 4, 4)
+  [INFO] qp  shape=(1, 16, 4, 4)
+  [INFO] q   shape=(1, 8, 4, 4)  min=-0.037  max=0.054  mean=0.0252
+  [INFO] p   shape=(1, 8, 4, 4)  min=-0.067  max=0.048  mean=0.0232
+  [PASS] q/p are non-trivial after f_psi/_split
+
+============================================================
+  4. DECODER OUTPUT SANITY (no dynamics)
+============================================================
+  [INFO] pred shape=(1, 3, 64, 64)  min=0.0000  max=0.0919  mean=0.0285
+  [INFO] MSE(decoder(q0), frame_0) at init = 0.935908
+  [PASS] Decoder output has non-trivial variance
+  [INFO] Saved init reconstruction to /tmp/diag_decoder_init.png
+
+============================================================
+  5. GRADIENT FLOW: single-step reconstruction, no dynamics
+============================================================
+
+  [FAIL] Encoder params with no/zero gradient (2 of them):
+    logvar_head.weight
+    logvar_head.bias
+  [PASS] All decoder parameters have non-zero gradients
+
+  [INFO] Sample gradient magnitudes (encoder):
+    frame_cnn.conv.0.weight                   abs_mean=1.00e-09  abs_max=6.25e-09
+    frame_cnn.conv.0.bias                     abs_mean=1.08e-09  abs_max=6.12e-09
+    frame_cnn.conv.2.weight                   abs_mean=5.78e-10  abs_max=1.36e-08
+    frame_cnn.conv.2.bias                     abs_mean=2.80e-09  abs_max=1.39e-08
+    frame_cnn.conv.4.weight                   abs_mean=6.37e-10  abs_max=1.87e-08
+    frame_cnn.conv.4.bias                     abs_mean=8.41e-09  abs_max=3.29e-08
+
+============================================================
+  6. GRADIENT FLOW THROUGH controlled_step
+============================================================
+  [PASS] Encoder receives gradients through controlled_step (20 params)
+
+============================================================
+  7. HAMILTONIAN FUNCTION SANITY
+============================================================
+  [INFO] H(q,p) = -15.4567
+  [PASS] H(q,p) is finite
+  [INFO] H after one step = -15.4567  (delta = 0.0001)
+  [PASS] H is finite after one step
+
+============================================================
+  8. MEMORIZATION TEST  (decoder-only, no dynamics)
+============================================================
+  [INFO] Overfitting decoder(f_psi(mu)) → frame_0 for 200 steps (no KL, no dynamics)
+  [INFO] If this doesn't converge, the encoder→f_psi→decoder path is broken at the architecture level.
+  [INFO] Loss at step   0: 0.922681
+  [INFO] Loss at step  50: 0.003731
+  [INFO] Loss at step 199: 0.003731
+  [PASS] Decoder-only memorization converges — encoder/decoder pipeline is functional
+  [INFO] Saved memorization curve to /tmp/diag_memorization.png
+  [INFO] Saved memorization reconstruction to /tmp/diag_memorization_recon.png
+
+============================================================
+  9. MEMORIZATION TEST WITH T=1 ROLLOUT
+============================================================
+  [INFO] Overfitting through one controlled_step for 300 steps (no KL)
+  [INFO] Loss at step   0: 1.789867
+  [INFO] Loss at step 100: 0.008806
+  [INFO] Loss at step 299: 0.008806
+  [PASS] T=1 rollout memorization converges — dynamics path has gradients
+  [INFO] Saved T=1 memorization curve to /tmp/diag_t1_memorization.png
+
+============================================================
+  10. NaN/INF PATROL
+============================================================
+  [PASS] mu is finite
+  [PASS] logvar is finite
+  [PASS] z is finite
+  [PASS] q is finite
+  [PASS] p is finite
+  [PASS] 20-step rollout stays finite and bounded
+
+============================================================
+  SUMMARY
+============================================================
+
+Interpret results in order:
+  Test 8 FAIL → encoder/decoder architecture is broken (shapes, dead activations, detach)
+  Test 8 PASS, Test 9 FAIL → gradient dies in controlled_step/RK4 (likely .detach() in dynamics)
+  Test 8 PASS, Test 9 PASS → the issue is in training loop bookkeeping (KL, loss scale, lr)
+  Test 5 dead grads → .detach() between encoder and decoder somewhere
+  Test 6 dead grads → .detach() in controlled_step or the J/R/B computation
+  Test 10 explosion → numerics unstable, reduce dt or check R positive-definiteness
+  Section 0 bg_frac FAIL → trivial MSE floor, model learns mean background
+  
+Diagnostic images saved to /tmp/diag_*.png
+

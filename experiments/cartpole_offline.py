@@ -26,62 +26,59 @@ from phgn_lstm import ControlledDHGN_LSTM
 
 
 def _train_epoch(
-    model: ControlledDHGN_LSTM,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    kl_weight: float,
-    free_bits: float,
-    grad_clip: float,
-    device: torch.device,
+	model: ControlledDHGN_LSTM,
+	loader: DataLoader,
+	optimizer: torch.optim.Optimizer,
+	kl_weight: float,
+	free_bits: float,
+	grad_clip: float,
+	device: torch.device,
 ) -> dict[str, float]:
-    model.train()
-    total_recon = total_kl = total_loss = 0.0
+	model.train()
+	total_recon = total_kl = total_loss = 0.0
 
-    for ctx, action, next_frame, _ in loader:
-        ctx = ctx.to(device)            # (B, n_frames, C, H, W)
-        action = action.to(device)      # (B, 1)
-        next_frame = next_frame.to(device)  # (B, C, H, W)
+	for ctx, action, next_frame, _ in loader:
+		ctx = ctx.to(device)  # (B, n_frames, C, H, W)
+		action = action.to(device)  # (B, 1)
+		next_frame = next_frame.to(device)  # (B, C, H, W)
 
-        mu, logvar = model.encoder(ctx)
-        logvar = logvar.clamp(-10, 10)
-        z = mu + torch.randn_like(mu) * (0.5 * logvar).exp()
-        q0, p0 = model._split(model.f_psi(z))
+		q0, p0, kl_raw, _, _ = model(ctx)
 
-        q1, p1 = model.controlled_step(q0, p0, action)
-        pred = model.decoder(q1)
+		q1, p1 = model.controlled_step(q0, p0, action)
+		pred = model.decoder(q1)
 
-        recon = F.mse_loss(pred, next_frame)
-        kl = (
-            -0.5
-            * (1 + logvar - mu.pow(2) - logvar.exp())
-            .sum(dim=[1, 2, 3])
-            .clamp(min=free_bits)
-            .mean()
-        )
-        loss = recon + kl_weight * kl
+		recon = F.mse_loss(pred, next_frame)
+		kl = kl_raw.clamp(min=free_bits).mean()
+		loss = recon + kl_weight * kl
 
-        optimizer.zero_grad()
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+		optimizer.zero_grad()
+		loss.backward()
+		if grad_clip > 0:
+			torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+		optimizer.step()
 
-        total_recon += recon.item()
-        total_kl += kl.item()
-        total_loss += loss.item()
+		total_recon += recon.item()
+		total_kl += kl.item()
+		total_loss += loss.item()
 
-    n = len(loader)
-    return {
-        "train/loss": total_loss / n,
-        "train/recon": total_recon / n,
-        "train/kl": total_kl / n,
-    }
+	n = len(loader)
+	return {
+		"train/loss": total_loss / n,
+		"train/recon": total_recon / n,
+		"train/kl": total_kl / n,
+	}
 
 
 @click.command()
 # data
 @click.option("--n-episodes", type=int, default=200, show_default=True)
-@click.option("--n-frames", type=int, default=8, show_default=True, help="Context frames for LSTM encoder")
+@click.option(
+	"--n-frames",
+	type=int,
+	default=8,
+	show_default=True,
+	help="Context frames for LSTM encoder",
+)
 @click.option("--img-size", type=int, default=64, show_default=True)
 @click.option("--scripted-fraction", type=float, default=0.5, show_default=True)
 # model
@@ -100,79 +97,79 @@ def _train_epoch(
 @click.option("--log-every", type=int, default=5, show_default=True)
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
 def main(**kwargs):
-    assert kwargs["img_size"] % 8 == 0
+	assert kwargs["img_size"] % 8 == 0
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	print(f"Device: {device}")
 
-    writer = SummaryWriter(comment="_phgn_lstm_offline")
-    run_dir = make_run_dir("cartpole_offline")
+	writer = SummaryWriter(comment="_phgn_lstm_offline")
+	run_dir = make_run_dir("cartpole_offline")
 
-    print(f"\nCollecting data from {kwargs['n_episodes']} episodes...")
-    transitions = collect_data(
-        n_episodes=kwargs["n_episodes"],
-        n_frames=kwargs["n_frames"],
-        img_size=kwargs["img_size"],
-        scripted_fraction=kwargs["scripted_fraction"],
-    )
-    dataset = CartPoleDataset(transitions)
-    loader = DataLoader(
-        dataset,
-        batch_size=kwargs["batch_size"],
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-    )
-    print(f"Dataset: {len(dataset):,} transitions")
+	print(f"\nCollecting data from {kwargs['n_episodes']} episodes...")
+	transitions = collect_data(
+		n_episodes=kwargs["n_episodes"],
+		n_frames=kwargs["n_frames"],
+		img_size=kwargs["img_size"],
+		scripted_fraction=kwargs["scripted_fraction"],
+	)
+	dataset = CartPoleDataset(transitions)
+	loader = DataLoader(
+		dataset,
+		batch_size=kwargs["batch_size"],
+		shuffle=True,
+		num_workers=2,
+		pin_memory=True,
+	)
+	print(f"Dataset: {len(dataset):,} transitions")
 
-    model = ControlledDHGN_LSTM(
-        pos_ch=kwargs["pos_ch"],
-        img_ch=3,
-        dt=kwargs["dt"],
-        feat_dim=kwargs["feat_dim"],
-        img_size=kwargs["img_size"],
-        control_dim=1,
-        separable=kwargs["separable"],
-    ).to(device)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+	model = ControlledDHGN_LSTM(
+		pos_ch=kwargs["pos_ch"],
+		img_ch=3,
+		dt=kwargs["dt"],
+		feat_dim=kwargs["feat_dim"],
+		img_size=kwargs["img_size"],
+		control_dim=1,
+		separable=kwargs["separable"],
+	).to(device)
+	print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
-    best_loss = float("inf")
+	optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
+	best_loss = float("inf")
 
-    hparams = {k: v for k, v in kwargs.items()}
+	hparams = {k: v for k, v in kwargs.items()}
 
-    for epoch in tqdm(range(kwargs["n_epochs"]), desc="Epochs"):
-        metrics = _train_epoch(
-            model=model,
-            loader=loader,
-            optimizer=optimizer,
-            kl_weight=kwargs["kl_weight"],
-            free_bits=kwargs["free_bits"],
-            grad_clip=kwargs["grad_clip"],
-            device=device,
-        )
+	for epoch in tqdm(range(kwargs["n_epochs"]), desc="Epochs"):
+		metrics = _train_epoch(
+			model=model,
+			loader=loader,
+			optimizer=optimizer,
+			kl_weight=kwargs["kl_weight"],
+			free_bits=kwargs["free_bits"],
+			grad_clip=kwargs["grad_clip"],
+			device=device,
+		)
 
-        if (epoch + 1) % kwargs["log_every"] == 0:
-            for k, v in metrics.items():
-                writer.add_scalar(k, v, epoch)
-            tqdm.write(
-                f"  epoch {epoch + 1:3d}"
-                f"  loss={metrics['train/loss']:.4f}"
-                f"  recon={metrics['train/recon']:.4f}"
-                f"  kl={metrics['train/kl']:.4f}"
-            )
+		if (epoch + 1) % kwargs["log_every"] == 0:
+			for k, v in metrics.items():
+				writer.add_scalar(k, v, epoch)
+			tqdm.write(
+				f"  epoch {epoch + 1:3d}"
+				f"  loss={metrics['train/loss']:.4f}"
+				f"  recon={metrics['train/recon']:.4f}"
+				f"  kl={metrics['train/kl']:.4f}"
+			)
 
-        if (
-            kwargs["checkpoint_every"] > 0
-            and (epoch + 1) % kwargs["checkpoint_every"] == 0
-        ):
-            if metrics["train/loss"] < best_loss:
-                best_loss = metrics["train/loss"]
-                save_checkpoint(run_dir, epoch, model, hparams, metrics)
+		if (
+			kwargs["checkpoint_every"] > 0
+			and (epoch + 1) % kwargs["checkpoint_every"] == 0
+		):
+			if metrics["train/loss"] < best_loss:
+				best_loss = metrics["train/loss"]
+				save_checkpoint(run_dir, epoch, model, hparams, metrics)
 
-    writer.close()
-    print("\nDone. Run: tensorboard --logdir runs")
+	writer.close()
+	print("\nDone. Run: tensorboard --logdir runs")
 
 
 if __name__ == "__main__":
-    main()
+	main()

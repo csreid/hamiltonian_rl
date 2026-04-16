@@ -114,3 +114,41 @@ $$\dot{q} = M^{-1}p$$
 
 ![](images/collapse.png)
 
+# 4/13
+
+## Change of Plans
+
+* Full CartPole + MPPI pipeline was too ambitious for now
+* Backed off to the simpler problem: **learn phase space + reconstruction from pixels**
+  * Same framing as the SHO work, but for Pendulum
+  * Wrapped `Pendulum-v1` to add damping
+
+## Architecture
+
+1. Bidirectional LSTM over the **full trajectory** $\rightarrow (q_0, p_0)$
+2. Integrate Hamiltonian dynamics forward with **RK4**
+3. Decode phase-space trajectory back to pixels
+
+## Results
+
+![](images/pendulum_recon.gif)
+
+GT (left) vs. reconstruction (right)
+
+## Why Pendulum?
+
+* Trying to eliminate as many variables as possible
+* Pendulum has a **separable Hamiltonian**: $\mathcal{H}(q,p) = T(p) + V(q)$
+  * Stronger inductive bias than CartPole
+  * $T$ and $V$ can be learned independently
+* CartPole is non-separable — removing that complexity first
+
+## Dissipation Structure
+
+![](images/R_eigenvalues.png)
+
+One large eigenvalue, 15 near zero — model correctly concentrates dissipation in one mode
+
+## Concerns
+
+* Results might be **too good** — want to check longer Hamiltonian rollouts to ensure it generalizes
