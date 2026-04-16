@@ -198,21 +198,35 @@ def _log_reconstruction_video(
     epoch: int,
     tag: str = "val/reconstruction",
     fps: int = 10,
+    use_dynamics: bool = False,
 ) -> None:
-    """Log a side-by-side ground-truth / reconstruction video to TensorBoard."""
+    """Log a side-by-side ground-truth / reconstruction video to TensorBoard.
+
+    use_dynamics=False (default): encode each frame via forward_all, matching
+    the Phase-1 training objective (per-frame reconstruction).
+    use_dynamics=True: encode a single initial state then roll out with the
+    learned Hamiltonian dynamics (appropriate after Phase 2).
+    """
     model.eval()
     frames, actions, _ = val_traj  # (T+1, C, H, W), (T,)
 
     ctx = frames.unsqueeze(0).to(device)  # (1, T+1, C, H, W)
-    q, p = model.encode_mean(ctx)
+    q_dim = model.latent_dim // 2
 
-    recon_frames = [model.decoder(q).squeeze(0).cpu()]  # decoded q0
-    for t in range(len(actions)):
-        u = actions[t].reshape(1, 1).to(device)
-        q, p = model.controlled_step(q, p, u)
-        recon_frames.append(model.decoder(q).squeeze(0).cpu())
+    if use_dynamics:
+        q, p = model.encode_mean(ctx)
+        recon_frames = [model.decoder(q).squeeze(0).cpu()]
+        for t in range(len(actions)):
+            u = actions[t].reshape(1, 1).to(device)
+            q, p = model.controlled_step(q, p, u)
+            recon_frames.append(model.decoder(q).squeeze(0).cpu())
+        recon = torch.stack(recon_frames)
+    else:
+        mu_all, _ = model.encoder.forward_all(ctx)   # (1, T+1, latent_dim)
+        s_all = model.f_psi(mu_all.squeeze(0))        # (T+1, latent_dim)
+        qs_enc = s_all[:, :q_dim]                     # (T+1, q_dim)
+        recon = model.decoder(qs_enc).cpu()            # (T+1, C, H, W)
 
-    recon = torch.stack(recon_frames)  # (T+1, C, H, W)
     gt = frames  # (T+1, C, H, W)
 
     # Annotate each frame with its frame number.
@@ -508,6 +522,7 @@ def main(**kwargs):
                     writer=writer,
                     epoch=global_epoch,
                     tag=f"val/reconstruction/{label}",
+                    use_dynamics=(phase == "P2"),
                 )
             if val_energy:
                 _log_hamiltonian_comparison(
