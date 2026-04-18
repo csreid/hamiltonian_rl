@@ -122,7 +122,7 @@ def _collect_episodes(
     Returns a list of (frames, actions, states) tuples:
         frames  : (T+1, 3, img_size, img_size) float32 [0,1]
         actions : (T,)  float32
-        states  : (T+1, 2) float32 — (theta, theta_dot) at each frame, post-damping
+        states  : (T+1, 3) float32 — (cos(theta), sin(theta), theta_dot) at each frame, post-damping
     """
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
@@ -135,7 +135,7 @@ def _collect_episodes(
         theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
         frames = [torch.from_numpy(obs).float() / 255.0]
         actions = []
-        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
+        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
         for _ in range(max_steps):
             theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
@@ -152,7 +152,7 @@ def _collect_episodes(
             frames.append(torch.from_numpy(obs).float() / 255.0)
             actions.append(action)
             states.append(
-                np.array([theta_next, theta_dot_next], dtype=np.float32)
+                np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32)
             )
 
         episodes.append(
@@ -253,7 +253,7 @@ def _collect_spin_episodes(
         theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
         frames = [torch.from_numpy(obs).float() / 255.0]
         actions = []
-        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
+        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
         for _ in range(max_steps):
             _, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
@@ -262,7 +262,7 @@ def _collect_spin_episodes(
             theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
             frames.append(torch.from_numpy(obs).float() / 255.0)
             actions.append(action)
-            states.append(np.array([theta_next, theta_dot_next], dtype=np.float32))
+            states.append(np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32))
 
         episodes.append(
             (
@@ -298,7 +298,7 @@ class PendulumDataset(Dataset):
 
     frames  : (T+1, 3, img_size, img_size) float32 [0,1]
     actions : (T,)  float32
-    states  : (T+1, 2) float32 — (theta, theta_dot)
+    states  : (T+1, 3) float32 — (cos(theta), sin(theta), theta_dot)
     """
 
     def __init__(
@@ -306,7 +306,7 @@ class PendulumDataset(Dataset):
     ):
         self.frames = torch.stack([e[0] for e in episodes])  # (N, T+1, 3, H, W)
         self.actions = torch.stack([e[1] for e in episodes])  # (N, T)
-        self.states = torch.stack([e[2] for e in episodes])  # (N, T+1, 2)
+        self.states = torch.stack([e[2] for e in episodes])  # (N, T+1, 3)
 
     def __len__(self):
         return len(self.frames)

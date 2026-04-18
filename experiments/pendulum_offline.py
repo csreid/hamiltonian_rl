@@ -120,7 +120,7 @@ def _train_epoch_phase1(
 
         with torch.no_grad():
             z_flat = s_all.detach().cpu().reshape(-1, model.latent_dim)
-            st_flat = states.reshape(-1, 2).float()
+            st_flat = states.reshape(-1, 3).float()
             total_r2 += _batch_r2(z_flat, st_flat)
 
     n = len(loader)
@@ -195,10 +195,10 @@ def _train_epoch_phase2(
     }
 
 def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
-    """Compute H = 0.5*theta_dot^2 + g*(1 - cos(theta)) from (T, 2) states."""
-    theta = states[:, 0].numpy()
-    theta_dot = states[:, 1].numpy()
-    return 0.5 * theta_dot**2 + _G * (1.0 + np.cos(theta))
+    """Compute H = 0.5*theta_dot^2 + g*(1 + cos(theta)) from (T, 3) states."""
+    cos_theta = states[:, 0].numpy()
+    theta_dot = states[:, 2].numpy()
+    return 0.5 * theta_dot**2 + _G * (1.0 + cos_theta)
 
 
 def _annotate_frame(frame: torch.Tensor, text: str) -> torch.Tensor:
@@ -369,16 +369,16 @@ def _log_latent_scatter(
     mu_all, _ = model.encoder.forward_all(ctx)
     s_all = model.f_psi(mu_all.squeeze(0)).cpu()  # (T+1, latent_dim)
 
-    st = states.float()  # (T+1, 2): [θ, θ̇]
-    A = torch.linalg.lstsq(s_all, st).solution  # (latent_dim, 2)
+    st = states.float()  # (T+1, 3): [cos(θ), sin(θ), θ̇]
+    A = torch.linalg.lstsq(s_all, st).solution  # (latent_dim, 3)
     st_pred = (s_all @ A).numpy()
     st_true = st.numpy()
 
     T = st_true.shape[0]
     colors = np.arange(T)
 
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-    for i, name in enumerate(["θ (rad)", "θ̇ (rad/s)"]):
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for i, name in enumerate(["cos(θ)", "sin(θ)", "θ̇ (rad/s)"]):
         true_i = st_true[:, i]
         pred_i = st_pred[:, i]
         axes[i].scatter(true_i, pred_i, c=colors, cmap="viridis", s=3, alpha=0.7)
