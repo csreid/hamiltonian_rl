@@ -125,14 +125,13 @@ def _train_epoch_phase1(
 
     n = len(loader)
     return {
-        "train/loss": total_loss / n,
-        "train/recon": total_recon / n,
-        "train/kl": total_kl / n,
-        "train/fd_loss": total_fd / n,
-        "train/r2": total_r2 / n,
-        "train/latent": 0.0,
-        "train/q_var": total_q_var / n,
-        "train/p_var": total_p_var / n,
+        "phase1_train/loss": total_loss / n,
+        "phase1_train/recon": total_recon / n,
+        "phase1_train/kl": total_kl / n,
+        "phase1_train/fd_loss": total_fd / n,
+        "phase1_train/r2": total_r2 / n,
+        "phase1_train/q_var": total_q_var / n,
+        "phase1_train/p_var": total_p_var / n,
     }
 
 
@@ -189,12 +188,10 @@ def _train_epoch_phase2(
 
     n = len(loader)
     return {
-        "train/loss": total_latent / n,
-        "train/recon": 0.0,
-        "train/kl": 0.0,
-        "train/latent": total_latent / n,
-        "train/q_var": total_q_var / n,
-        "train/p_var": total_p_var / n,
+        "phase2_train/loss": total_latent / n,
+        "phase2_train/latent": total_latent / n,
+        "phase2_train/q_var": total_q_var / n,
+        "phase2_train/p_var": total_p_var / n,
     }
 
 def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
@@ -561,23 +558,23 @@ def main(**kwargs):
     best_latent = float("inf")
     global_epoch = 0
 
-    def _log_and_checkpoint(metrics, epoch, phase, best_val, metric_key):
+    def _log_and_checkpoint(metrics, epoch, phase, best_val, metric_key, prefix):
         if (epoch + 1) % kwargs["log_every"] == 0:
             for k, v in metrics.items():
                 writer.add_scalar(k, v, global_epoch)
             extra = ""
-            if "train/fd_loss" in metrics:
-                extra += f"  fd={metrics['train/fd_loss']:.4f}"
-            if "train/r2" in metrics:
-                extra += f"  r2={metrics['train/r2']:.4f}"
+            if f"{prefix}/fd_loss" in metrics:
+                extra += f"  fd={metrics[f'{prefix}/fd_loss']:.4f}"
+            if f"{prefix}/r2" in metrics:
+                extra += f"  r2={metrics[f'{prefix}/r2']:.4f}"
             tqdm.write(
                 f"  [{phase}] epoch {epoch + 1:4d}"
-                f"  loss={metrics['train/loss']:.4f}"
-                f"  recon={metrics['train/recon']:.4f}"
-                f"  kl={metrics['train/kl']:.4f}"
-                f"  latent={metrics['train/latent']:.4f}"
-                f"  q_var={metrics['train/q_var']:.4f}"
-                f"  p_var={metrics['train/p_var']:.4f}"
+                f"  loss={metrics[f'{prefix}/loss']:.4f}"
+                f"  recon={metrics.get(f'{prefix}/recon', 0.0):.4f}"
+                f"  kl={metrics.get(f'{prefix}/kl', 0.0):.4f}"
+                f"  latent={metrics.get(f'{prefix}/latent', 0.0):.4f}"
+                f"  q_var={metrics[f'{prefix}/q_var']:.4f}"
+                f"  p_var={metrics[f'{prefix}/p_var']:.4f}"
                 + extra
             )
         if (
@@ -638,7 +635,7 @@ def main(**kwargs):
             fd_weight=kwargs["fd_weight"],
             device=device,
         )
-        best_recon = _log_and_checkpoint(metrics, epoch, "P1", best_recon, "train/recon")
+        best_recon = _log_and_checkpoint(metrics, epoch, "P1", best_recon, "phase1_train/recon", "phase1_train")
         global_epoch += 1
 
     print("\n=== Phase 2: H/R/B (latent loss) ===")
@@ -650,7 +647,7 @@ def main(**kwargs):
             grad_clip=kwargs["grad_clip"],
             device=device,
         )
-        best_latent = _log_and_checkpoint(metrics, epoch, "P2", best_latent, "train/latent")
+        best_latent = _log_and_checkpoint(metrics, epoch, "P2", best_latent, "phase2_train/latent", "phase2_train")
         global_epoch += 1
 
     writer.close()
