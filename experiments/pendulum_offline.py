@@ -374,11 +374,14 @@ def _log_latent_scatter(
     st_pred = (s_all @ A).numpy()
     st_true = st.numpy()
 
+    T = st_true.shape[0]
+    colors = np.arange(T)
+
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
     for i, name in enumerate(["θ (rad)", "θ̇ (rad/s)"]):
         true_i = st_true[:, i]
         pred_i = st_pred[:, i]
-        axes[i].scatter(true_i, pred_i, s=3, alpha=0.5)
+        axes[i].scatter(true_i, pred_i, c=colors, cmap="viridis", s=3, alpha=0.7)
         lo, hi = min(true_i.min(), pred_i.min()), max(true_i.max(), pred_i.max())
         axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
         axes[i].set_xlabel(f"True {name}")
