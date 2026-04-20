@@ -1,11 +1,11 @@
 """Offline Pendulum world-model training for ControlledDHGN_LSTM.
 
 Collects episodes with an energy-pumping + PD controller (with random gains),
-then trains the model as a multi-step world model:
+then trains the model jointly as a multi-step world model:
 
-    encode all episode frames → (q0, p0)  via bidirectional LSTM encoder
-    roll out T RK4 steps      → (q1..qT)  with recorded actions
-    decode each qi            → pred_frame_i
+    encode frame 0              → (q0, p0)  via LSTM encoder + f_psi
+    roll out T RK4 steps        → (q1..qT)  with recorded actions
+    decode each qi              → pred_frame_i
     loss = mean MSE(pred_frame_i, frame_{i+1}) + kl_weight * KL
 """
 
@@ -56,7 +56,7 @@ def _batch_r2(z_flat: torch.Tensor, st_flat: torch.Tensor) -> float:
     return (1 - ss_res / (ss_tot + 1e-8)).clamp(max=1.0).mean().item()
 
 
-def _train_epoch_phase1(
+def _train_epoch(
     model: ControlledDHGN_LSTM,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
@@ -65,142 +65,97 @@ def _train_epoch_phase1(
     grad_clip: float,
     device: torch.device,
 ) -> dict[str, float]:
-    """Phase 1: train encoder → f_psi → decoder with recon + KL."""
+    """Joint training with two reconstruction signals combined before backward.
+
+    Signal 1 (rollout): encode frame 0 → (q0, p0), roll T controlled steps,
+    decode each q_t, compare to frames[1..T].
+
+    Signal 2 (per-frame): encode all frames with BiLSTM (forward_all) → per-step
+    (q, p), decode each q, compare to the corresponding input frame.
+    """
     model.train()
-    total_recon = total_kl = total_loss = 0.0
+    total_recon_rollout = total_recon_perframe = total_kl = total_loss = 0.0
     total_q_var = total_p_var = 0.0
 
     for frames, actions, _ in loader:
-        frames = frames.to(device)
-        actions = actions.to(device)
+        frames = frames.to(device)    # (B, T+1, C, H, W)
+        actions = actions.to(device)  # (B, T)
         T = actions.shape[1]
         B_size = frames.shape[0]
         q_dim = model.latent_dim // 2
 
+        # ── Signal 1: dynamics rollout from frame 0 ────────────────────────
+        mu0, logvar0 = model.encoder(frames[:, :1])
+        logvar0 = logvar0.clamp(-10, 2)
+        z0 = mu0 + torch.randn_like(mu0) * (0.5 * logvar0).exp()
+        s0 = model.f_psi(z0)
+        q, p = s0[:, :q_dim], s0[:, q_dim:]
+
+        kl0 = (
+            (-0.5 * (1 + logvar0 - mu0.pow(2) - logvar0.exp()))
+            .clamp(min=free_bits)
+            .sum(dim=-1)
+            .mean()
+        )
+
+        recon_rollout = torch.zeros(1, device=device)
+        qs_dyn, ps_dyn = [q], [p]
+        for t in range(T):
+            u = actions[:, t].unsqueeze(-1)
+            q, p = model.controlled_step(q, p, u)
+            recon_rollout = recon_rollout + F.mse_loss(model.decoder(q), frames[:, t + 1])
+            qs_dyn.append(q)
+            ps_dyn.append(p)
+        recon_rollout = recon_rollout / T
+
+        # ── Signal 2: per-frame BiLSTM reconstruction ─────────────────────
+        B_T1 = B_size * (T + 1)
         mu_all, logvar_all = model.encoder.forward_all(frames)
         logvar_all = logvar_all.clamp(-10, 2)
         z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
+        qs_enc = model.f_psi(z_all.reshape(B_T1, -1)).reshape(B_size, T + 1, -1)[:, :, :q_dim]
 
-        B_T1 = B_size * (T + 1)
-        s_all = model.f_psi(z_all.reshape(B_T1, -1)).reshape(B_size, T + 1, -1)
-        qs_enc = s_all[:, :, :q_dim]
-        ps_enc = s_all[:, :, q_dim:]
+        pred_all = model.decoder(qs_enc.reshape(B_T1, q_dim)).reshape(B_size, T + 1, *frames.shape[2:])
+        recon_perframe = F.mse_loss(pred_all, frames)
 
-        pred_all = model.decoder(qs_enc.reshape(B_T1, q_dim))
-        pred_all = pred_all.reshape(B_size, T + 1, *frames.shape[2:])
-        recon = F.mse_loss(pred_all, frames)
-
-        kl = (
+        kl_all = (
             (-0.5 * (1 + logvar_all - mu_all.pow(2) - logvar_all.exp()))
             .clamp(min=free_bits)
             .sum(dim=-1)
             .mean()
         )
 
-        loss = recon + kl_weight * kl
-
+        # ── Combined loss ──────────────────────────────────────────────────
+        kl = kl0 + kl_all
+        loss = recon_rollout + recon_perframe + kl_weight * kl
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_recon += recon.item()
+        total_recon_rollout += recon_rollout.item()
+        total_recon_perframe += recon_perframe.item()
         total_kl += kl.item()
         total_loss += loss.item()
-        q_var, p_var = _log_latent_variance(qs_enc, ps_enc)
-        total_q_var += q_var
-        total_p_var += p_var
+
+        with torch.no_grad():
+            qs_t = torch.stack([x.detach() for x in qs_dyn], dim=1)
+            ps_t = torch.stack([x.detach() for x in ps_dyn], dim=1)
+            q_var, p_var = _log_latent_variance(qs_t, ps_t)
+            total_q_var += q_var
+            total_p_var += p_var
 
     n = len(loader)
     return {
-        "phase1_train/loss": total_loss / n,
-        "phase1_train/recon": total_recon / n,
-        "phase1_train/kl": total_kl / n,
-        "phase1_train/q_var": total_q_var / n,
-        "phase1_train/p_var": total_p_var / n,
+        "train/loss": total_loss / n,
+        "train/recon_rollout": total_recon_rollout / n,
+        "train/recon_perframe": total_recon_perframe / n,
+        "train/kl": total_kl / n,
+        "train/q_var": total_q_var / n,
+        "train/p_var": total_p_var / n,
     }
 
-
-def _train_epoch_phase2(
-    model: ControlledDHGN_LSTM,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    grad_clip: float,
-    fd_weight: float,
-    device: torch.device,
-) -> dict[str, float]:
-    """Phase 2: freeze encoder/f_psi/decoder, train H/R/B with latent loss + fd_p supervision."""
-    model.train()
-    total_latent = total_fd = total_r2 = 0.0
-    total_q_var = total_p_var = 0.0
-
-    for frames, actions, states in loader:
-        frames = frames.to(device)
-        actions = actions.to(device)
-        T = actions.shape[1]
-        B_size = frames.shape[0]
-        q_dim = model.latent_dim // 2
-
-        with torch.no_grad():
-            mu_all, _ = model.encoder.forward_all(frames)
-            B_T1 = B_size * (T + 1)
-            s_all = model.f_psi(mu_all.reshape(B_T1, -1)).reshape(B_size, T + 1, -1)
-            qs_enc = s_all[:, :, :q_dim]
-            ps_enc = s_all[:, :, q_dim:]
-
-        q, p = qs_enc[:, 0], ps_enc[:, 0]
-        latent_loss = torch.zeros(1, device=device)
-        qs_dyn = [q]
-        ps_dyn = [p]
-
-        for t in range(T):
-            u = actions[:, t].unsqueeze(-1)
-            q, p = model.controlled_step(q, p, u)
-            latent_loss = (
-                latent_loss
-                + F.mse_loss(q, qs_enc[:, t + 1])
-                + F.mse_loss(p, ps_enc[:, t + 1])
-            )
-            qs_dyn.append(q)
-            ps_dyn.append(p)
-
-        latent_loss = latent_loss / T
-
-        qs_dyn = torch.stack(qs_dyn, dim=1)
-        ps_dyn = torch.stack(ps_dyn, dim=1)
-        fd_targets = (qs_dyn[:, 1:] - qs_dyn[:, :-1]).detach()
-        fd_loss = F.mse_loss(ps_dyn[:, :-1], fd_targets)
-
-        loss = latent_loss + fd_weight * fd_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-
-        total_latent += latent_loss.item()
-        total_fd += fd_loss.item()
-        q_var, p_var = _log_latent_variance(qs_enc, ps_enc)
-        total_q_var += q_var
-        total_p_var += p_var
-
-        with torch.no_grad():
-            z_flat = qs_dyn.detach().cpu().reshape(B_size * (T + 1), -1)
-            z_flat = torch.cat([z_flat, ps_dyn.detach().cpu().reshape(B_size * (T + 1), -1)], dim=-1)
-            st_flat = states.reshape(-1, 3).float()
-            total_r2 += _batch_r2(z_flat, st_flat)
-
-    n = len(loader)
-    return {
-        "phase2_train/loss": total_latent / n,
-        "phase2_train/latent": total_latent / n,
-        "phase2_train/fd_loss": total_fd / n,
-        "phase2_train/r2": total_r2 / n,
-        "phase2_train/q_var": total_q_var / n,
-        "phase2_train/p_var": total_p_var / n,
-    }
 
 def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
     """Compute H = 0.5*theta_dot^2 + g*(1 + cos(theta)) from (T, 3) states."""
@@ -226,46 +181,30 @@ def _log_reconstruction_video(
     epoch: int,
     tag: str = "val/reconstruction",
     fps: int = 10,
-    use_dynamics: bool = False,
 ) -> None:
     """Log a side-by-side ground-truth / reconstruction video to TensorBoard.
 
-    use_dynamics=False (default): encode each frame via forward_all, matching
-    the Phase-1 training objective (per-frame reconstruction).
-    use_dynamics=True: encode a single initial state then roll out with the
-    learned Hamiltonian dynamics (appropriate after Phase 2).
+    Encodes frame 0, then rolls out with learned Hamiltonian dynamics.
     """
     model.eval()
     frames, actions, _ = val_traj  # (T+1, C, H, W), (T,)
 
     ctx = frames.unsqueeze(0).to(device)  # (1, T+1, C, H, W)
-    q_dim = model.latent_dim // 2
 
-    if use_dynamics:
-        q, p = model.encode_mean(ctx)
-        recon_frames = [model.decoder(q).squeeze(0).cpu()]
-        for t in range(len(actions)):
-            u = actions[t].reshape(1, 1).to(device)
-            q, p = model.controlled_step(q, p, u)
-            recon_frames.append(model.decoder(q).squeeze(0).cpu())
-        recon = torch.stack(recon_frames)
-    else:
-        mu_all, _ = model.encoder.forward_all(ctx)   # (1, T+1, latent_dim)
-        s_all = model.f_psi(mu_all.squeeze(0))        # (T+1, latent_dim)
-        qs_enc = s_all[:, :q_dim]                     # (T+1, q_dim)
-        recon = model.decoder(qs_enc).cpu()            # (T+1, C, H, W)
+    q, p = model.encode_mean(ctx)
+    recon_frames = [model.decoder(q).squeeze(0).cpu()]
+    for t in range(len(actions)):
+        u = actions[t].reshape(1, 1).to(device)
+        q, p = model.controlled_step(q, p, u)
+        recon_frames.append(model.decoder(q).squeeze(0).cpu())
+    recon = torch.stack(recon_frames)
 
     gt = frames  # (T+1, C, H, W)
-
-    # Annotate each frame with its frame number.
     gt_ann = torch.stack([_annotate_frame(gt[i], f"{i}") for i in range(len(gt))])
     recon_ann = torch.stack([_annotate_frame(recon[i].clamp(0, 1), f"{i}") for i in range(len(recon))])
 
-    # Side-by-side along width: (T+1, C, H, 2W) → (1, T+1, C, H, 2W)
     side_by_side = torch.cat([gt_ann, recon_ann], dim=3).unsqueeze(0)
-    # TensorBoard add_video expects uint8 (N, T, C, H, W)
     video = (side_by_side.clamp(0, 1) * 255).byte()
-
     writer.add_video(tag, video, epoch, fps=fps)
 
 
@@ -278,9 +217,16 @@ def _log_hamiltonian_comparison(
     epoch: int,
     tag: str = "val/hamiltonian",
 ) -> None:
-    """Log two figures: network H vs true H, and dH predicted vs dH actual."""
+    """Log H comparison and dH breakdown figures to TensorBoard.
+
+    "Encoded H" is H(q,p) evaluated at per-frame encoded latents (forward_all).
+    "Ground-truth H" is the true physical energy from environment states.
+    "dH encoded" is the step-to-step change in encoded H.
+    "dH predicted" is the analytically predicted change from the Hamiltonian ODE.
+    "dH ground-truth" is the step-to-step change in true physical energy.
+    """
     model.eval()
-    frames, actions, states = val_traj  # (T+1, C, H, W), (T,), (T+1, 2)
+    frames, actions, states = val_traj  # (T+1, C, H, W), (T,), (T+1, 3)
 
     q_dim = model.latent_dim // 2
     R = model.get_R()
@@ -291,8 +237,8 @@ def _log_hamiltonian_comparison(
     qs_enc = s_all[:, :q_dim]
     ps_enc = s_all[:, q_dim:]
 
-    net_H = [model.H(qs_enc[t:t+1], ps_enc[t:t+1]).item() for t in range(len(qs_enc))]
-    dH_actual = []
+    encoded_H = [model.H(qs_enc[t:t+1], ps_enc[t:t+1]).item() for t in range(len(qs_enc))]
+    dH_encoded = []
     dH_predicted = []
 
     for t in range(len(actions)):
@@ -316,15 +262,17 @@ def _log_hamiltonian_comparison(
             + dt * (grad_H * Bu_full).sum(-1)
         )
         dH_predicted.append(dH_pred.item())
-        dH_actual.append(net_H[t + 1] - net_H[t])
+        dH_encoded.append(encoded_H[t + 1] - encoded_H[t])
 
-    true_H = _true_hamiltonian(states)
-    t_axis = np.arange(len(true_H))
-    dh_axis = np.arange(1, len(true_H))
+    ground_truth_H = _true_hamiltonian(states)
+    dH_ground_truth = [ground_truth_H[t + 1] - ground_truth_H[t] for t in range(len(actions))]
+
+    t_axis = np.arange(len(ground_truth_H))
+    dh_axis = np.arange(1, len(ground_truth_H))
 
     fig_h, ax_h = plt.subplots(figsize=(8, 3))
-    ax_h.plot(t_axis, true_H, label="True H", linewidth=1.5, color="tab:blue")
-    ax_h.plot(t_axis, net_H, label="Network H", linewidth=1.5, linestyle="--", color="tab:orange")
+    ax_h.plot(t_axis, ground_truth_H, label="Ground-truth H", linewidth=1.5, color="tab:blue")
+    ax_h.plot(t_axis, encoded_H, label="Encoded H", linewidth=1.5, linestyle="--", color="tab:orange")
     ax_h.axhline(_G * 2, color="grey", linestyle=":", linewidth=1, label="H*=20")
     ax_h.set_xlabel("Step")
     ax_h.set_ylabel("H")
@@ -335,7 +283,8 @@ def _log_hamiltonian_comparison(
     plt.close(fig_h)
 
     fig_dh, ax_dh = plt.subplots(figsize=(8, 3))
-    ax_dh.plot(dh_axis, dH_actual, label="dH actual", linewidth=1.0, color="tab:green")
+    ax_dh.plot(dh_axis, dH_ground_truth, label="dH ground-truth", linewidth=1.0, color="tab:blue")
+    ax_dh.plot(dh_axis, dH_encoded, label="dH encoded", linewidth=1.0, color="tab:green")
     ax_dh.plot(dh_axis, dH_predicted, label="dH predicted", linewidth=1.0, linestyle="--", color="tab:red")
     ax_dh.axhline(0, color="lightgrey", linestyle="-", linewidth=0.5)
     ax_dh.set_xlabel("Step")
@@ -356,7 +305,7 @@ def _log_R_eigenvalues(
     """Log eigenvalue distribution of the dissipation matrix R = L Lᵀ."""
     model.eval()
     R = model.get_R().cpu()
-    eigenvalues = torch.linalg.eigvalsh(R)  # real-valued since R is symmetric PSD
+    eigenvalues = torch.linalg.eigvalsh(R)
     writer.add_histogram("structure/R_eigenvalues", eigenvalues, epoch)
 
 
@@ -378,9 +327,10 @@ def _log_latent_scatter(
     s_all = model.f_psi(mu_all.squeeze(0)).cpu()  # (T+1, latent_dim)
 
     st = states.float()  # (T+1, 3): [cos(θ), sin(θ), θ̇]
-    A = torch.linalg.lstsq(s_all, st).solution  # (latent_dim, 3)
-    st_pred = (s_all @ A).numpy()
-    st_true = st.numpy()
+    mid = len(s_all) // 2
+    A = torch.linalg.lstsq(s_all[:mid], st[:mid]).solution  # fit on first half
+    st_pred = (s_all[mid:] @ A).numpy()                     # evaluate on second half
+    st_true = st[mid:].numpy()
 
     T = st_true.shape[0]
     colors = np.arange(T)
@@ -399,7 +349,7 @@ def _log_latent_scatter(
         r2 = 1 - ss_res / (ss_tot + 1e-8)
         axes[i].set_title(f"{name}  R²={r2:.3f}")
 
-    fig.suptitle(f"Latent → state regression (epoch {epoch + 1})")
+    fig.suptitle(f"Latent → state regression, held-out half (epoch {epoch + 1})")
     fig.tight_layout()
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
@@ -443,8 +393,7 @@ def _log_latent_scatter(
 @click.option("--dt", type=float, default=0.05, show_default=True)
 @click.option("--no-separable", "separable", default=True, flag_value=False)
 # training
-@click.option("--phase1-epochs", type=int, default=1500, show_default=True)
-@click.option("--phase2-epochs", type=int, default=1500, show_default=True)
+@click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option(
     "--batch-size",
     type=int,
@@ -456,13 +405,6 @@ def _log_latent_scatter(
 @click.option("--kl-weight", type=float, default=1e-3, show_default=True)
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
-@click.option(
-    "--fd-weight",
-    type=float,
-    default=0.1,
-    show_default=True,
-    help="Weight for finite-difference p supervision loss in phase 1",
-)
 # logging
 @click.option("--log-every", type=int, default=5, show_default=True)
 @click.option(
@@ -530,7 +472,6 @@ def main(**kwargs):
         )
 
     dataset = PendulumDataset(episodes)
-
     loader = DataLoader(
         dataset,
         batch_size=kwargs["batch_size"],
@@ -552,46 +493,35 @@ def main(**kwargs):
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     hparams = {k: v for k, v in kwargs.items()}
+    optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
+    best_loss = float("inf")
 
-    perception_params = (
-        list(model.encoder.parameters())
-        + list(model.f_psi.parameters())
-        + list(model.decoder.parameters())
-    )
-    dynamics_params = (
-        list(model.hamiltonian.parameters())
-        + [model.A, model.L_param, model.B]
-    )
-    opt_phase1 = torch.optim.Adam(perception_params, lr=kwargs["lr"])
-    opt_phase2 = torch.optim.Adam(dynamics_params, lr=kwargs["lr"])
+    print("\n=== Training (joint: dynamics rollout recon + KL) ===")
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Training"):
+        metrics = _train_epoch(
+            model=model,
+            loader=loader,
+            optimizer=optimizer,
+            kl_weight=kwargs["kl_weight"],
+            free_bits=kwargs["free_bits"],
+            grad_clip=kwargs["grad_clip"],
+            device=device,
+        )
 
-    best_recon = float("inf")
-    best_latent = float("inf")
-    global_epoch = 0
-
-    def _log_and_checkpoint(metrics, epoch, phase, best_val, metric_key, prefix):
         if (epoch + 1) % kwargs["log_every"] == 0:
             for k, v in metrics.items():
-                writer.add_scalar(k, v, global_epoch)
-            extra = ""
-            if f"{prefix}/fd_loss" in metrics:
-                extra += f"  fd={metrics[f'{prefix}/fd_loss']:.4f}"
-            if f"{prefix}/r2" in metrics:
-                extra += f"  r2={metrics[f'{prefix}/r2']:.4f}"
+                writer.add_scalar(k, v, epoch)
             tqdm.write(
-                f"  [{phase}] epoch {epoch + 1:4d}"
-                f"  loss={metrics[f'{prefix}/loss']:.4f}"
-                f"  recon={metrics.get(f'{prefix}/recon', 0.0):.4f}"
-                f"  kl={metrics.get(f'{prefix}/kl', 0.0):.4f}"
-                f"  latent={metrics.get(f'{prefix}/latent', 0.0):.4f}"
-                f"  q_var={metrics[f'{prefix}/q_var']:.4f}"
-                f"  p_var={metrics[f'{prefix}/p_var']:.4f}"
-                + extra
+                f"  epoch {epoch + 1:4d}"
+                f"  loss={metrics['train/loss']:.4f}"
+                f"  recon_rollout={metrics['train/recon_rollout']:.4f}"
+                f"  recon_perframe={metrics['train/recon_perframe']:.4f}"
+                f"  kl={metrics['train/kl']:.4f}"
+                f"  q_var={metrics['train/q_var']:.4f}"
+                f"  p_var={metrics['train/p_var']:.4f}"
             )
-        if (
-            kwargs["val_every"] > 0
-            and (epoch + 1) % kwargs["val_every"] == 0
-        ):
+
+        if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
             for val_trajs, label in (
                 (val_energy, "energy_pump"),
                 (val_random, "random"),
@@ -604,9 +534,8 @@ def main(**kwargs):
                     val_traj=val_trajs[0],
                     device=device,
                     writer=writer,
-                    epoch=global_epoch,
+                    epoch=epoch,
                     tag=f"val/reconstruction/{label}",
-                    use_dynamics=(phase == "P2"),
                 )
             if val_energy:
                 _log_hamiltonian_comparison(
@@ -614,7 +543,7 @@ def main(**kwargs):
                     val_traj=val_energy[0],
                     device=device,
                     writer=writer,
-                    epoch=global_epoch,
+                    epoch=epoch,
                     tag="val/hamiltonian/energy_pump",
                 )
                 _log_latent_scatter(
@@ -622,44 +551,17 @@ def main(**kwargs):
                     val_traj=val_energy[0],
                     device=device,
                     writer=writer,
-                    epoch=global_epoch,
+                    epoch=epoch,
                 )
-            _log_R_eigenvalues(model=model, writer=writer, epoch=global_epoch)
+            _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
+
         if (
             kwargs["checkpoint_every"] > 0
             and (epoch + 1) % kwargs["checkpoint_every"] == 0
-            and metrics[metric_key] < best_val
+            and metrics["train/loss"] < best_loss
         ):
-            save_checkpoint(run_dir, global_epoch, model, hparams, metrics)
-            return metrics[metric_key]
-        return best_val
-
-    print("\n=== Phase 1: encoder/f_psi/decoder (recon + KL) ===")
-    for epoch in tqdm(range(kwargs["phase1_epochs"]), desc="Phase 1"):
-        metrics = _train_epoch_phase1(
-            model=model,
-            loader=loader,
-            optimizer=opt_phase1,
-            kl_weight=kwargs["kl_weight"],
-            free_bits=kwargs["free_bits"],
-            grad_clip=kwargs["grad_clip"],
-            device=device,
-        )
-        best_recon = _log_and_checkpoint(metrics, epoch, "P1", best_recon, "phase1_train/recon", "phase1_train")
-        global_epoch += 1
-
-    print("\n=== Phase 2: H/R/B (latent loss) ===")
-    for epoch in tqdm(range(kwargs["phase2_epochs"]), desc="Phase 2"):
-        metrics = _train_epoch_phase2(
-            model=model,
-            loader=loader,
-            optimizer=opt_phase2,
-            grad_clip=kwargs["grad_clip"],
-            fd_weight=kwargs["fd_weight"],
-            device=device,
-        )
-        best_latent = _log_and_checkpoint(metrics, epoch, "P2", best_latent, "phase2_train/latent", "phase2_train")
-        global_epoch += 1
+            save_checkpoint(run_dir, epoch, model, hparams, metrics)
+            best_loss = metrics["train/loss"]
 
     writer.close()
     print("\nDone. Run: tensorboard --logdir runs")
