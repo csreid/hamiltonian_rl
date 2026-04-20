@@ -67,10 +67,10 @@ def _train_epoch_phase1(
 ) -> dict[str, float]:
     """Phase 1: train encoder → f_psi → decoder with recon + KL."""
     model.train()
-    total_recon = total_kl = total_loss = total_r2 = 0.0
+    total_recon = total_kl = total_loss = 0.0
     total_q_var = total_p_var = 0.0
 
-    for frames, actions, states in loader:
+    for frames, actions, _ in loader:
         frames = frames.to(device)
         actions = actions.to(device)
         T = actions.shape[1]
@@ -112,17 +112,11 @@ def _train_epoch_phase1(
         total_q_var += q_var
         total_p_var += p_var
 
-        with torch.no_grad():
-            z_flat = s_all.detach().cpu().reshape(-1, model.latent_dim)
-            st_flat = states.reshape(-1, 3).float()
-            total_r2 += _batch_r2(z_flat, st_flat)
-
     n = len(loader)
     return {
         "phase1_train/loss": total_loss / n,
         "phase1_train/recon": total_recon / n,
         "phase1_train/kl": total_kl / n,
-        "phase1_train/r2": total_r2 / n,
         "phase1_train/q_var": total_q_var / n,
         "phase1_train/p_var": total_p_var / n,
     }
@@ -138,10 +132,10 @@ def _train_epoch_phase2(
 ) -> dict[str, float]:
     """Phase 2: freeze encoder/f_psi/decoder, train H/R/B with latent loss + fd_p supervision."""
     model.train()
-    total_latent = total_fd = 0.0
+    total_latent = total_fd = total_r2 = 0.0
     total_q_var = total_p_var = 0.0
 
-    for frames, actions, _ in loader:
+    for frames, actions, states in loader:
         frames = frames.to(device)
         actions = actions.to(device)
         T = actions.shape[1]
@@ -192,11 +186,18 @@ def _train_epoch_phase2(
         total_q_var += q_var
         total_p_var += p_var
 
+        with torch.no_grad():
+            z_flat = qs_dyn.detach().cpu().reshape(B_size * (T + 1), -1)
+            z_flat = torch.cat([z_flat, ps_dyn.detach().cpu().reshape(B_size * (T + 1), -1)], dim=-1)
+            st_flat = states.reshape(-1, 3).float()
+            total_r2 += _batch_r2(z_flat, st_flat)
+
     n = len(loader)
     return {
         "phase2_train/loss": total_latent / n,
         "phase2_train/latent": total_latent / n,
         "phase2_train/fd_loss": total_fd / n,
+        "phase2_train/r2": total_r2 / n,
         "phase2_train/q_var": total_q_var / n,
         "phase2_train/p_var": total_p_var / n,
     }
@@ -258,7 +259,7 @@ def _log_reconstruction_video(
 
     # Annotate each frame with its frame number.
     gt_ann = torch.stack([_annotate_frame(gt[i], f"{i}") for i in range(len(gt))])
-    recon_ann = torch.stack([_annotate_frame(recon[i], f"{i}") for i in range(len(recon))])
+    recon_ann = torch.stack([_annotate_frame(recon[i].clamp(0, 1), f"{i}") for i in range(len(recon))])
 
     # Side-by-side along width: (T+1, C, H, 2W) → (1, T+1, C, H, 2W)
     side_by_side = torch.cat([gt_ann, recon_ann], dim=3).unsqueeze(0)
