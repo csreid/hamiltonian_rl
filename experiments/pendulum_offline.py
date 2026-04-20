@@ -209,6 +209,38 @@ def _log_reconstruction_video(
 
 
 @torch.no_grad()
+def _log_reconstruction_lstm_video(
+    model: ControlledDHGN_LSTM,
+    val_traj: tuple,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/reconstruction_lstm",
+    fps: int = 10,
+) -> None:
+    """Log a side-by-side ground-truth / reconstruction video using BiLSTM per-frame encoding."""
+    model.eval()
+    frames, actions, _ = val_traj  # (T+1, C, H, W), (T,)
+
+    ctx = frames.unsqueeze(0).to(device)  # (1, T+1, C, H, W)
+    q_dim = model.latent_dim // 2
+
+    mu_all, _ = model.encoder.forward_all(ctx)  # (1, T+1, latent_dim)
+    s_all = model.f_psi(mu_all.squeeze(0))      # (T+1, latent_dim)
+    qs_enc = s_all[:, :q_dim]                   # (T+1, q_dim)
+
+    recon = model.decoder(qs_enc).cpu()         # (T+1, C, H, W)
+
+    gt = frames
+    gt_ann = torch.stack([_annotate_frame(gt[i], f"{i}") for i in range(len(gt))])
+    recon_ann = torch.stack([_annotate_frame(recon[i].clamp(0, 1), f"{i}") for i in range(len(recon))])
+
+    side_by_side = torch.cat([gt_ann, recon_ann], dim=3).unsqueeze(0)
+    video = (side_by_side.clamp(0, 1) * 255).byte()
+    writer.add_video(tag, video, epoch, fps=fps)
+
+
+@torch.no_grad()
 def _log_hamiltonian_comparison(
     model: ControlledDHGN_LSTM,
     val_traj: tuple,
@@ -535,7 +567,15 @@ def main(**kwargs):
                     device=device,
                     writer=writer,
                     epoch=epoch,
-                    tag=f"val/reconstruction/{label}",
+                    tag=f"val/reconstruction_hamiltonian/{label}",
+                )
+                _log_reconstruction_lstm_video(
+                    model=model,
+                    val_traj=val_trajs[0],
+                    device=device,
+                    writer=writer,
+                    epoch=epoch,
+                    tag=f"val/reconstruction_lstm/{label}",
                 )
             if val_energy:
                 _log_hamiltonian_comparison(
