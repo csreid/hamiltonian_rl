@@ -63,12 +63,11 @@ def _train_epoch_phase1(
     kl_weight: float,
     free_bits: float,
     grad_clip: float,
-    fd_weight: float,
     device: torch.device,
 ) -> dict[str, float]:
-    """Phase 1: train encoder → f_psi → decoder with recon + KL + fd_p supervision."""
+    """Phase 1: train encoder → f_psi → decoder with recon + KL."""
     model.train()
-    total_recon = total_kl = total_loss = total_fd = total_r2 = 0.0
+    total_recon = total_kl = total_loss = total_r2 = 0.0
     total_q_var = total_p_var = 0.0
 
     for frames, actions, states in loader:
@@ -98,11 +97,7 @@ def _train_epoch_phase1(
             .mean()
         )
 
-        # Supervise p[t] to predict the finite difference q[t+1] - q[t].
-        fd_targets = (qs_enc[:, 1:] - qs_enc[:, :-1]).detach()
-        fd_loss = F.mse_loss(ps_enc[:, :-1], fd_targets)
-
-        loss = recon + kl_weight * kl + fd_weight * fd_loss
+        loss = recon + kl_weight * kl
 
         optimizer.zero_grad()
         loss.backward()
@@ -112,7 +107,6 @@ def _train_epoch_phase1(
 
         total_recon += recon.item()
         total_kl += kl.item()
-        total_fd += fd_loss.item()
         total_loss += loss.item()
         q_var, p_var = _log_latent_variance(qs_enc, ps_enc)
         total_q_var += q_var
@@ -128,7 +122,6 @@ def _train_epoch_phase1(
         "phase1_train/loss": total_loss / n,
         "phase1_train/recon": total_recon / n,
         "phase1_train/kl": total_kl / n,
-        "phase1_train/fd_loss": total_fd / n,
         "phase1_train/r2": total_r2 / n,
         "phase1_train/q_var": total_q_var / n,
         "phase1_train/p_var": total_p_var / n,
@@ -140,11 +133,12 @@ def _train_epoch_phase2(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     grad_clip: float,
+    fd_weight: float,
     device: torch.device,
 ) -> dict[str, float]:
-    """Phase 2: freeze encoder/f_psi/decoder, train H/R/B with latent loss."""
+    """Phase 2: freeze encoder/f_psi/decoder, train H/R/B with latent loss + fd_p supervision."""
     model.train()
-    total_latent = 0.0
+    total_latent = total_fd = 0.0
     total_q_var = total_p_var = 0.0
 
     for frames, actions, _ in loader:
@@ -163,6 +157,8 @@ def _train_epoch_phase2(
 
         q, p = qs_enc[:, 0], ps_enc[:, 0]
         latent_loss = torch.zeros(1, device=device)
+        qs_dyn = [q]
+        ps_dyn = [p]
 
         for t in range(T):
             u = actions[:, t].unsqueeze(-1)
@@ -172,16 +168,26 @@ def _train_epoch_phase2(
                 + F.mse_loss(q, qs_enc[:, t + 1])
                 + F.mse_loss(p, ps_enc[:, t + 1])
             )
+            qs_dyn.append(q)
+            ps_dyn.append(p)
 
         latent_loss = latent_loss / T
 
+        qs_dyn = torch.stack(qs_dyn, dim=1)
+        ps_dyn = torch.stack(ps_dyn, dim=1)
+        fd_targets = (qs_dyn[:, 1:] - qs_dyn[:, :-1]).detach()
+        fd_loss = F.mse_loss(ps_dyn[:, :-1], fd_targets)
+
+        loss = latent_loss + fd_weight * fd_loss
+
         optimizer.zero_grad()
-        latent_loss.backward()
+        loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         total_latent += latent_loss.item()
+        total_fd += fd_loss.item()
         q_var, p_var = _log_latent_variance(qs_enc, ps_enc)
         total_q_var += q_var
         total_p_var += p_var
@@ -190,6 +196,7 @@ def _train_epoch_phase2(
     return {
         "phase2_train/loss": total_latent / n,
         "phase2_train/latent": total_latent / n,
+        "phase2_train/fd_loss": total_fd / n,
         "phase2_train/q_var": total_q_var / n,
         "phase2_train/p_var": total_p_var / n,
     }
@@ -635,7 +642,6 @@ def main(**kwargs):
             kl_weight=kwargs["kl_weight"],
             free_bits=kwargs["free_bits"],
             grad_clip=kwargs["grad_clip"],
-            fd_weight=kwargs["fd_weight"],
             device=device,
         )
         best_recon = _log_and_checkpoint(metrics, epoch, "P1", best_recon, "phase1_train/recon", "phase1_train")
@@ -648,6 +654,7 @@ def main(**kwargs):
             loader=loader,
             optimizer=opt_phase2,
             grad_clip=kwargs["grad_clip"],
+            fd_weight=kwargs["fd_weight"],
             device=device,
         )
         best_latent = _log_and_checkpoint(metrics, epoch, "P2", best_latent, "phase2_train/latent", "phase2_train")
