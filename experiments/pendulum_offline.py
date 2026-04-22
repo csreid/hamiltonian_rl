@@ -635,6 +635,40 @@ def main(**kwargs):
                 )
             _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
 
+            train_sample = episodes[:max(1, n_val)]
+            _log_reconstruction_video(
+                model=model,
+                val_traj=train_sample[0],
+                device=device,
+                writer=writer,
+                epoch=epoch,
+                tag="train/reconstruction_hamiltonian",
+            )
+            _log_reconstruction_lstm_video(
+                model=model,
+                val_traj=train_sample[0],
+                device=device,
+                writer=writer,
+                epoch=epoch,
+                tag="train/reconstruction_lstm",
+            )
+            _log_hamiltonian_comparison(
+                model=model,
+                val_traj=train_sample[0],
+                device=device,
+                writer=writer,
+                epoch=epoch,
+                tag="train/hamiltonian",
+            )
+            _log_latent_scatter(
+                model=model,
+                val_trajs=train_sample,
+                device=device,
+                writer=writer,
+                epoch=epoch,
+                tag="train/latent_regression",
+            )
+
         if (
             kwargs["checkpoint_every"] > 0
             and (epoch + 1) % kwargs["checkpoint_every"] == 0

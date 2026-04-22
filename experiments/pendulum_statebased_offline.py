@@ -588,6 +588,24 @@ def main(**kwargs):
                 )
             _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
 
+            train_sample = train_episodes[:max(1, n_val)]
+            _log_state_rollout(
+                model=model,
+                val_trajs=train_sample,
+                device=device,
+                writer=writer,
+                epoch=epoch,
+                tag="train/rollout",
+            )
+            _log_hamiltonian_comparison(
+                model=model,
+                val_traj=train_sample[0],
+                device=device,
+                writer=writer,
+                epoch=epoch,
+                tag="train/hamiltonian",
+            )
+
         if (
             kwargs["checkpoint_every"] > 0
             and (epoch + 1) % kwargs["checkpoint_every"] == 0
