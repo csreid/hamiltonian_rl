@@ -446,7 +446,8 @@ def _log_latent_scatter(
     show_default=True,
     help="Epochs between H comparison plots (0 to disable)",
 )
-@click.option("--n-val-episodes", type=int, default=3, show_default=True)
+@click.option("--n-val-episodes", type=int, default=-1, show_default=True,
+              help="Val episodes per type (-1 = n_episodes // 2)")
 @click.option(
     "--val-max-steps",
     type=int,
@@ -464,7 +465,10 @@ def main(**kwargs):
     writer = SummaryWriter(comment="_pendulum_offline")
     run_dir = make_run_dir("pendulum_offline")
 
-    n_val = kwargs["n_val_episodes"] if kwargs["val_every"] > 0 else 0
+    n_val_episodes = kwargs["n_val_episodes"]
+    if n_val_episodes < 0:
+        n_val_episodes = kwargs["n_episodes"] // 2
+    n_val = n_val_episodes if kwargs["val_every"] > 0 else 0
     val_steps = kwargs["val_max_steps"] or kwargs["max_steps"] * 2
     print(f"\nCollecting {kwargs['n_episodes']} train episodes...")
     episodes = collect_data(
