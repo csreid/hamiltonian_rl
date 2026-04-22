@@ -173,6 +173,37 @@ def _annotate_frame(frame: torch.Tensor, text: str) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _eval_loss(
+    model: ControlledDHGN_LSTM,
+    val_trajs: list,
+    device: torch.device,
+) -> dict[str, float]:
+    model.eval()
+    q_dim = model.latent_dim // 2
+    total_rollout = total_perframe = 0.0
+    for frames, actions, _ in val_trajs:
+        frames = frames.unsqueeze(0).to(device)  # (1, T+1, C, H, W)
+        actions = actions.to(device)
+        T = len(actions)
+
+        q, p = model.encode_mean(frames)
+        rollout = 0.0
+        for t in range(T):
+            u = actions[t].reshape(1, 1)
+            q, p = model.controlled_step(q, p, u)
+            rollout += F.mse_loss(model.decoder(q), frames[:, t + 1]).item()
+        total_rollout += rollout / T
+
+        mu_all, _ = model.encoder.forward_all(frames)
+        qs_enc = model.f_psi(mu_all.squeeze(0))[:, :q_dim]
+        pred_all = model.decoder(qs_enc)
+        total_perframe += F.mse_loss(pred_all, frames.squeeze(0)).item()
+
+    n = len(val_trajs)
+    return {"recon_rollout": total_rollout / n, "recon_perframe": total_perframe / n}
+
+
+@torch.no_grad()
 def _log_reconstruction_video(
     model: ControlledDHGN_LSTM,
     val_traj: tuple,
@@ -565,6 +596,9 @@ def main(**kwargs):
             ):
                 if not val_trajs:
                     continue
+                val_metrics = _eval_loss(model, val_trajs, device)
+                for k, v in val_metrics.items():
+                    writer.add_scalar(f"val/{k}/{label}", v, epoch)
                 _log_reconstruction_video(
                     model=model,
                     val_traj=val_trajs[0],

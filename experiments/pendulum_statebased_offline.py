@@ -272,6 +272,29 @@ def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
 
 
 @torch.no_grad()
+def _eval_loss(
+    model: StatePHGN,
+    val_trajs: list,
+    device: torch.device,
+) -> float:
+    model.eval()
+    total = 0.0
+    for states, actions in val_trajs:
+        states = states.to(device)
+        actions = actions.to(device)
+        T = len(actions)
+        q, p = model.split(states[0:1])
+        loss = 0.0
+        for t in range(T):
+            u = actions[t].reshape(1, 1)
+            q, p = model.step(q, p, u)
+            pred = torch.cat([q, p], dim=-1)
+            loss += F.mse_loss(pred, states[t + 1 : t + 2]).item()
+        total += loss / T
+    return total / len(val_trajs)
+
+
+@torch.no_grad()
 def _log_hamiltonian_comparison(
     model: StatePHGN,
     val_traj: tuple,
@@ -542,6 +565,7 @@ def main(**kwargs):
             ):
                 if not val_trajs:
                     continue
+                writer.add_scalar(f"val/loss/{label}", _eval_loss(model, val_trajs, device), epoch)
                 _log_state_rollout(
                     model=model,
                     val_traj=val_trajs[0],
