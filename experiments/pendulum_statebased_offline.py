@@ -372,7 +372,7 @@ def _log_hamiltonian_comparison(
 @torch.no_grad()
 def _log_state_rollout(
     model: StatePHGN,
-    val_traj: tuple,
+    val_trajs: list,
     device: torch.device,
     writer: SummaryWriter,
     epoch: int,
@@ -380,26 +380,27 @@ def _log_state_rollout(
 ) -> None:
     """Roll out from s0 and compare predicted vs true state trajectory."""
     model.eval()
-    states, actions = val_traj  # (T+1, 3), (T,)
-
-    q, p = model.split(states[0:1].to(device))
-    pred = [torch.cat([q, p], dim=-1).squeeze(0).cpu()]
-    for t in range(len(actions)):
-        u = actions[t].reshape(1, 1).to(device)
-        q, p = model.step(q, p, u)
-        pred.append(torch.cat([q, p], dim=-1).squeeze(0).cpu())
-
-    pred_np = torch.stack(pred).numpy()    # (T+1, 3)
-    true_np = states.numpy()               # (T+1, 3)
-    T = len(true_np)
-    colors = np.arange(T)
     state_names = ["cos θ", "sin θ", "θ̇ (rad/s)"]
 
-    # Scatter: predicted vs true
+    all_true, all_pred = [], []
+    for states, actions in val_trajs:
+        q, p = model.split(states[0:1].to(device))
+        pred = [torch.cat([q, p], dim=-1).squeeze(0).cpu()]
+        for t in range(len(actions)):
+            u = actions[t].reshape(1, 1).to(device)
+            q, p = model.step(q, p, u)
+            pred.append(torch.cat([q, p], dim=-1).squeeze(0).cpu())
+        all_pred.append(torch.stack(pred).numpy())
+        all_true.append(states.numpy())
+
+    pred_all = np.concatenate(all_pred, axis=0)
+    true_all = np.concatenate(all_true, axis=0)
+
+    # Scatter: predicted vs true, pooled across all trajectories
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     for i, name in enumerate(state_names):
-        ti, pi = true_np[:, i], pred_np[:, i]
-        axes[i].scatter(ti, pi, c=colors, cmap="viridis", s=3, alpha=0.7)
+        ti, pi = true_all[:, i], pred_all[:, i]
+        axes[i].scatter(ti, pi, s=2, alpha=0.3)
         lo, hi = min(ti.min(), pi.min()), max(ti.max(), pi.max())
         axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
         ss_res = ((ti - pi) ** 2).sum()
@@ -408,12 +409,14 @@ def _log_state_rollout(
         axes[i].set_xlabel(f"True {name}")
         axes[i].set_ylabel(f"Predicted {name}")
         axes[i].set_title(f"{name}  R²={r2:.3f}")
-    fig.suptitle(f"Rollout prediction (epoch {epoch + 1})")
+    fig.suptitle(f"Rollout prediction ({len(val_trajs)} trajectories, epoch {epoch + 1})")
     fig.tight_layout()
     writer.add_figure(tag + "/scatter", fig, epoch)
     plt.close(fig)
 
-    # Time-series
+    # Time-series from first trajectory only
+    true_np, pred_np = all_true[0], all_pred[0]
+    T = len(true_np)
     fig2, axes2 = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
     t_axis = np.arange(T)
     for i, name in enumerate(state_names):
@@ -568,7 +571,7 @@ def main(**kwargs):
                 writer.add_scalar(f"val/loss/{label}", _eval_loss(model, val_trajs, device), epoch)
                 _log_state_rollout(
                     model=model,
-                    val_traj=val_trajs[0],
+                    val_trajs=val_trajs,
                     device=device,
                     writer=writer,
                     epoch=epoch,

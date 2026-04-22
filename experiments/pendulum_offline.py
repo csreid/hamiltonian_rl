@@ -375,34 +375,36 @@ def _log_R_eigenvalues(
 @torch.no_grad()
 def _log_latent_scatter(
     model: ControlledDHGN_LSTM,
-    val_traj: tuple,
+    val_trajs: list,
     device: torch.device,
     writer: SummaryWriter,
     epoch: int,
     tag: str = "val/latent_regression",
 ) -> None:
-    """Fit linear latent→state regression on a val trajectory and log scatter plots."""
+    """Fit linear latent→state regression on val trajectories and log scatter plots."""
     model.eval()
-    frames, actions, states = val_traj  # (T+1, C, H, W), (T,), (T+1, 2)
 
-    ctx = frames.unsqueeze(0).to(device)
-    mu_all, _ = model.encoder.forward_all(ctx)
-    s_all = model.f_psi(mu_all.squeeze(0)).cpu()  # (T+1, latent_dim)
+    all_s, all_st = [], []
+    for frames, actions, states in val_trajs:
+        ctx = frames.unsqueeze(0).to(device)
+        mu_all, _ = model.encoder.forward_all(ctx)
+        s_all = model.f_psi(mu_all.squeeze(0)).cpu()  # (T+1, latent_dim)
+        all_s.append(s_all)
+        all_st.append(states.float())
 
-    st = states.float()  # (T+1, 3): [cos(θ), sin(θ), θ̇]
-    mid = len(s_all) // 2
-    A = torch.linalg.lstsq(s_all[:mid], st[:mid]).solution  # fit on first half
-    st_pred = (s_all[mid:] @ A).numpy()                     # evaluate on second half
-    st_true = st[mid:].numpy()
+    s_cat = torch.cat(all_s, dim=0)   # (N, latent_dim)
+    st_cat = torch.cat(all_st, dim=0)  # (N, 3)
 
-    T = st_true.shape[0]
-    colors = np.arange(T)
+    mid = len(s_cat) // 2
+    A = torch.linalg.lstsq(s_cat[:mid], st_cat[:mid]).solution  # fit on first half
+    st_pred = (s_cat[mid:] @ A).numpy()                          # evaluate on second half
+    st_true = st_cat[mid:].numpy()
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     for i, name in enumerate(["cos(θ)", "sin(θ)", "θ̇ (rad/s)"]):
         true_i = st_true[:, i]
         pred_i = st_pred[:, i]
-        axes[i].scatter(true_i, pred_i, c=colors, cmap="viridis", s=3, alpha=0.7)
+        axes[i].scatter(true_i, pred_i, s=2, alpha=0.3)
         lo, hi = min(true_i.min(), pred_i.min()), max(true_i.max(), pred_i.max())
         axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
         axes[i].set_xlabel(f"True {name}")
@@ -412,7 +414,7 @@ def _log_latent_scatter(
         r2 = 1 - ss_res / (ss_tot + 1e-8)
         axes[i].set_title(f"{name}  R²={r2:.3f}")
 
-    fig.suptitle(f"Latent → state regression, held-out half (epoch {epoch + 1})")
+    fig.suptitle(f"Latent → state regression, held-out half ({len(val_trajs)} trajectories, epoch {epoch + 1})")
     fig.tight_layout()
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
@@ -626,7 +628,7 @@ def main(**kwargs):
                 )
                 _log_latent_scatter(
                     model=model,
-                    val_traj=val_energy[0],
+                    val_trajs=val_energy,
                     device=device,
                     writer=writer,
                     epoch=epoch,
