@@ -290,7 +290,178 @@ def collect_spin_trajectories(
     )
 
 
+# ── State-only data collection (no pixel rendering) ──────────────────────────
+
+
+def _collect_state_only_episodes(
+    n_episodes: int,
+    epsilon: float,
+    max_steps: int,
+    energy_k: float,
+    desc: str,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Collect (states, actions) without rendering frames.
+
+    Returns a list of (states, actions) tuples:
+        states  : (T+1, 3) float32 — (cos(theta), sin(theta), theta_dot)
+        actions : (T,)  float32
+    """
+    env = gym.make("Pendulum-v1", render_mode=None)
+    episodes = []
+
+    for _ in tqdm(range(n_episodes), desc=desc):
+        kp = random.uniform(2.0, 15.0)
+        kd = random.uniform(0.5, 5.0)
+
+        obs, _ = env.reset()
+        theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+        actions = []
+
+        for _ in range(max_steps):
+            theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
+
+            if random.random() < epsilon:
+                action = float(np.random.uniform(-2.0, 2.0))
+            elif abs(theta) < _UPRIGHT_THRESHOLD:
+                action = _pd_action(theta, theta_dot, kp, kd)
+            else:
+                action = _energy_pumping_action(theta, theta_dot, energy_k)
+
+            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+            if damping != 0.0:
+                theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
+                theta_dot_new *= np.exp(-damping * _DT)
+                env.unwrapped.state = np.array([theta_new, theta_dot_new])  # type: ignore[union-attr]
+                obs = np.array([np.cos(theta_new), np.sin(theta_new), theta_dot_new], dtype=np.float32)
+            actions.append(action)
+            states.append(obs.astype(np.float32))
+
+        episodes.append((
+            torch.from_numpy(np.stack(states)),          # (T+1, 3)
+            torch.tensor(actions, dtype=torch.float32),  # (T,)
+        ))
+
+    return episodes
+
+
+def collect_state_data(
+    n_episodes: int,
+    epsilon: float = 0.1,
+    max_steps: int = 200,
+    energy_k: float = 1.0,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Collect state-only Pendulum episodes (no pixel rendering)."""
+    episodes = _collect_state_only_episodes(
+        n_episodes=n_episodes,
+        epsilon=epsilon,
+        max_steps=max_steps,
+        energy_k=energy_k,
+        desc="Collecting state data",
+        damping=damping,
+    )
+    print(f"  Collected {n_episodes} episodes ({max_steps} steps each).")
+    return episodes
+
+
+def collect_state_val_trajectories(
+    n_episodes: int,
+    max_steps: int = 200,
+    energy_k: float = 1.0,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return _collect_state_only_episodes(
+        n_episodes=n_episodes,
+        epsilon=0.0,
+        max_steps=max_steps,
+        energy_k=energy_k,
+        desc="Val trajectories (energy-pump)",
+        damping=damping,
+    )
+
+
+def collect_state_random_trajectories(
+    n_episodes: int,
+    max_steps: int = 200,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return _collect_state_only_episodes(
+        n_episodes=n_episodes,
+        epsilon=1.0,
+        max_steps=max_steps,
+        energy_k=1.0,
+        desc="Val trajectories (random)",
+        damping=damping,
+    )
+
+
+def _collect_state_spin_episodes(
+    n_episodes: int,
+    max_steps: int,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    env = gym.make("Pendulum-v1", render_mode=None)
+    episodes = []
+
+    for _ in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
+        obs, _ = env.reset()
+        theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+        actions = []
+
+        for _ in range(max_steps):
+            _, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
+            action = _spin_action(theta_dot)
+            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+            if damping != 0.0:
+                theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
+                theta_dot_new *= np.exp(-damping * _DT)
+                env.unwrapped.state = np.array([theta_new, theta_dot_new])  # type: ignore[union-attr]
+                obs = np.array([np.cos(theta_new), np.sin(theta_new), theta_dot_new], dtype=np.float32)
+            actions.append(action)
+            states.append(obs.astype(np.float32))
+
+        episodes.append((
+            torch.from_numpy(np.stack(states)),
+            torch.tensor(actions, dtype=torch.float32),
+        ))
+
+    return episodes
+
+
+def collect_state_spin_trajectories(
+    n_episodes: int,
+    max_steps: int = 200,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return _collect_state_spin_episodes(
+        n_episodes=n_episodes,
+        max_steps=max_steps,
+        damping=damping,
+    )
+
+
 # ── Dataset ──────────────────────────────────────────────────────────────────
+
+
+class PendulumStateDataset(Dataset):
+    """State-only episode dataset (no frames).
+
+    states  : (T+1, 3) float32 — (cos(theta), sin(theta), theta_dot)
+    actions : (T,)  float32
+    """
+
+    def __init__(self, episodes: list[tuple[torch.Tensor, torch.Tensor]]):
+        self.states = torch.stack([e[0] for e in episodes])   # (N, T+1, 3)
+        self.actions = torch.stack([e[1] for e in episodes])  # (N, T)
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return self.states[idx], self.actions[idx]
 
 
 class PendulumDataset(Dataset):
