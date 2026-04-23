@@ -596,6 +596,7 @@ def main(**kwargs):
                     tag="val/hamiltonian/energy_pump",
                 )
             _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
+            writer.add_scalar("structure/b", model.b.item(), epoch)
 
             train_sample = train_episodes[:max(1, n_val)]
             _log_state_rollout(
