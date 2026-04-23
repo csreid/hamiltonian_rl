@@ -1,14 +1,14 @@
 """Offline Pendulum world-model training directly in ground-truth phase space.
 
 Skips pixel encoding/decoding entirely.  The model operates on the ground-truth
-state (cos θ, sin θ, θ̇) ∈ ℝ³ treated as the Hamiltonian phase space:
+state (θ, θ̇) ∈ ℝ² treated as the Hamiltonian phase space:
 
-    q = (cos θ, sin θ) ∈ ℝ²   (position)
-    p = (θ̇,)           ∈ ℝ¹   (momentum)
+    q = θ    ∈ ℝ¹   (angle)
+    p = θ̇   ∈ ℝ¹   (angular velocity)
 
 The controlled port-Hamiltonian ODE
 
-    dz/dt = (J − R) ∇H(z) + [0, 0, b] u
+    dz/dt = (J − R) ∇H(z) + [0, b] u
 
 is integrated with RK4 for T steps.  Training loss is MSE between the
 predicted and ground-truth next states.
@@ -92,8 +92,8 @@ class _HamiltonianMLP(nn.Module):
 class StatePHGN(nn.Module):
     """Controlled port-Hamiltonian model operating on ground-truth pendulum state.
 
-    Phase space: z = (cos θ, sin θ, θ̇) with q = z[:2], p = z[2:]
-    ODE: dz/dt = (J − R) ∇H(z) + [0, 0, b] u
+    Phase space: z = (θ, θ̇) with q = z[:1], p = z[1:]
+    ODE: dz/dt = (J − R) ∇H(z) + [0, b] u
     Integrated with RK4.
 
     Args:
@@ -103,9 +103,9 @@ class StatePHGN(nn.Module):
         separable:   use T(q,p) + V(q) Hamiltonian decomposition
     """
 
-    Q_DIM = 2
+    Q_DIM = 1
     P_DIM = 1
-    STATE_DIM = 3  # Q_DIM + P_DIM
+    STATE_DIM = 2  # Q_DIM + P_DIM
 
     def __init__(
         self,
@@ -265,10 +265,10 @@ def _train_epoch(
 
 
 def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
-    """H = 0.5 θ̇² + g (1 + cos θ) from (T, 3) states."""
-    cos_theta = states[:, 0].numpy()
-    theta_dot = states[:, 2].numpy()
-    return 0.5 * theta_dot**2 + _G * (1.0 + cos_theta)
+    """H = 0.5 θ̇² + g (1 + cos θ) from (T, 2) states."""
+    theta = states[:, 0].numpy()
+    theta_dot = states[:, 1].numpy()
+    return 0.5 * theta_dot**2 + _G * (1.0 + np.cos(theta))
 
 
 @torch.no_grad()
@@ -305,7 +305,7 @@ def _log_hamiltonian_comparison(
 ) -> None:
     """Log H values and dH breakdown for one validation trajectory."""
     model.eval()
-    states, actions = val_traj  # (T+1, 3), (T,)
+    states, actions = val_traj  # (T+1, 2), (T,)
 
     states_dev = states.to(device)
     q_all, p_all = model.split(states_dev)  # each step is indexed manually below
@@ -380,7 +380,7 @@ def _log_state_rollout(
 ) -> None:
     """Roll out from s0 and compare predicted vs true state trajectory."""
     model.eval()
-    state_names = ["cos θ", "sin θ", "θ̇ (rad/s)"]
+    state_names = ["θ (rad)", "θ̇ (rad/s)"]
 
     all_true, all_pred = [], []
     for states, actions in val_trajs:

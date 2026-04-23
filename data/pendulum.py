@@ -253,7 +253,7 @@ def _collect_spin_episodes(
         theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
         frames = [torch.from_numpy(obs).float() / 255.0]
         actions = []
-        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
 
         for _ in range(max_steps):
             _, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
@@ -262,7 +262,7 @@ def _collect_spin_episodes(
             theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
             frames.append(torch.from_numpy(obs).float() / 255.0)
             actions.append(action)
-            states.append(np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32))
+            states.append(np.array([theta_next, theta_dot_next], dtype=np.float32))
 
         episodes.append(
             (
@@ -304,7 +304,7 @@ def _collect_state_only_episodes(
     """Collect (states, actions) without rendering frames.
 
     Returns a list of (states, actions) tuples:
-        states  : (T+1, 3) float32 — (cos(theta), sin(theta), theta_dot)
+        states  : (T+1, 2) float32 — (theta, theta_dot)
         actions : (T,)  float32
     """
     env = gym.make("Pendulum-v1", render_mode=None)
@@ -314,9 +314,9 @@ def _collect_state_only_episodes(
         kp = random.uniform(2.0, 15.0)
         kd = random.uniform(0.5, 5.0)
 
-        obs, _ = env.reset()
+        env.reset()
         theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
-        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
         actions = []
 
         for _ in range(max_steps):
@@ -329,14 +329,13 @@ def _collect_state_only_episodes(
             else:
                 action = _energy_pumping_action(theta, theta_dot, energy_k)
 
-            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+            env.step(np.array([action], dtype=np.float32))
+            theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
             if damping != 0.0:
-                theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
                 theta_dot_new *= np.exp(-damping * _DT)
                 env.unwrapped.state = np.array([theta_new, theta_dot_new])  # type: ignore[union-attr]
-                obs = np.array([np.cos(theta_new), np.sin(theta_new), theta_dot_new], dtype=np.float32)
             actions.append(action)
-            states.append(obs.astype(np.float32))
+            states.append(np.array([theta_new, theta_dot_new], dtype=np.float32))
 
         episodes.append((
             torch.from_numpy(np.stack(states)),          # (T+1, 3)
@@ -449,7 +448,7 @@ def collect_state_spin_trajectories(
 class PendulumStateDataset(Dataset):
     """State-only episode dataset (no frames).
 
-    states  : (T+1, 3) float32 — (cos(theta), sin(theta), theta_dot)
+    states  : (T+1, 2) float32 — (theta, theta_dot)
     actions : (T,)  float32
     """
 
