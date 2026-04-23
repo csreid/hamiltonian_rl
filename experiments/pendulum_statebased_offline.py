@@ -350,7 +350,7 @@ def _log_hamiltonian_comparison(
 
     fig_h, ax_h = plt.subplots(figsize=(8, 3))
     ax_h.plot(t_axis, true_H, label="Ground-truth H", linewidth=1.5, color="tab:blue")
-    ax_h.plot(t_axis, model_H, label="Model H", linewidth=1.5, linestyle="--", color="tab:orange")
+    ax_h.plot(t_axis, model_H, label="Learned H", linewidth=1.5, linestyle="--", color="tab:orange")
     ax_h.axhline(_G * 2, color="grey", linestyle=":", linewidth=1, label="H*=20")
     ax_h.set_xlabel("Step")
     ax_h.set_ylabel("H")
@@ -361,9 +361,9 @@ def _log_hamiltonian_comparison(
     plt.close(fig_h)
 
     fig_dh, ax_dh = plt.subplots(figsize=(8, 3))
-    ax_dh.plot(dh_axis, dH_true, label="dH ground-truth", linewidth=1.0, color="tab:blue")
-    ax_dh.plot(dh_axis, dH_model, label="dH model", linewidth=1.0, color="tab:green")
-    ax_dh.plot(dh_axis, dH_pred, label="dH predicted", linewidth=1.0, linestyle="--", color="tab:red")
+    ax_dh.plot(dh_axis, dH_true, label="ΔH (ground-truth)", linewidth=1.0, color="tab:blue")
+    ax_dh.plot(dh_axis, dH_model, label="ΔH (empirical)", linewidth=1.0, color="tab:green")
+    ax_dh.plot(dh_axis, dH_pred, label="ΔH (analytic)", linewidth=1.0, linestyle="--", color="tab:red")
     ax_dh.axhline(0, color="lightgrey", linestyle="-", linewidth=0.5)
     ax_dh.set_xlabel("Step")
     ax_dh.set_ylabel("dH")
@@ -402,7 +402,7 @@ def _log_state_rollout(
     true_all = np.concatenate(all_true, axis=0)
 
     # Scatter: predicted vs true, pooled across all trajectories
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
     for i, name in enumerate(state_names):
         ti, pi = true_all[:, i], pred_all[:, i]
         axes[i].scatter(ti, pi, s=2, alpha=0.3)
@@ -422,7 +422,7 @@ def _log_state_rollout(
     # Time-series from first trajectory only
     true_np, pred_np = all_true[0], all_pred[0]
     T = len(true_np)
-    fig2, axes2 = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
+    fig2, axes2 = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
     t_axis = np.arange(T)
     for i, name in enumerate(state_names):
         axes2[i].plot(t_axis, true_np[:, i], label="true", linewidth=1.5)
