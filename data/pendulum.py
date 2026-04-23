@@ -405,22 +405,21 @@ def _collect_state_spin_episodes(
     episodes = []
 
     for _ in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
-        obs, _ = env.reset()
+        env.reset()
         theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
-        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
         actions = []
 
         for _ in range(max_steps):
             _, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
             action = _spin_action(theta_dot)
-            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+            env.step(np.array([action], dtype=np.float32))
+            theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
             if damping != 0.0:
-                theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
                 theta_dot_new *= np.exp(-damping * _DT)
                 env.unwrapped.state = np.array([theta_new, theta_dot_new])  # type: ignore[union-attr]
-                obs = np.array([np.cos(theta_new), np.sin(theta_new), theta_dot_new], dtype=np.float32)
             actions.append(action)
-            states.append(obs.astype(np.float32))
+            states.append(np.array([theta_new, theta_dot_new], dtype=np.float32))
 
         episodes.append((
             torch.from_numpy(np.stack(states)),
@@ -453,7 +452,7 @@ class PendulumStateDataset(Dataset):
     """
 
     def __init__(self, episodes: list[tuple[torch.Tensor, torch.Tensor]]):
-        self.states = torch.stack([e[0] for e in episodes])   # (N, T+1, 3)
+        self.states = torch.stack([e[0] for e in episodes])   # (N, T+1, 2)
         self.actions = torch.stack([e[1] for e in episodes])  # (N, T)
 
     def __len__(self):
