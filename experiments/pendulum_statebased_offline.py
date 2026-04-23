@@ -139,7 +139,12 @@ class StatePHGN(nn.Module):
     # ── Structure matrix helpers ────────────────────────────────────────────
 
     def get_J(self) -> torch.Tensor:
-        return self.A - self.A.T
+        J = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
+        J[0, 1] = 1.0
+        J[1, 0] = -1.0
+        #return self.A - self.A.T
+
+        return J
 
     def get_L(self) -> torch.Tensor:
         L_lower = self.L_param.tril(-1)
