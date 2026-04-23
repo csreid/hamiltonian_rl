@@ -152,8 +152,12 @@ class StatePHGN(nn.Module):
         return L_lower + torch.diag(diag_pos)
 
     def get_R(self) -> torch.Tensor:
-        L = self.get_L()
-        return L @ L.T
+        #L = self.get_L()
+        #return L @ L.T
+
+        R = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
+
+        return R
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
 
