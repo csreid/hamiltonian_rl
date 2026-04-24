@@ -629,6 +629,7 @@ def main(**kwargs):
             )
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
+            tqdm.write(f"  [val] epoch {epoch + 1}: starting validation")
             for val_trajs, label in (
                 (val_energy, "energy_pump"),
                 (val_random, "random"),
@@ -636,7 +637,9 @@ def main(**kwargs):
             ):
                 if not val_trajs:
                     continue
+                tqdm.write(f"  [val] eval_loss/{label}")
                 writer.add_scalar(f"val/loss/{label}", _eval_loss(model, val_trajs, device), epoch)
+                tqdm.write(f"  [val] state_rollout/{label}")
                 _log_state_rollout(
                     model=model,
                     val_trajs=val_trajs,
@@ -646,6 +649,7 @@ def main(**kwargs):
                     tag=f"val/rollout/{label}",
                 )
             if val_energy:
+                tqdm.write("  [val] hamiltonian_comparison")
                 _log_hamiltonian_comparison(
                     model=model,
                     val_traj=val_energy[0],
@@ -654,6 +658,7 @@ def main(**kwargs):
                     epoch=epoch,
                     tag="val/hamiltonian/energy_pump",
                 )
+                tqdm.write("  [val] rollout_videos")
                 _log_rollout_videos(
                     model=model,
                     val_traj=val_energy[0],
@@ -662,9 +667,11 @@ def main(**kwargs):
                     epoch=epoch,
                     tag="val/video/energy_pump",
                 )
+                tqdm.write("  [val] rollout_videos done")
             _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
             writer.add_scalar("structure/b", model.b.item(), epoch)
 
+            tqdm.write("  [val] train rollout")
             train_sample = train_episodes[:max(1, n_val)]
             _log_state_rollout(
                 model=model,
@@ -682,6 +689,7 @@ def main(**kwargs):
                 epoch=epoch,
                 tag="train/hamiltonian",
             )
+            tqdm.write(f"  [val] epoch {epoch + 1}: validation done")
 
         if (
             kwargs["checkpoint_every"] > 0
