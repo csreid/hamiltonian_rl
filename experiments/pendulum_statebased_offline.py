@@ -471,22 +471,20 @@ def _log_rollout_videos(
     states, actions = val_traj  # (T+1, 2), (T,)
     T = len(actions)
 
-    tqdm.write("    [video] making env")
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
-    tqdm.write("    [video] env.reset()")
     env.reset()
 
     def _render_at(theta: float, theta_dot: float, u: float | None = None) -> np.ndarray:
+        if not (np.isfinite(theta) and np.isfinite(theta_dot)):
+            theta, theta_dot = 0.0, 0.0
         env.unwrapped.state = np.array([theta, theta_dot], dtype=np.float64)
         env.unwrapped.last_u = np.float32(u) if u is not None else None
         return env.render()  # (H, W, 3) uint8
 
-    tqdm.write("    [video] rendering GT frames")
     gt_frames = [_render_at(states[0, 0].item(), states[0, 1].item())]
     for t in range(T):
         gt_frames.append(_render_at(states[t + 1, 0].item(), states[t + 1, 1].item(), u=actions[t].item()))
 
-    tqdm.write("    [video] rendering HGN frames")
     q = states[0:1, : model.Q_DIM].to(device)
     p = states[0:1, model.Q_DIM :].to(device)
     hgn_frames = [_render_at(q.item(), p.item())]
@@ -496,7 +494,6 @@ def _log_rollout_videos(
         hgn_frames.append(_render_at(q.item(), p.item(), u=actions[t].item()))
 
     env.close()
-    tqdm.write("    [video] env closed, encoding video tensor")
 
     def _to_video_tensor(frames: list) -> torch.Tensor:
         # (1, T, C, H, W) uint8
@@ -508,9 +505,7 @@ def _log_rollout_videos(
 
     video = torch.cat([gt_vid, hgn_vid], dim=3)
 
-    tqdm.write("    [video] calling writer.add_video")
     writer.add_video(tag + "/gt_vs_hamiltonian_rollout", video, epoch, fps=fps)
-    tqdm.write("    [video] add_video done")
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +628,6 @@ def main(**kwargs):
             )
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
-            tqdm.write(f"  [val] epoch {epoch + 1}: starting validation")
             for val_trajs, label in (
                 (val_energy, "energy_pump"),
                 (val_random, "random"),
@@ -641,9 +635,7 @@ def main(**kwargs):
             ):
                 if not val_trajs:
                     continue
-                tqdm.write(f"  [val] eval_loss/{label}")
                 writer.add_scalar(f"val/loss/{label}", _eval_loss(model, val_trajs, device), epoch)
-                tqdm.write(f"  [val] state_rollout/{label}")
                 _log_state_rollout(
                     model=model,
                     val_trajs=val_trajs,
@@ -653,7 +645,6 @@ def main(**kwargs):
                     tag=f"val/rollout/{label}",
                 )
             if val_energy:
-                tqdm.write("  [val] hamiltonian_comparison")
                 _log_hamiltonian_comparison(
                     model=model,
                     val_traj=val_energy[0],
@@ -662,7 +653,6 @@ def main(**kwargs):
                     epoch=epoch,
                     tag="val/hamiltonian/energy_pump",
                 )
-                tqdm.write("  [val] rollout_videos")
                 _log_rollout_videos(
                     model=model,
                     val_traj=val_energy[0],
@@ -671,11 +661,9 @@ def main(**kwargs):
                     epoch=epoch,
                     tag="val/video/energy_pump",
                 )
-                tqdm.write("  [val] rollout_videos done")
             _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
             writer.add_scalar("structure/b", model.b.item(), epoch)
 
-            tqdm.write("  [val] train rollout")
             train_sample = train_episodes[:max(1, n_val)]
             _log_state_rollout(
                 model=model,
@@ -693,7 +681,6 @@ def main(**kwargs):
                 epoch=epoch,
                 tag="train/hamiltonian",
             )
-            tqdm.write(f"  [val] epoch {epoch + 1}: validation done")
 
         if (
             kwargs["checkpoint_every"] > 0
