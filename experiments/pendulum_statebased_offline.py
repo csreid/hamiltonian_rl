@@ -20,6 +20,7 @@ import os
 import sys
 
 import click
+import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -455,6 +456,51 @@ def _log_R_eigenvalues(
     writer.add_histogram("structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch)
 
 
+@torch.no_grad()
+def _log_rollout_videos(
+    model: StatePHGN,
+    val_traj: tuple,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/video",
+    fps: int = 20,
+) -> None:
+    """Log side-by-side ground-truth and Hamiltonian-rollout videos to TensorBoard."""
+    model.eval()
+    states, actions = val_traj  # (T+1, 2), (T,)
+    T = len(actions)
+
+    env = gym.make("Pendulum-v1", render_mode="rgb_array")
+    env.reset()
+
+    def _render_at(theta: float, theta_dot: float) -> np.ndarray:
+        env.unwrapped.state = np.array([theta, theta_dot], dtype=np.float64)
+        return env.render()  # (H, W, 3) uint8
+
+    # Ground-truth frames: inject actual (theta, theta_dot) at each timestep
+    gt_frames = [_render_at(states[t, 0].item(), states[t, 1].item()) for t in range(T + 1)]
+
+    # Hamiltonian rollout frames: inject model-predicted state at each timestep
+    q = states[0:1, : model.Q_DIM].to(device)
+    p = states[0:1, model.Q_DIM :].to(device)
+    hgn_frames = [_render_at(q.item(), p.item())]
+    for t in range(T):
+        u = actions[t].reshape(1, 1).to(device)
+        q, p = model.step(q, p, u)
+        hgn_frames.append(_render_at(q.item(), p.item()))
+
+    env.close()
+
+    def _to_video_tensor(frames: list) -> torch.Tensor:
+        # (1, T, C, H, W) uint8
+        arr = np.stack(frames, axis=0).transpose(0, 3, 1, 2)
+        return torch.from_numpy(arr).unsqueeze(0)
+
+    writer.add_video(tag + "/ground_truth", _to_video_tensor(gt_frames), epoch, fps=fps)
+    writer.add_video(tag + "/hamiltonian_rollout", _to_video_tensor(hgn_frames), epoch, fps=fps)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -599,6 +645,14 @@ def main(**kwargs):
                     writer=writer,
                     epoch=epoch,
                     tag="val/hamiltonian/energy_pump",
+                )
+                _log_rollout_videos(
+                    model=model,
+                    val_traj=val_energy[0],
+                    device=device,
+                    writer=writer,
+                    epoch=epoch,
+                    tag="val/video/energy_pump",
                 )
             _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
             writer.add_scalar("structure/b", model.b.item(), epoch)
