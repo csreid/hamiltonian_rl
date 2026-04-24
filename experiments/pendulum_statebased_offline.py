@@ -106,6 +106,7 @@ class StatePHGN(nn.Module):
     Q_DIM = 1
     P_DIM = 1
     STATE_DIM = 2  # Q_DIM + P_DIM
+    Q_ENC_DIM = 2  # sin(θ), cos(θ)
 
     def __init__(
         self,
@@ -120,7 +121,7 @@ class StatePHGN(nn.Module):
         D = self.STATE_DIM
 
         self.hamiltonian = _HamiltonianMLP(
-            q_dim=self.Q_DIM,
+            q_dim=self.Q_ENC_DIM,
             p_dim=self.P_DIM,
             hidden=hidden_dim,
             separable=separable,
@@ -165,8 +166,12 @@ class StatePHGN(nn.Module):
         """Split flat state s (B, 3) → q (B, 2), p (B, 1)."""
         return s[:, : self.Q_DIM], s[:, self.Q_DIM :]
 
+    @staticmethod
+    def encode_q(q: torch.Tensor) -> torch.Tensor:
+        return torch.cat([torch.sin(q), torch.cos(q)], dim=-1)
+
     def H(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        return self.hamiltonian(q, p)
+        return self.hamiltonian(self.encode_q(q), p)
 
     # ── Dynamics ────────────────────────────────────────────────────────────
 
@@ -180,7 +185,7 @@ class StatePHGN(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """dz/dt = (J − R) ∇H(z) + [0, 0, b] u."""
         z_ = torch.cat([q, p], dim=-1).detach().requires_grad_(True)
-        H_val = self.hamiltonian(z_[:, : self.Q_DIM], z_[:, self.Q_DIM :]).sum()
+        H_val = self.hamiltonian(self.encode_q(z_[:, : self.Q_DIM]), z_[:, self.Q_DIM :]).sum()
         grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
 
         dz = torch.einsum("ij,bj->bi", M, grad_H)
