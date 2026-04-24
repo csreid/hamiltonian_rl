@@ -471,7 +471,9 @@ def _log_rollout_videos(
     states, actions = val_traj  # (T+1, 2), (T,)
     T = len(actions)
 
+    tqdm.write("    [video] making env")
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
+    tqdm.write("    [video] env.reset()")
     env.reset()
 
     def _render_at(theta: float, theta_dot: float, u: float | None = None) -> np.ndarray:
@@ -479,13 +481,12 @@ def _log_rollout_videos(
         env.unwrapped.last_u = np.float32(u) if u is not None else None
         return env.render()  # (H, W, 3) uint8
 
-    # Ground-truth frames: inject actual (theta, theta_dot) at each timestep.
-    # Frame t is rendered with the action that was applied to *reach* state t.
+    tqdm.write("    [video] rendering GT frames")
     gt_frames = [_render_at(states[0, 0].item(), states[0, 1].item())]
     for t in range(T):
         gt_frames.append(_render_at(states[t + 1, 0].item(), states[t + 1, 1].item(), u=actions[t].item()))
 
-    # Hamiltonian rollout frames: inject model-predicted state at each timestep
+    tqdm.write("    [video] rendering HGN frames")
     q = states[0:1, : model.Q_DIM].to(device)
     p = states[0:1, model.Q_DIM :].to(device)
     hgn_frames = [_render_at(q.item(), p.item())]
@@ -495,6 +496,7 @@ def _log_rollout_videos(
         hgn_frames.append(_render_at(q.item(), p.item(), u=actions[t].item()))
 
     env.close()
+    tqdm.write("    [video] env closed, encoding video tensor")
 
     def _to_video_tensor(frames: list) -> torch.Tensor:
         # (1, T, C, H, W) uint8
@@ -506,7 +508,9 @@ def _log_rollout_videos(
 
     video = torch.cat([gt_vid, hgn_vid], dim=3)
 
+    tqdm.write("    [video] calling writer.add_video")
     writer.add_video(tag + "/gt_vs_hamiltonian_rollout", video, epoch, fps=fps)
+    tqdm.write("    [video] add_video done")
 
 
 # ---------------------------------------------------------------------------
