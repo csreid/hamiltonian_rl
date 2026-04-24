@@ -476,7 +476,7 @@ def _log_rollout_videos(
 
     def _render_at(theta: float, theta_dot: float, u: float | None = None) -> np.ndarray:
         env.unwrapped.state = np.array([theta, theta_dot], dtype=np.float64)
-        env.unwrapped.last_u = np.array([u], dtype=np.float32) if u is not None else None
+        env.unwrapped.last_u = np.float32(u) if u is not None else None
         return env.render()  # (H, W, 3) uint8
 
     # Ground-truth frames: inject actual (theta, theta_dot) at each timestep.
