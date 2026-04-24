@@ -501,8 +501,12 @@ def _log_rollout_videos(
         arr = np.stack(frames, axis=0).transpose(0, 3, 1, 2)
         return torch.from_numpy(arr).unsqueeze(0)
 
-    writer.add_video(tag + "/ground_truth", _to_video_tensor(gt_frames), epoch, fps=fps)
-    writer.add_video(tag + "/hamiltonian_rollout", _to_video_tensor(hgn_frames), epoch, fps=fps)
+    gt_vid = _to_video_tensor(gt_frames)
+    hgn_vid = _to_video_tensor(hgn_frames)
+
+    video = torch.cat([gt_vid, hgn_vid], dim=3)
+
+    writer.add_video(tag + "/gt_vs_hamiltonian_rollout", _to_video_tensor(video), epoch, fps=fps)
 
 
 # ---------------------------------------------------------------------------
