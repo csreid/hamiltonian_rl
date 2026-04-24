@@ -544,6 +544,11 @@ def _log_rollout_videos(
               help="Steps per val episode (0 = 2x --max-steps)")
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
 def main(**kwargs):
+    # Force SDL software rendering to avoid CUDA/OpenGL context conflict when
+    # calling env.render() while a CUDA context is active on the same GPU.
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
