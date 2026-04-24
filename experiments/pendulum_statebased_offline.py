@@ -506,7 +506,7 @@ def _log_rollout_videos(
 
     video = torch.cat([gt_vid, hgn_vid], dim=3)
 
-    writer.add_video(tag + "/gt_vs_hamiltonian_rollout", _to_video_tensor(video), epoch, fps=fps)
+    writer.add_video(tag + "/gt_vs_hamiltonian_rollout", video, epoch, fps=fps)
 
 
 # ---------------------------------------------------------------------------
