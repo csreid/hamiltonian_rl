@@ -474,12 +474,16 @@ def _log_rollout_videos(
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
     env.reset()
 
-    def _render_at(theta: float, theta_dot: float) -> np.ndarray:
+    def _render_at(theta: float, theta_dot: float, u: float | None = None) -> np.ndarray:
         env.unwrapped.state = np.array([theta, theta_dot], dtype=np.float64)
+        env.unwrapped.last_u = np.array([u], dtype=np.float32) if u is not None else None
         return env.render()  # (H, W, 3) uint8
 
-    # Ground-truth frames: inject actual (theta, theta_dot) at each timestep
-    gt_frames = [_render_at(states[t, 0].item(), states[t, 1].item()) for t in range(T + 1)]
+    # Ground-truth frames: inject actual (theta, theta_dot) at each timestep.
+    # Frame t is rendered with the action that was applied to *reach* state t.
+    gt_frames = [_render_at(states[0, 0].item(), states[0, 1].item())]
+    for t in range(T):
+        gt_frames.append(_render_at(states[t + 1, 0].item(), states[t + 1, 1].item(), u=actions[t].item()))
 
     # Hamiltonian rollout frames: inject model-predicted state at each timestep
     q = states[0:1, : model.Q_DIM].to(device)
@@ -488,7 +492,7 @@ def _log_rollout_videos(
     for t in range(T):
         u = actions[t].reshape(1, 1).to(device)
         q, p = model.step(q, p, u)
-        hgn_frames.append(_render_at(q.item(), p.item()))
+        hgn_frames.append(_render_at(q.item(), p.item(), u=actions[t].item()))
 
     env.close()
 
