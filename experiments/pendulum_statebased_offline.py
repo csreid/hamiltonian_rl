@@ -239,6 +239,7 @@ def _train_epoch(
     optimizer: torch.optim.Optimizer,
     grad_clip: float,
     device: torch.device,
+    seq_len: int,
 ) -> dict[str, float]:
     model.train()
     total_loss = total_q_var = total_p_var = 0.0
@@ -246,20 +247,19 @@ def _train_epoch(
     for states, actions in loader:
         states = states.to(device)  # (B, T+1, 3)
         actions = actions.to(device)  # (B, T)
-        T = actions.shape[1]
 
         q, p = model.split(states[:, 0])
 
         loss = torch.zeros(1, device=device)
         qs, ps = [q], [p]
-        for t in range(T):
+        for t in range(seq_len):
             u = actions[:, t].unsqueeze(-1)
             q, p = model.step(q, p, u)
             pred = torch.cat([q, p], dim=-1)
             loss = loss + F.mse_loss(pred, states[:, t + 1])
             qs.append(q)
             ps.append(p)
-        loss = loss / T
+        loss = loss / seq_len
 
         optimizer.zero_grad()
         loss.backward()
@@ -624,6 +624,20 @@ def _log_rollout_videos(
 @click.option("--h-lr", type=float, default=1e-4, show_default=True)
 @click.option("--structural-lr", type=float, default=1e-2, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
+@click.option(
+    "--seq-len-start",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Initial rollout length for curriculum",
+)
+@click.option(
+    "--seq-len-warmup",
+    type=int,
+    default=500,
+    show_default=True,
+    help="Epochs over which to linearly ramp rollout length to full sequence",
+)
 # logging
 @click.option("--log-every", type=int, default=5, show_default=True)
 @click.option(
@@ -727,21 +741,32 @@ def main(**kwargs):
     )
     best_loss = float("inf")
 
+    full_seq_len = train_episodes[0][1].shape[0]
+
     print("\n=== Training ===")
     for epoch in tqdm(range(kwargs["epochs"]), desc="Training"):
+        frac = min(epoch / max(1, kwargs["seq_len_warmup"]), 1.0)
+        seq_len = round(
+            kwargs["seq_len_start"]
+            + frac * (full_seq_len - kwargs["seq_len_start"])
+        )
+
         metrics = _train_epoch(
             model=model,
             loader=loader,
             optimizer=optimizer,
             grad_clip=kwargs["grad_clip"],
             device=device,
+            seq_len=seq_len,
         )
 
         if (epoch + 1) % kwargs["log_every"] == 0:
             for k, v in metrics.items():
                 writer.add_scalar(k, v, epoch)
+            writer.add_scalar("train/seq_len", seq_len, epoch)
             tqdm.write(
                 f"  epoch {epoch + 1:4d}"
+                f"  seq_len={seq_len:3d}"
                 f"  loss={metrics['train/loss']:.6f}"
                 f"  q_var={metrics['train/q_var']:.4f}"
                 f"  p_var={metrics['train/p_var']:.4f}"
