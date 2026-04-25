@@ -632,11 +632,11 @@ def _log_rollout_videos(
     help="Initial rollout length for curriculum",
 )
 @click.option(
-    "--seq-len-warmup",
-    type=int,
-    default=500,
+    "--seq-len-advance-threshold",
+    type=float,
+    default=0.005,
     show_default=True,
-    help="Epochs over which to linearly ramp rollout length to full sequence",
+    help="EMA loss below which rollout length advances by 1",
 )
 # logging
 @click.option("--log-every", type=int, default=5, show_default=True)
@@ -742,15 +742,11 @@ def main(**kwargs):
     best_loss = float("inf")
 
     full_seq_len = train_episodes[0][1].shape[0]
+    seq_len = kwargs["seq_len_start"]
+    ema_loss = None
 
     print("\n=== Training ===")
     for epoch in tqdm(range(kwargs["epochs"]), desc="Training"):
-        frac = min(epoch / max(1, kwargs["seq_len_warmup"]), 1.0)
-        seq_len = round(
-            kwargs["seq_len_start"]
-            + frac * (full_seq_len - kwargs["seq_len_start"])
-        )
-
         metrics = _train_epoch(
             model=model,
             loader=loader,
@@ -760,14 +756,24 @@ def main(**kwargs):
             seq_len=seq_len,
         )
 
+        ema_loss = (
+            metrics["train/loss"]
+            if ema_loss is None
+            else 0.9 * ema_loss + 0.1 * metrics["train/loss"]
+        )
+        if ema_loss < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
+            seq_len += 1
+
         if (epoch + 1) % kwargs["log_every"] == 0:
             for k, v in metrics.items():
                 writer.add_scalar(k, v, epoch)
             writer.add_scalar("train/seq_len", seq_len, epoch)
+            writer.add_scalar("train/ema_loss", ema_loss, epoch)
             tqdm.write(
                 f"  epoch {epoch + 1:4d}"
                 f"  seq_len={seq_len:3d}"
                 f"  loss={metrics['train/loss']:.6f}"
+                f"  ema={ema_loss:.6f}"
                 f"  q_var={metrics['train/q_var']:.4f}"
                 f"  p_var={metrics['train/p_var']:.4f}"
             )
