@@ -29,4 +29,3 @@ line-length = 80
 
 [tool.ruff.format]
 indent-style = "space"
-

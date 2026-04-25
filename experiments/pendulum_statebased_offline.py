@@ -66,19 +66,25 @@ class _HamiltonianMLP(nn.Module):
         self.separable = separable
         if separable:
             self.kinetic = nn.Sequential(
-                nn.Linear(q_dim + p_dim, hidden), nn.Softplus(),
-                nn.Linear(hidden, hidden), nn.Softplus(),
+                nn.Linear(q_dim + p_dim, hidden),
+                nn.Softplus(),
+                nn.Linear(hidden, hidden),
+                nn.Softplus(),
                 nn.Linear(hidden, 1),
             )
             self.potential = nn.Sequential(
-                nn.Linear(q_dim, hidden), nn.Softplus(),
-                nn.Linear(hidden, hidden), nn.Softplus(),
+                nn.Linear(q_dim, hidden),
+                nn.Softplus(),
+                nn.Linear(hidden, hidden),
+                nn.Softplus(),
                 nn.Linear(hidden, 1),
             )
         else:
             self.net = nn.Sequential(
-                nn.Linear(q_dim + p_dim, hidden), nn.Softplus(),
-                nn.Linear(hidden, hidden), nn.Softplus(),
+                nn.Linear(q_dim + p_dim, hidden),
+                nn.Softplus(),
+                nn.Linear(hidden, hidden),
+                nn.Softplus(),
                 nn.Linear(hidden, 1),
             )
 
@@ -141,12 +147,12 @@ class StatePHGN(nn.Module):
     # ── Structure matrix helpers ────────────────────────────────────────────
 
     def get_J(self) -> torch.Tensor:
-        J = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
-        J[0, 1] = 1.0
-        J[1, 0] = -1.0
-        #return self.A - self.A.T
+        # J = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
+        # J[0, 1] = 1.0
+        # J[1, 0] = -1.0
+        return self.A - self.A.T
 
-        return J
+        # return J
 
     def get_L(self) -> torch.Tensor:
         L_lower = self.L_param.tril(-1)
@@ -154,12 +160,12 @@ class StatePHGN(nn.Module):
         return L_lower + torch.diag(diag_pos)
 
     def get_R(self) -> torch.Tensor:
-        #L = self.get_L()
-        #return L @ L.T
+        L = self.get_L()
+        return L @ L.T
 
-        R = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
+        # R = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
 
-        return R
+        # return R
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
 
@@ -186,7 +192,9 @@ class StatePHGN(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """dz/dt = (J − R) ∇H(z) + [0, 0, b] u."""
         z_ = torch.cat([q, p], dim=-1).detach().requires_grad_(True)
-        H_val = self.hamiltonian(self.encode_q(z_[:, : self.Q_DIM]), z_[:, self.Q_DIM :]).sum()
+        H_val = self.hamiltonian(
+            self.encode_q(z_[:, : self.Q_DIM]), z_[:, self.Q_DIM :]
+        ).sum()
         grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
 
         dz = torch.einsum("ij,bj->bi", M, grad_H)
@@ -236,7 +244,7 @@ def _train_epoch(
     total_loss = total_q_var = total_p_var = 0.0
 
     for states, actions in loader:
-        states = states.to(device)    # (B, T+1, 3)
+        states = states.to(device)  # (B, T+1, 3)
         actions = actions.to(device)  # (B, T)
         T = actions.shape[1]
 
@@ -263,8 +271,12 @@ def _train_epoch(
         with torch.no_grad():
             qs_t = torch.stack([x.detach() for x in qs], dim=1)
             ps_t = torch.stack([x.detach() for x in ps], dim=1)
-            total_q_var += qs_t.reshape(-1, model.Q_DIM).var(dim=0).mean().item()
-            total_p_var += ps_t.reshape(-1, model.P_DIM).var(dim=0).mean().item()
+            total_q_var += (
+                qs_t.reshape(-1, model.Q_DIM).var(dim=0).mean().item()
+            )
+            total_p_var += (
+                ps_t.reshape(-1, model.P_DIM).var(dim=0).mean().item()
+            )
 
     n = len(loader)
     return {
@@ -323,11 +335,16 @@ def _log_hamiltonian_comparison(
     states, actions = val_traj  # (T+1, 2), (T,)
 
     states_dev = states.to(device)
-    q_all, p_all = model.split(states_dev)  # each step is indexed manually below
+    q_all, p_all = model.split(
+        states_dev
+    )  # each step is indexed manually below
 
     # Model H along ground-truth trajectory
     model_H = [
-        model.H(states_dev[t : t + 1, : model.Q_DIM], states_dev[t : t + 1, model.Q_DIM :]).item()
+        model.H(
+            states_dev[t : t + 1, : model.Q_DIM],
+            states_dev[t : t + 1, model.Q_DIM :],
+        ).item()
         for t in range(len(states))
     ]
     true_H = _true_hamiltonian(states)
@@ -342,10 +359,13 @@ def _log_hamiltonian_comparison(
             H_val = model.H(z[:, : model.Q_DIM], z[:, model.Q_DIM :]).sum()
             grad_H = torch.autograd.grad(H_val, z)[0]
 
-        Bu_full = torch.cat([
-            torch.zeros(1, model.Q_DIM, device=device),
-            u @ model.b.T,
-        ], dim=-1)
+        Bu_full = torch.cat(
+            [
+                torch.zeros(1, model.Q_DIM, device=device),
+                u @ model.b.T,
+            ],
+            dim=-1,
+        )
 
         dH_step = (
             -model.dt * (grad_H @ R * grad_H).sum(-1).item()
@@ -359,9 +379,20 @@ def _log_hamiltonian_comparison(
     dh_axis = np.arange(1, len(true_H))
 
     fig_h, ax_h = plt.subplots(figsize=(8, 3))
-    ax_h.plot(t_axis, true_H, label="Ground-truth H", linewidth=1.5, color="tab:blue")
-    ax_h.plot(t_axis, model_H, label="Learned H", linewidth=1.5, linestyle="--", color="tab:orange")
-    ax_h.axhline(_G * 2, color="grey", linestyle=":", linewidth=1, label="H*=20")
+    ax_h.plot(
+        t_axis, true_H, label="Ground-truth H", linewidth=1.5, color="tab:blue"
+    )
+    ax_h.plot(
+        t_axis,
+        model_H,
+        label="Learned H",
+        linewidth=1.5,
+        linestyle="--",
+        color="tab:orange",
+    )
+    ax_h.axhline(
+        _G * 2, color="grey", linestyle=":", linewidth=1, label="H*=20"
+    )
     ax_h.set_xlabel("Step")
     ax_h.set_ylabel("H")
     ax_h.legend(fontsize=8)
@@ -371,9 +402,28 @@ def _log_hamiltonian_comparison(
     plt.close(fig_h)
 
     fig_dh, ax_dh = plt.subplots(figsize=(8, 3))
-    ax_dh.plot(dh_axis, dH_true, label="ΔH (ground-truth)", linewidth=1.0, color="tab:blue")
-    ax_dh.plot(dh_axis, dH_model, label="ΔH (empirical)", linewidth=1.0, color="tab:green")
-    ax_dh.plot(dh_axis, dH_pred, label="ΔH (analytic)", linewidth=1.0, linestyle="--", color="tab:red")
+    ax_dh.plot(
+        dh_axis,
+        dH_true,
+        label="ΔH (ground-truth)",
+        linewidth=1.0,
+        color="tab:blue",
+    )
+    ax_dh.plot(
+        dh_axis,
+        dH_model,
+        label="ΔH (empirical)",
+        linewidth=1.0,
+        color="tab:green",
+    )
+    ax_dh.plot(
+        dh_axis,
+        dH_pred,
+        label="ΔH (analytic)",
+        linewidth=1.0,
+        linestyle="--",
+        color="tab:red",
+    )
     ax_dh.axhline(0, color="lightgrey", linestyle="-", linewidth=0.5)
     ax_dh.set_xlabel("Step")
     ax_dh.set_ylabel("dH")
@@ -424,7 +474,9 @@ def _log_state_rollout(
         axes[i].set_xlabel(f"True {name}")
         axes[i].set_ylabel(f"Predicted {name}")
         axes[i].set_title(f"{name}  R²={r2:.3f}")
-    fig.suptitle(f"Rollout prediction ({len(val_trajs)} trajectories, epoch {epoch + 1})")
+    fig.suptitle(
+        f"Rollout prediction ({len(val_trajs)} trajectories, epoch {epoch + 1})"
+    )
     fig.tight_layout()
     writer.add_figure(tag + "/scatter", fig, epoch)
     plt.close(fig)
@@ -436,7 +488,9 @@ def _log_state_rollout(
     t_axis = np.arange(T)
     for i, name in enumerate(state_names):
         axes2[i].plot(t_axis, true_np[:, i], label="true", linewidth=1.5)
-        axes2[i].plot(t_axis, pred_np[:, i], label="pred", linewidth=1.5, linestyle="--")
+        axes2[i].plot(
+            t_axis, pred_np[:, i], label="pred", linewidth=1.5, linestyle="--"
+        )
         axes2[i].set_ylabel(name)
         axes2[i].legend(fontsize=7, loc="upper right")
     axes2[-1].set_xlabel("Step")
@@ -453,7 +507,9 @@ def _log_R_eigenvalues(
     epoch: int,
 ) -> None:
     R = model.get_R().cpu()
-    writer.add_histogram("structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch)
+    writer.add_histogram(
+        "structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch
+    )
 
 
 @torch.no_grad()
@@ -474,7 +530,9 @@ def _log_rollout_videos(
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
     env.reset()
 
-    def _render_at(theta: float, theta_dot: float, u: float | None = None) -> np.ndarray:
+    def _render_at(
+        theta: float, theta_dot: float, u: float | None = None
+    ) -> np.ndarray:
         if not (np.isfinite(theta) and np.isfinite(theta_dot)):
             theta, theta_dot = 0.0, 0.0
         env.unwrapped.state = np.array([theta, theta_dot], dtype=np.float64)
@@ -483,7 +541,13 @@ def _log_rollout_videos(
 
     gt_frames = [_render_at(states[0, 0].item(), states[0, 1].item())]
     for t in range(T):
-        gt_frames.append(_render_at(states[t + 1, 0].item(), states[t + 1, 1].item(), u=actions[t].item()))
+        gt_frames.append(
+            _render_at(
+                states[t + 1, 0].item(),
+                states[t + 1, 1].item(),
+                u=actions[t].item(),
+            )
+        )
 
     q = states[0:1, : model.Q_DIM].to(device)
     p = states[0:1, model.Q_DIM :].to(device)
@@ -516,32 +580,73 @@ def _log_rollout_videos(
 @click.command()
 # data
 @click.option("--n-episodes", type=int, default=200, show_default=True)
-@click.option("--epsilon", type=float, default=0.1, show_default=True,
-              help="Fraction of steps with random uniform action")
-@click.option("--energy-k", type=float, default=1.0, show_default=True,
-              help="Gain for energy-pumping controller")
-@click.option("--max-steps", type=int, default=200, show_default=True,
-              help="Steps per episode")
-@click.option("--damping", type=float, default=0.0, show_default=True,
-              help="Linear viscous damping (theta_dot *= exp(-b*dt) per step)")
+@click.option(
+    "--epsilon",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help="Fraction of steps with random uniform action",
+)
+@click.option(
+    "--energy-k",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Gain for energy-pumping controller",
+)
+@click.option(
+    "--max-steps",
+    type=int,
+    default=200,
+    show_default=True,
+    help="Steps per episode",
+)
+@click.option(
+    "--damping",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Linear viscous damping (theta_dot *= exp(-b*dt) per step)",
+)
 # model
-@click.option("--hidden-dim", type=int, default=256, show_default=True,
-              help="Width of Hamiltonian MLP hidden layers")
+@click.option(
+    "--hidden-dim",
+    type=int,
+    default=256,
+    show_default=True,
+    help="Width of Hamiltonian MLP hidden layers",
+)
 @click.option("--dt", type=float, default=0.05, show_default=True)
 @click.option("--no-separable", "separable", default=True, flag_value=False)
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=16, show_default=True)
-@click.option("--lr", type=float, default=1e-4, show_default=True)
+@click.option("--h-lr", type=float, default=1e-4, show_default=True)
+@click.option("--structural-lr", type=float, default=1e-2, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 # logging
 @click.option("--log-every", type=int, default=5, show_default=True)
-@click.option("--val-every", type=int, default=10, show_default=True,
-              help="Epochs between val plots (0 to disable)")
-@click.option("--n-val-episodes", type=int, default=-1, show_default=True,
-              help="Val episodes per type (-1 = n_episodes // 2)")
-@click.option("--val-max-steps", type=int, default=0, show_default=True,
-              help="Steps per val episode (0 = 2x --max-steps)")
+@click.option(
+    "--val-every",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Epochs between val plots (0 to disable)",
+)
+@click.option(
+    "--n-val-episodes",
+    type=int,
+    default=-1,
+    show_default=True,
+    help="Val episodes per type (-1 = n_episodes // 2)",
+)
+@click.option(
+    "--val-max-steps",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Steps per val episode (0 = 2x --max-steps)",
+)
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
 def main(**kwargs):
     # Force SDL software rendering to avoid CUDA/OpenGL context conflict when
@@ -572,7 +677,9 @@ def main(**kwargs):
 
     val_energy, val_random, val_spin = [], [], []
     if n_val > 0:
-        print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
+        print(
+            f"Collecting {n_val} val episodes per type ({val_steps} steps each)..."
+        )
         val_energy = collect_state_val_trajectories(
             n_episodes=n_val,
             max_steps=val_steps,
@@ -609,7 +716,15 @@ def main(**kwargs):
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     hparams = dict(kwargs)
-    optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.hamiltonian.parameters(), "lr": kwargs["h_lr"]},
+            {
+                "params": [model.L_param, model.A, model.b],
+                "lr": kwargs["structural_lr"],
+            },
+        ]
+    )
     best_loss = float("inf")
 
     print("\n=== Training ===")
@@ -640,7 +755,11 @@ def main(**kwargs):
             ):
                 if not val_trajs:
                     continue
-                writer.add_scalar(f"val/loss/{label}", _eval_loss(model, val_trajs, device), epoch)
+                writer.add_scalar(
+                    f"val/loss/{label}",
+                    _eval_loss(model, val_trajs, device),
+                    epoch,
+                )
                 _log_state_rollout(
                     model=model,
                     val_trajs=val_trajs,
@@ -669,7 +788,7 @@ def main(**kwargs):
             _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
             writer.add_scalar("structure/b", model.b.item(), epoch)
 
-            train_sample = train_episodes[:max(1, n_val)]
+            train_sample = train_episodes[: max(1, n_val)]
             _log_state_rollout(
                 model=model,
                 val_trajs=train_sample,
