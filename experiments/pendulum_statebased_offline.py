@@ -136,7 +136,7 @@ class StatePHGN(nn.Module):
 
         # Control: b maps scalar torque to dp (1-D momentum update)
         self.b = nn.Parameter(torch.zeros(self.P_DIM, control_dim))
-        nn.init.normal_(self.b, std=1e-1)
+        nn.init.constant_(self.b, 3.0)
 
     # ── Structure matrix helpers ────────────────────────────────────────────
 
