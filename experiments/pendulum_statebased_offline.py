@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.func import functional_call, grad, vmap
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -176,7 +177,6 @@ class StatePHGN(nn.Module):
 
     # ── Dynamics ────────────────────────────────────────────────────────────
 
-    @torch.enable_grad()
     def _dynamics(
         self,
         q: torch.Tensor,
@@ -185,9 +185,18 @@ class StatePHGN(nn.Module):
         M: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """dz/dt = (J − R) ∇H(z) + [0, 0, b] u."""
-        z_ = torch.cat([q, p], dim=-1).detach().requires_grad_(True)
-        H_val = self.hamiltonian(self.encode_q(z_[:, : self.Q_DIM]), z_[:, self.Q_DIM :]).sum()
-        grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
+        params = dict(self.hamiltonian.named_parameters())
+
+        def H_per_sample(z):
+            q_i = z[: self.Q_DIM]
+            p_i = z[self.Q_DIM :]
+            q_enc_i = torch.cat([torch.sin(q_i), torch.cos(q_i)], dim=-1)
+            return functional_call(
+                self.hamiltonian, params, (q_enc_i.unsqueeze(0), p_i.unsqueeze(0))
+            ).squeeze()
+
+        z = torch.cat([q, p], dim=-1)           # (B, STATE_DIM)
+        grad_H = vmap(grad(H_per_sample))(z)    # (B, STATE_DIM)
 
         dz = torch.einsum("ij,bj->bi", M, grad_H)
 
