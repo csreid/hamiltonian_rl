@@ -370,7 +370,7 @@ def _log_hamiltonian_comparison(
         Bu_full = torch.cat(
             [
                 torch.zeros(1, model.Q_DIM, device=device),
-                u @ model.b.T,
+                u @ model.get_b().T,
             ],
             dim=-1,
         )
