@@ -142,17 +142,12 @@ class StatePHGN(nn.Module):
 
         # Control: b maps scalar torque to dp (1-D momentum update)
         self.b = nn.Parameter(torch.zeros(self.P_DIM, control_dim))
-        nn.init.constant_(self.b, 3.0)
+        nn.init.constant_(self.b, std=1e-2)
 
     # ── Structure matrix helpers ────────────────────────────────────────────
 
     def get_J(self) -> torch.Tensor:
-        # J = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
-        # J[0, 1] = 1.0
-        # J[1, 0] = -1.0
         return self.A - self.A.T
-
-        # return J
 
     def get_L(self) -> torch.Tensor:
         L_lower = self.L_param.tril(-1)
@@ -161,11 +156,8 @@ class StatePHGN(nn.Module):
 
     def get_R(self) -> torch.Tensor:
         L = self.get_L()
+
         return L @ L.T
-
-        # R = torch.zeros(self.STATE_DIM, self.STATE_DIM, device=self.L_param.device)
-
-        # return R
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
 
@@ -501,15 +493,29 @@ def _log_state_rollout(
 
 
 @torch.no_grad()
-def _log_R_eigenvalues(
+def _log_structural_matrices(
     model: StatePHGN,
     writer: SummaryWriter,
     epoch: int,
 ) -> None:
+    J = model.get_J().cpu()
     R = model.get_R().cpu()
-    writer.add_histogram(
-        "structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch
-    )
+
+    writer.add_histogram("structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch)
+
+    for name, mat in (("J", J), ("R", R)):
+        fig, ax = plt.subplots(figsize=(3, 3))
+        m = mat.numpy()
+        vmax = max(abs(m.max()), abs(m.min()), 1e-6)
+        im = ax.imshow(m, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        for i in range(m.shape[0]):
+            for j in range(m.shape[1]):
+                ax.text(j, i, f"{m[i, j]:.3f}", ha="center", va="center", fontsize=9)
+        ax.set_title(f"{name} (epoch {epoch + 1})")
+        fig.tight_layout()
+        writer.add_figure(f"structure/{name}", fig, epoch)
+        plt.close(fig)
 
 
 @torch.no_grad()
@@ -624,6 +630,13 @@ def _log_rollout_videos(
 @click.option("--h-lr", type=float, default=1e-4, show_default=True)
 @click.option("--structural-lr", type=float, default=1e-2, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
+@click.option(
+    "--ema-alpha",
+    type=float,
+    default=0.99,
+    show_default=True,
+    help="EMA smoothing factor for loss-gated curriculum (higher = smoother)",
+)
 @click.option(
     "--seq-len-start",
     type=int,
@@ -756,10 +769,11 @@ def main(**kwargs):
             seq_len=seq_len,
         )
 
+        alpha = kwargs["ema_alpha"]
         ema_loss = (
             metrics["train/loss"]
             if ema_loss is None
-            else 0.9 * ema_loss + 0.1 * metrics["train/loss"]
+            else alpha * ema_loss + (1.0 - alpha) * metrics["train/loss"]
         )
         if ema_loss < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
             seq_len += 1
@@ -816,7 +830,7 @@ def main(**kwargs):
                     epoch=epoch,
                     tag="val/video/energy_pump",
                 )
-            _log_R_eigenvalues(model=model, writer=writer, epoch=epoch)
+            _log_structural_matrices(model=model, writer=writer, epoch=epoch)
             writer.add_scalar("structure/b", model.b.item(), epoch)
 
             train_sample = train_episodes[: max(1, n_val)]
