@@ -783,6 +783,8 @@ def main(**kwargs):
                 writer.add_scalar(k, v, epoch)
             writer.add_scalar("train/seq_len", seq_len, epoch)
             writer.add_scalar("train/ema_loss", ema_loss, epoch)
+            writer.add_scalar("structure/b", model.b.item(), epoch)
+            _log_structural_matrices(model=model, writer=writer, epoch=epoch)
             tqdm.write(
                 f"  epoch {epoch + 1:4d}"
                 f"  seq_len={seq_len:3d}"
@@ -830,9 +832,6 @@ def main(**kwargs):
                     epoch=epoch,
                     tag="val/video/energy_pump",
                 )
-            _log_structural_matrices(model=model, writer=writer, epoch=epoch)
-            writer.add_scalar("structure/b", model.b.item(), epoch)
-
             train_sample = train_episodes[: max(1, n_val)]
             _log_state_rollout(
                 model=model,
