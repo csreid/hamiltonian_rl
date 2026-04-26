@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -121,10 +122,13 @@ class StatePHGN(nn.Module):
         dt: float = 0.05,
         control_dim: int = 1,
         separable: bool = True,
+        learn_structure: bool = True,
+        damping: float = 0.0,
     ):
         super().__init__()
         self.dt = dt
         self.control_dim = control_dim
+        self.learn_structure = learn_structure
         D = self.STATE_DIM
 
         self.hamiltonian = _HamiltonianMLP(
@@ -134,19 +138,25 @@ class StatePHGN(nn.Module):
             separable=separable,
         )
 
-        # J = A − Aᵀ (skew-symmetric), R = L Lᵀ (PSD)
-        self.A = nn.Parameter(torch.zeros(D, D))
-        self.L_param = nn.Parameter(torch.zeros(D, D))
-        nn.init.normal_(self.A, std=1e-2)
-        nn.init.normal_(self.L_param, std=1e-2)
-
-        # Control: b maps scalar torque to dp (1-D momentum update)
-        self.b = nn.Parameter(torch.zeros(self.P_DIM, control_dim))
-        nn.init.normal_(self.b, std=1e-2)
+        if learn_structure:
+            # J = A − Aᵀ (skew-symmetric), R = L Lᵀ (PSD)
+            self.A = nn.Parameter(torch.zeros(D, D))
+            self.L_param = nn.Parameter(torch.zeros(D, D))
+            nn.init.normal_(self.A, std=1e-2)
+            nn.init.normal_(self.L_param, std=1e-2)
+            # Control: b maps scalar torque to dp (1-D momentum update)
+            self.b = nn.Parameter(torch.zeros(self.P_DIM, control_dim))
+            nn.init.normal_(self.b, std=1e-2)
+        else:
+            self.register_buffer("J_fixed", torch.tensor([[0.0, 1.0], [-1.0, 0.0]]))
+            self.register_buffer("R_fixed", torch.tensor([[0.0, 0.0], [0.0, damping]]))
+            self.register_buffer("b_fixed", torch.full((self.P_DIM, control_dim), 3.0))
 
     # ── Structure matrix helpers ────────────────────────────────────────────
 
     def get_J(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.J_fixed
         return self.A - self.A.T
 
     def get_L(self) -> torch.Tensor:
@@ -155,9 +165,15 @@ class StatePHGN(nn.Module):
         return L_lower + torch.diag(diag_pos)
 
     def get_R(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.R_fixed
         L = self.get_L()
-
         return L @ L.T
+
+    def get_b(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.b_fixed
+        return self.b
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
 
@@ -192,7 +208,7 @@ class StatePHGN(nn.Module):
         dz = torch.einsum("ij,bj->bi", M, grad_H)
 
         # Control acts on the momentum component only
-        Bu = u @ self.b.T  # (B, P_DIM)
+        Bu = u @ self.get_b().T  # (B, P_DIM)
         dz = dz + torch.cat([torch.zeros_like(q), Bu], dim=-1)
 
         return dz[:, : self.Q_DIM], dz[:, self.Q_DIM :]
@@ -518,6 +534,13 @@ def _log_structural_matrices(
         plt.close(fig)
 
 
+def _annotate_frame(frame: np.ndarray, label: str) -> np.ndarray:
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img)
+    draw.text((4, 4), label, fill=(255, 255, 0))
+    return np.array(img)
+
+
 @torch.no_grad()
 def _log_rollout_videos(
     model: StatePHGN,
@@ -548,11 +571,7 @@ def _log_rollout_videos(
     gt_frames = [_render_at(states[0, 0].item(), states[0, 1].item())]
     for t in range(T):
         gt_frames.append(
-            _render_at(
-                states[t + 1, 0].item(),
-                states[t + 1, 1].item(),
-                u=actions[t].item(),
-            )
+            _render_at(states[t + 1, 0].item(), states[t + 1, 1].item(), u=actions[t].item())
         )
 
     q = states[0:1, : model.Q_DIM].to(device)
@@ -565,15 +584,13 @@ def _log_rollout_videos(
 
     env.close()
 
-    def _to_video_tensor(frames: list) -> torch.Tensor:
-        # (1, T, C, H, W) uint8
-        arr = np.stack(frames, axis=0).transpose(0, 3, 1, 2)
-        return torch.from_numpy(arr).unsqueeze(0)
+    combined = []
+    for t, (gt_f, hgn_f) in enumerate(zip(gt_frames, hgn_frames)):
+        frame = np.concatenate([gt_f, hgn_f], axis=1)
+        combined.append(_annotate_frame(frame, f"t={t}"))
 
-    gt_vid = _to_video_tensor(gt_frames)
-    hgn_vid = _to_video_tensor(hgn_frames)
-
-    video = torch.cat([gt_vid, hgn_vid], dim=3)
+    arr = np.stack(combined, axis=0).transpose(0, 3, 1, 2)
+    video = torch.from_numpy(arr).unsqueeze(0)
 
     writer.add_video(tag + "/gt_vs_hamiltonian_rollout", video, epoch, fps=fps)
 
@@ -624,6 +641,12 @@ def _log_rollout_videos(
 )
 @click.option("--dt", type=float, default=0.05, show_default=True)
 @click.option("--no-separable", "separable", default=True, flag_value=False)
+@click.option(
+    "--learn-structure/--no-learn-structure",
+    default=True,
+    show_default=True,
+    help="Learn J/R/B matrices; --no-learn-structure fixes J=[[0,1],[-1,0]], R=[[0,0],[0,damping]], B=3",
+)
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=16, show_default=True)
@@ -739,19 +762,26 @@ def main(**kwargs):
         dt=kwargs["dt"],
         control_dim=1,
         separable=kwargs["separable"],
+        learn_structure=kwargs["learn_structure"],
+        damping=kwargs["damping"],
     ).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     hparams = dict(kwargs)
-    optimizer = torch.optim.Adam(
-        [
-            {"params": model.hamiltonian.parameters(), "lr": kwargs["h_lr"]},
-            {
-                "params": [model.L_param, model.A, model.b],
-                "lr": kwargs["structural_lr"],
-            },
-        ]
-    )
+    if kwargs["learn_structure"]:
+        optimizer = torch.optim.Adam(
+            [
+                {"params": model.hamiltonian.parameters(), "lr": kwargs["h_lr"]},
+                {
+                    "params": [model.L_param, model.A, model.b],
+                    "lr": kwargs["structural_lr"],
+                },
+            ]
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.hamiltonian.parameters(), lr=kwargs["h_lr"]
+        )
     best_loss = float("inf")
 
     full_seq_len = train_episodes[0][1].shape[0]
@@ -783,7 +813,7 @@ def main(**kwargs):
                 writer.add_scalar(k, v, epoch)
             writer.add_scalar("train/seq_len", seq_len, epoch)
             writer.add_scalar("train/ema_loss", ema_loss, epoch)
-            writer.add_scalar("structure/b", model.b.item(), epoch)
+            writer.add_scalar("structure/b", model.get_b().item(), epoch)
             _log_structural_matrices(model=model, writer=writer, epoch=epoch)
             tqdm.write(
                 f"  epoch {epoch + 1:4d}"
