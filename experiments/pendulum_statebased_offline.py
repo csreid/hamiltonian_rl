@@ -199,7 +199,7 @@ class StatePHGN(nn.Module):
         M: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """dz/dt = (J − R) ∇H(z) + [0, 0, b] u."""
-        z_ = torch.cat([q, p], dim=-1).detach().requires_grad_(True)
+        z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
         H_val = self.hamiltonian(
             self.encode_q(z_[:, : self.Q_DIM]), z_[:, self.Q_DIM :]
         ).sum()
