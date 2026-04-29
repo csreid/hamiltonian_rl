@@ -373,6 +373,7 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
         control_dim: int = 1,
         separable: bool = True,
         obs_state_dim: int | None = None,
+        learn_structure: bool = True,
     ):
         super().__init__(
             pos_ch=pos_ch,
@@ -383,16 +384,25 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
         )
 
         self.latent_dim = latent_dim
+        self.learn_structure = learn_structure
         q_dim = latent_dim // 2
 
         # Override state_dim and structure matrices with flat latent_dim.
         # (Parent created these sized to latent_ch * 4 * 4; reassignment
         # via nn.Module.__setattr__ cleanly replaces them in _parameters.)
         self.state_dim = latent_dim
-        self.A = nn.Parameter(torch.zeros(latent_dim, latent_dim))
-        self.L_param = nn.Parameter(torch.zeros(latent_dim, latent_dim))
-        nn.init.normal_(self.A, std=1e-2)
-        nn.init.normal_(self.L_param, std=1e-2)
+        if learn_structure:
+            self.A = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+            self.L_param = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+            nn.init.normal_(self.A, std=1e-2)
+            nn.init.normal_(self.L_param, std=1e-2)
+        else:
+            # Canonical symplectic J = [[0, I], [-I, 0]], R = 0, fixed.
+            J_fixed = torch.zeros(latent_dim, latent_dim)
+            J_fixed[:q_dim, q_dim:] = torch.eye(q_dim)
+            J_fixed[q_dim:, :q_dim] = -torch.eye(q_dim)
+            self.register_buffer("J_fixed", J_fixed)
+            self.register_buffer("R_fixed", torch.zeros(latent_dim, latent_dim))
 
         # Replace all conv-based modules with flat MLP equivalents.
         self.encoder = FlexLSTMEncoder(
@@ -409,8 +419,11 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
         self.coord_head = MLPCoordHead(q_dim)
 
         self.control_dim = control_dim
-        self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
-        nn.init.normal_(self.B, std=1e-2)
+        if learn_structure:
+            self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
+            nn.init.normal_(self.B, std=1e-2)
+        else:
+            self.register_buffer("B_fixed", torch.ones(q_dim, control_dim))
 
         self.state_decoder = (
             MLPStateDecoder(latent_dim, obs_state_dim)
@@ -421,6 +434,41 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
         with torch.no_grad():
             self.f_psi.net[-1].weight.data *= 20.0
             self.f_psi.net[-1].bias.data *= 20.0
+
+    # ── Structure matrix accessors (override parent to support fixed mode) ──
+
+    def get_J(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.J_fixed
+        return self.A - self.A.T
+
+    def get_R(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.R_fixed
+        L = self.get_L()
+        return L @ L.T
+
+    def get_B(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.B_fixed
+        return self.B
+
+    # ── Dynamics (override parent to preserve gradient graph across rollout) ─
+
+    @torch.enable_grad()
+    def _dynamics(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        M: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """dz/dt = M ∇H(z). Does NOT detach q/p so gradients flow across steps."""
+        half = self.latent_dim // 2
+        z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
+        H_val = self.hamiltonian(z_[:, :half], z_[:, half:]).sum()
+        grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
+        dz = torch.einsum("ij,bj->bi", M, grad_H)
+        return dz[:, :half], dz[:, half:]
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
 
@@ -464,7 +512,7 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """dz/dt = (J − R) ∇H + B u."""
         dq, dp = self._dynamics(q, p, M)
-        Bu = u @ self.B.T  # (B, q_dim)
+        Bu = u @ self.get_B().T  # (B, q_dim)
         dp = dp + Bu
         return dq, dp
 

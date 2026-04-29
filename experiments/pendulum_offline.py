@@ -12,6 +12,9 @@ then trains the model jointly as a multi-step world model:
 from __future__ import annotations
 
 import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import click
 import matplotlib.pyplot as plt
@@ -64,6 +67,7 @@ def _train_epoch(
     free_bits: float,
     grad_clip: float,
     device: torch.device,
+    seq_len: int,
 ) -> dict[str, float]:
     """Joint training with two reconstruction signals combined before backward.
 
@@ -78,9 +82,10 @@ def _train_epoch(
     total_q_var = total_p_var = 0.0
 
     for frames, actions, _ in loader:
-        frames = frames.to(device)    # (B, T+1, C, H, W)
-        actions = actions.to(device)  # (B, T)
-        T = actions.shape[1]
+        frames = frames.to(device)    # (B, T_full+1, C, H, W)
+        actions = actions.to(device)  # (B, T_full)
+        T_full = actions.shape[1]
+        T = min(seq_len, T_full)      # truncated rollout length
         B_size = frames.shape[0]
         q_dim = model.latent_dim // 2
 
@@ -108,14 +113,14 @@ def _train_epoch(
             ps_dyn.append(p)
         recon_rollout = recon_rollout / T
 
-        # ── Signal 2: per-frame BiLSTM reconstruction ─────────────────────
-        B_T1 = B_size * (T + 1)
+        # ── Signal 2: per-frame BiLSTM reconstruction (all T_full+1 frames) ─
+        B_T1_full = B_size * (T_full + 1)
         mu_all, logvar_all = model.encoder.forward_all(frames)
         logvar_all = logvar_all.clamp(-10, 2)
         z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
-        qs_enc = model.f_psi(z_all.reshape(B_T1, -1)).reshape(B_size, T + 1, -1)[:, :, :q_dim]
+        qs_enc = model.f_psi(z_all.reshape(B_T1_full, -1)).reshape(B_size, T_full + 1, -1)[:, :, :q_dim]
 
-        pred_all = model.decoder(qs_enc.reshape(B_T1, q_dim)).reshape(B_size, T + 1, *frames.shape[2:])
+        pred_all = model.decoder(qs_enc.reshape(B_T1_full, q_dim)).reshape(B_size, T_full + 1, *frames.shape[2:])
         recon_perframe = F.mse_loss(pred_all, frames)
 
         kl_all = (
@@ -316,7 +321,7 @@ def _log_hamiltonian_comparison(
 
         Bu_full = torch.cat([
             torch.zeros(1, q_dim, device=device),
-            u @ model.B.T,
+            u @ model.get_B().T,
         ], dim=-1)
 
         dt = model.dt
@@ -420,6 +425,27 @@ def _log_latent_scatter(
     plt.close(fig)
 
 
+@torch.no_grad()
+def _log_structural_matrices(
+    model: ControlledDHGN_LSTM,
+    writer: SummaryWriter,
+    epoch: int,
+) -> None:
+    J = model.get_J().cpu()
+    R = model.get_R().cpu()
+    writer.add_histogram("structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch)
+    for name, mat in (("J", J), ("R", R)):
+        fig, ax = plt.subplots(figsize=(4, 4))
+        m = mat.numpy()
+        vmax = max(abs(m.max()), abs(m.min()), 1e-6)
+        im = ax.imshow(m, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(f"{name} (epoch {epoch + 1})")
+        fig.tight_layout()
+        writer.add_figure(f"structure/{name}", fig, epoch)
+        plt.close(fig)
+
+
 @click.command()
 # data
 @click.option("--n-episodes", type=int, default=200, show_default=True)
@@ -457,6 +483,12 @@ def _log_latent_scatter(
 @click.option("--feat-dim", type=int, default=256, show_default=True)
 @click.option("--dt", type=float, default=0.05, show_default=True)
 @click.option("--no-separable", "separable", default=True, flag_value=False)
+@click.option(
+    "--learn-structure/--no-learn-structure",
+    default=True,
+    show_default=True,
+    help="Learn J/R/B matrices; --no-learn-structure fixes J to canonical symplectic, R=0, B=1",
+)
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option(
@@ -467,9 +499,31 @@ def _log_latent_scatter(
     help="Episodes per batch; full rollouts are memory-heavy",
 )
 @click.option("--lr", type=float, default=1e-4, show_default=True)
+@click.option("--structural-lr", type=float, default=1e-2, show_default=True)
 @click.option("--kl-weight", type=float, default=1e-3, show_default=True)
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
+@click.option(
+    "--ema-alpha",
+    type=float,
+    default=0.99,
+    show_default=True,
+    help="EMA smoothing for loss-gated curriculum",
+)
+@click.option(
+    "--seq-len-start",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Initial rollout length for curriculum",
+)
+@click.option(
+    "--seq-len-advance-threshold",
+    type=float,
+    default=0.005,
+    show_default=True,
+    help="EMA loss below which rollout length advances by 1",
+)
 # logging
 @click.option("--log-every", type=int, default=5, show_default=True)
 @click.option(
@@ -558,12 +612,34 @@ def main(**kwargs):
         img_size=kwargs["img_size"],
         control_dim=1,
         separable=kwargs["separable"],
+        learn_structure=kwargs["learn_structure"],
     ).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     hparams = {k: v for k, v in kwargs.items()}
-    optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
+    if kwargs["learn_structure"]:
+        optimizer = torch.optim.Adam([
+            {
+                "params": (
+                    list(model.hamiltonian.parameters())
+                    + list(model.encoder.parameters())
+                    + list(model.f_psi.parameters())
+                    + list(model.decoder.parameters())
+                ),
+                "lr": kwargs["lr"],
+            },
+            {
+                "params": [model.A, model.L_param, model.B],
+                "lr": kwargs["structural_lr"],
+            },
+        ])
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
     best_loss = float("inf")
+
+    full_seq_len = episodes[0][1].shape[0]
+    seq_len = kwargs["seq_len_start"]
+    ema_loss = None
 
     print("\n=== Training (joint: dynamics rollout recon + KL) ===")
     for epoch in tqdm(range(kwargs["epochs"]), desc="Training"):
@@ -575,14 +651,34 @@ def main(**kwargs):
             free_bits=kwargs["free_bits"],
             grad_clip=kwargs["grad_clip"],
             device=device,
+            seq_len=seq_len,
         )
+
+        alpha = kwargs["ema_alpha"]
+        ema_loss = (
+            metrics["train/loss"]
+            if ema_loss is None
+            else alpha * ema_loss + (1.0 - alpha) * metrics["train/loss"]
+        )
+        if ema_loss < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
+            seq_len += 1
 
         if (epoch + 1) % kwargs["log_every"] == 0:
             for k, v in metrics.items():
                 writer.add_scalar(k, v, epoch)
+            writer.add_scalar("train/seq_len", seq_len, epoch)
+            writer.add_scalar("train/ema_loss", ema_loss, epoch)
+            writer.add_scalar(
+                "structure/B_norm",
+                model.get_B().norm().item(),
+                epoch,
+            )
+            _log_structural_matrices(model=model, writer=writer, epoch=epoch)
             tqdm.write(
                 f"  epoch {epoch + 1:4d}"
+                f"  seq_len={seq_len:3d}"
                 f"  loss={metrics['train/loss']:.4f}"
+                f"  ema={ema_loss:.4f}"
                 f"  recon_rollout={metrics['train/recon_rollout']:.4f}"
                 f"  recon_perframe={metrics['train/recon_perframe']:.4f}"
                 f"  kl={metrics['train/kl']:.4f}"

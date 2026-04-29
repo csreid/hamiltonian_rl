@@ -151,4 +151,41 @@ One large eigenvalue, 15 near zero — model correctly concentrates dissipation 
 
 ## Concerns
 
-* Results might be **too good** — want to check longer Hamiltonian rollouts to ensure it generalizes
+* Results might be **too good** --- want to check longer Hamiltonian rollouts to ensure it generalizes
+
+# 4/27
+
+## Shift: Pixels $\rightarrow$ Phase Space
+
+* Goal: confirm the port-Hamiltonian dynamics model can actually learn before adding pixel encoding back
+* I found lots of stuff
+
+## Problem: Structural Matrices Not Learning
+
+* Analytic rollouts were ~static
+* Suspected: $b$ initialized near zero with a small lr $\rightarrow$ contributes nothing to the Hamiltonian $\rightarrow$ no gradient signal
+* Tested by fixing them to the ground truth, $b = 3$,  $J = [[0, 1],[-1, 0]]$, $R = [[0, 0], [0, d]]$ (where $d$ is configurable damping factor) and training just $\mathcal{H}$
+	* model learned well, confirmed diagnosis
+* Fix: **split learning rates** --- small LR for $\mathcal{H}$, much larger LR for structural matrices ($J$, $R$, $B$)
+* Re-enabled joint learning of all structural matrices
+
+## Problem: Model Can't Learn Long Sequences
+
+* With structural matrices learning, model handled short rollouts fine but collapsed beyond $\sim 25$ steps
+* Suspected: gradients dominated by noise from a bad long rollout early in training
+* Added **curriculum learning**: start with short sequences, gradually increase length
+* Linear schedule advanced too fast
+* Switched to **performance-gated curriculum**: only advance sequence length once loss is sufficiently low
+
+## Problem: Model (Still) Can't Learn Long Sequences
+
+* Curriculum helped, but didn't fix the issue
+* Suspected: we detach the gradients in the dynamics rollout, so gradients re: long-term dependencies are incorrect
+* Fix: don't detach those, let the Hessian come through
+
+## Current status:
+
+* Everything is learning really well
+* Structural matrices have good/coherent values
+* Predicted rollouts look really good
+* Back to pixel space?

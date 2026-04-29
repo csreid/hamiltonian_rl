@@ -448,6 +448,78 @@ dissipation in one mode</p>
 Hamiltonian rollouts to ensure it generalizes</li>
 </ul>
 </section>
+
+<section id="section-3" class="title-slide slide level1">
+<h1>4/27</h1>
+
+</section>
+<section id="shift-pixels-rightarrow-phase-space" class="slide level2">
+<h2>Shift: Pixels <span class="math inline">→</span> Phase Space</h2>
+<ul>
+<li>Goal: confirm the port-Hamiltonian dynamics model can actually learn
+before adding pixel encoding back</li>
+</ul>
+</section>
+<section id="problem-structural-matrices-not-learning"
+class="slide level2">
+<h2>Problem: Structural Matrices Not Learning</h2>
+<ul>
+<li>Analytic rollouts were ~static</li>
+<li>Hypothesis: <span class="math inline"><em>b</em></span> initialized
+near zero with a small lr <span class="math inline">→</span> contributes
+nothing to the Hamiltonian <span class="math inline">→</span> no
+gradient signal</li>
+<li>Tested by fixing them to the ground truth, <span
+class="math inline"><em>b</em> = 3</span>, <span
+class="math inline"><em>J</em> = [[0,1],[−1,0]]</span>, <span
+class="math inline"><em>R</em> = [[0,0],[0,<em>d</em>]]</span> (where
+<span class="math inline"><em>d</em></span> is configurable damping
+factor) and training just <span class="math inline">ℋ</span>
+<ul>
+<li>model learned well, confirmed diagnosis</li>
+</ul></li>
+<li>Fix: <strong>split learning rates</strong> — small LR for <span
+class="math inline">ℋ</span>, much larger LR for structural matrices
+(<span class="math inline"><em>J</em></span>, <span
+class="math inline"><em>R</em></span>, <span
+class="math inline"><em>B</em></span>)</li>
+<li>Re-enabled joint learning of all structural matrices</li>
+</ul>
+</section>
+<section id="problem-model-cant-learn-long-sequences"
+class="slide level2">
+<h2>Problem: Model Can’t Learn Long Sequences</h2>
+<ul>
+<li>With structural matrices learning, model handled short rollouts fine
+but collapsed beyond <span class="math inline"> ∼ 25</span> steps</li>
+<li>Suspected: gradients dominated by noise from a bad long rollout
+early in training</li>
+<li>Added <strong>curriculum learning</strong>: start with short
+sequences, gradually increase length</li>
+<li>Linear schedule advanced too fast</li>
+<li>Switched to <strong>performance-gated curriculum</strong>: only
+advance sequence length once loss is sufficiently low</li>
+</ul>
+</section>
+<section id="problem-model-still-cant-learn-long-sequences"
+class="slide level2">
+<h2>Problem: Model (Still) Can’t Learn Long Sequences</h2>
+<ul>
+<li>Curriculum helped, but didn’t fix the issue</li>
+<li>Suspected: we detach the gradients in the dynamics rollout, so no
+gradients about long-term dependencies</li>
+<li>Fix: don’t detach those, let the Hessian come through</li>
+</ul>
+</section>
+<section id="current-status" class="slide level2">
+<h2>Current status:</h2>
+<ul>
+<li>Everything is learning really well</li>
+<li>Structural matrices have good/coherent values</li>
+<li>Predicted rollouts look really good</li>
+<li>Back to pixel space?</li>
+</ul>
+</section>
 <!-- {{{{ dzslides core
 #
 #
