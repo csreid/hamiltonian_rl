@@ -374,6 +374,7 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
         separable: bool = True,
         obs_state_dim: int | None = None,
         learn_structure: bool = True,
+        damping: float = 0.0,
     ):
         super().__init__(
             pos_ch=pos_ch,
@@ -402,7 +403,9 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
             J_fixed[:q_dim, q_dim:] = torch.eye(q_dim)
             J_fixed[q_dim:, :q_dim] = -torch.eye(q_dim)
             self.register_buffer("J_fixed", J_fixed)
-            self.register_buffer("R_fixed", torch.zeros(latent_dim, latent_dim))
+            R_fixed = torch.zeros(latent_dim, latent_dim)
+            R_fixed[q_dim:, q_dim:] = damping * torch.eye(q_dim)
+            self.register_buffer("R_fixed", R_fixed)
 
         # Replace all conv-based modules with flat MLP equivalents.
         self.encoder = FlexLSTMEncoder(

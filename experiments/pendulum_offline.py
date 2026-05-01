@@ -68,6 +68,7 @@ def _train_epoch(
     grad_clip: float,
     device: torch.device,
     seq_len: int,
+    alignment_weight: float = 0.0,
 ) -> dict[str, float]:
     """Joint training with two reconstruction signals combined before backward.
 
@@ -76,10 +77,13 @@ def _train_epoch(
 
     Signal 2 (per-frame): encode all frames with BiLSTM (forward_all) → per-step
     (q, p), decode each q, compare to the corresponding input frame.
+
+    Alignment: penalise ||q_rollout_t − q_enc_t|| for t=1..T, pulling the
+    Hamiltonian dynamics to stay on the encoder's learned manifold.
     """
     model.train()
     total_recon_rollout = total_recon_perframe = total_kl = total_loss = 0.0
-    total_q_var = total_p_var = 0.0
+    total_q_var = total_p_var = total_alignment = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T_full+1, C, H, W)
@@ -130,9 +134,17 @@ def _train_epoch(
             .mean()
         )
 
+        # ── Alignment: dynamics q → encoder q at each rollout step ─────────
+        # Detach qs_enc so only the dynamics side is penalised.
+        alignment = torch.zeros(1, device=device)
+        if alignment_weight > 0.0:
+            for t in range(T):
+                alignment = alignment + F.mse_loss(qs_dyn[t + 1], qs_enc[:, t + 1].detach())
+            alignment = alignment / T
+
         # ── Combined loss ──────────────────────────────────────────────────
         kl = kl0 + kl_all
-        loss = recon_rollout + recon_perframe + kl_weight * kl
+        loss = recon_rollout + recon_perframe + kl_weight * kl + alignment_weight * alignment
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
@@ -143,6 +155,7 @@ def _train_epoch(
         total_recon_perframe += recon_perframe.item()
         total_kl += kl.item()
         total_loss += loss.item()
+        total_alignment += alignment.item()
 
         with torch.no_grad():
             qs_t = torch.stack([x.detach() for x in qs_dyn], dim=1)
@@ -157,6 +170,7 @@ def _train_epoch(
         "train/recon_rollout": total_recon_rollout / n,
         "train/recon_perframe": total_recon_perframe / n,
         "train/kl": total_kl / n,
+        "train/alignment": total_alignment / n,
         "train/q_var": total_q_var / n,
         "train/p_var": total_p_var / n,
     }
@@ -504,6 +518,13 @@ def _log_structural_matrices(
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 @click.option(
+    "--alignment-weight",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help="Weight for posterior-alignment loss ||q_rollout_t − q_enc_t||",
+)
+@click.option(
     "--ema-alpha",
     type=float,
     default=0.99,
@@ -613,6 +634,7 @@ def main(**kwargs):
         control_dim=1,
         separable=kwargs["separable"],
         learn_structure=kwargs["learn_structure"],
+        damping=kwargs["damping"],
     ).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -652,6 +674,7 @@ def main(**kwargs):
             grad_clip=kwargs["grad_clip"],
             device=device,
             seq_len=seq_len,
+            alignment_weight=kwargs["alignment_weight"],
         )
 
         alpha = kwargs["ema_alpha"]
@@ -682,6 +705,7 @@ def main(**kwargs):
                 f"  recon_rollout={metrics['train/recon_rollout']:.4f}"
                 f"  recon_perframe={metrics['train/recon_perframe']:.4f}"
                 f"  kl={metrics['train/kl']:.4f}"
+                f"  align={metrics['train/alignment']:.4f}"
                 f"  q_var={metrics['train/q_var']:.4f}"
                 f"  p_var={metrics['train/p_var']:.4f}"
             )
