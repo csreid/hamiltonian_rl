@@ -177,6 +177,80 @@ class MLPStateTransform(nn.Module):
         return self.net(z)
 
 
+class AffineCouplingLayer(nn.Module):
+    """Affine coupling layer for a RealNVP-style normalizing flow.
+
+    Splits input in half; one half conditions scale/translate for the other.
+    Alternating which half passes through gives a universal bijection.
+    Zero-initialised output layers so the flow starts as identity.
+    """
+
+    def __init__(self, dim: int, mask_first: bool):
+        super().__init__()
+        d1 = dim // 2
+        d2 = dim - d1
+        self.d1 = d1
+        self.mask_first = mask_first
+        d_cond = d1 if mask_first else d2
+        d_out = d2 if mask_first else d1
+
+        self.scale_net = nn.Sequential(
+            nn.Linear(d_cond, 128), nn.ReLU(),
+            nn.Linear(128, d_out), nn.Tanh(),  # bounded → exp never blows up
+        )
+        self.translate_net = nn.Sequential(
+            nn.Linear(d_cond, 128), nn.ReLU(),
+            nn.Linear(128, d_out),
+        )
+        nn.init.zeros_(self.scale_net[-2].weight)
+        nn.init.zeros_(self.scale_net[-2].bias)
+        nn.init.zeros_(self.translate_net[-1].weight)
+        nn.init.zeros_(self.translate_net[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x[..., :self.d1], x[..., self.d1:]
+        if self.mask_first:
+            s, t = self.scale_net(x1), self.translate_net(x1)
+            return torch.cat([x1, x2 * s.exp() + t], dim=-1)
+        else:
+            s, t = self.scale_net(x2), self.translate_net(x2)
+            return torch.cat([x1 * s.exp() + t, x2], dim=-1)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        y1, y2 = y[..., :self.d1], y[..., self.d1:]
+        if self.mask_first:
+            s, t = self.scale_net(y1), self.translate_net(y1)
+            return torch.cat([y1, (y2 - t) * (-s).exp()], dim=-1)
+        else:
+            s, t = self.scale_net(y2), self.translate_net(y2)
+            return torch.cat([(y1 - t) * (-s).exp(), y2], dim=-1)
+
+
+class NormalizingFlow(nn.Module):
+    """Stack of affine coupling layers: LSTM latent z ↔ Hamiltonian phase space (q, p).
+
+    Bijective differentiable map so the two spaces carry identical information.
+    forward() maps z → (q, p); inverse() maps (q, p) → z.
+    """
+
+    def __init__(self, dim: int, n_layers: int = 6):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            AffineCouplingLayer(dim, mask_first=(i % 2 == 0))
+            for i in range(n_layers)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        for layer in reversed(self.layers):
+            y = layer.inverse(y)
+        return y
+
+
 class MLPHamiltonianNet(nn.Module):
     """H(q, p) implemented as an MLP.
 
@@ -414,7 +488,7 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
             latent_dim=latent_dim,
             img_size=img_size,
         )
-        self.f_psi = MLPStateTransform(latent_dim)
+        self.f_psi = NormalizingFlow(latent_dim)
         self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
         self.decoder = FlexDecoder(
             q_dim=q_dim, pos_ch=pos_ch, img_ch=img_ch, img_size=img_size
@@ -433,10 +507,6 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
             if obs_state_dim is not None
             else None
         )
-
-        with torch.no_grad():
-            self.f_psi.net[-1].weight.data *= 20.0
-            self.f_psi.net[-1].bias.data *= 20.0
 
     # ── Structure matrix accessors (override parent to support fixed mode) ──
 

@@ -68,32 +68,52 @@ def _train_epoch(
     grad_clip: float,
     device: torch.device,
     seq_len: int,
-    alignment_weight: float = 0.0,
 ) -> dict[str, float]:
-    """Joint training with two reconstruction signals combined before backward.
+    """Training with decoupled decoder and Hamiltonian objectives.
 
-    Signal 1 (rollout): encode frame 0 → (q0, p0), roll T controlled steps,
-    decode each q_t, compare to frames[1..T].
+    Decoder: trained only on per-frame BiLSTM-encoded q values — F(z_t) for
+    actual frames.  The decoder never sees rollout-produced q values, so its
+    training distribution exactly matches what the flow produces from real data.
 
-    Signal 2 (per-frame): encode all frames with BiLSTM (forward_all) → per-step
-    (q, p), decode each q, compare to the corresponding input frame.
-
-    Alignment: penalise ||q_rollout_t − q_enc_t|| for t=1..T, pulling the
-    Hamiltonian dynamics to stay on the encoder's learned manifold.
+    Hamiltonian: trained with a full trajectory loss.  The rollout starts from
+    the encoder-summary initial state (matching test-time inference) and is
+    compared at every step to the BiLSTM-grounded targets F(z_t), which are
+    detached so the decoder's gradient path stays clean.
     """
     model.train()
-    total_recon_rollout = total_recon_perframe = total_kl = total_loss = 0.0
-    total_q_var = total_p_var = total_alignment = 0.0
+    total_recon_perframe = total_kl = total_trajectory = total_loss = 0.0
+    total_q_var = total_p_var = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T_full+1, C, H, W)
         actions = actions.to(device)  # (B, T_full)
         T_full = actions.shape[1]
-        T = min(seq_len, T_full)      # truncated rollout length
+        T = min(seq_len, T_full)
         B_size = frames.shape[0]
         q_dim = model.latent_dim // 2
 
-        # ── Signal 1: dynamics rollout from frame 0 ────────────────────────
+        # ── Grounded phase-space targets via BiLSTM (all frames) ──────────
+        B_T1_full = B_size * (T_full + 1)
+        mu_all, logvar_all = model.encoder.forward_all(frames)
+        logvar_all = logvar_all.clamp(-10, 2)
+        z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
+        s_enc = model.f_psi(z_all.reshape(B_T1_full, -1)).reshape(B_size, T_full + 1, -1)
+        qs_enc = s_enc[:, :, :q_dim]
+
+        kl_all = (
+            (-0.5 * (1 + logvar_all - mu_all.pow(2) - logvar_all.exp()))
+            .clamp(min=free_bits)
+            .sum(dim=-1)
+            .mean()
+        )
+
+        # ── Decoder loss: reconstruct each frame from its grounded q ──────
+        pred_all = model.decoder(qs_enc.reshape(B_T1_full, q_dim)).reshape(
+            B_size, T_full + 1, *frames.shape[2:]
+        )
+        recon_perframe = F.mse_loss(pred_all, frames)
+
+        # ── Initial state from encoder summary (matches test-time path) ───
         mu0, logvar0 = model.encoder(frames[:, :1])
         logvar0 = logvar0.clamp(-10, 2)
         z0 = mu0 + torch.randn_like(mu0) * (0.5 * logvar0).exp()
@@ -107,63 +127,33 @@ def _train_epoch(
             .mean()
         )
 
-        recon_rollout = torch.zeros(1, device=device)
+        # ── Hamiltonian trajectory loss ────────────────────────────────────
+        # Roll forward T steps; compare rollout q_t to BiLSTM-grounded targets.
+        # Targets are detached: gradient flows through the Hamiltonian and the
+        # encoder-summary initial state, but not through the decoder.
+        trajectory = torch.zeros(1, device=device)
         qs_dyn, ps_dyn = [q], [p]
         for t in range(T):
             u = actions[:, t].unsqueeze(-1)
             q, p = model.controlled_step(q, p, u)
-            recon_rollout = recon_rollout + F.mse_loss(model.decoder(q), frames[:, t + 1])
+            trajectory = trajectory + F.mse_loss(q, qs_enc[:, t + 1].detach())
             qs_dyn.append(q)
             ps_dyn.append(p)
-        recon_rollout = recon_rollout / T
-
-        # ── Signal 2: per-frame BiLSTM reconstruction (all T_full+1 frames) ─
-        B_T1_full = B_size * (T_full + 1)
-        mu_all, logvar_all = model.encoder.forward_all(frames)
-        logvar_all = logvar_all.clamp(-10, 2)
-        z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
-        s_enc = model.f_psi(z_all.reshape(B_T1_full, -1)).reshape(B_size, T_full + 1, -1)
-        qs_enc = s_enc[:, :, :q_dim]
-        ps_enc = s_enc[:, :, q_dim:]
-
-        pred_all = model.decoder(qs_enc.reshape(B_T1_full, q_dim)).reshape(B_size, T_full + 1, *frames.shape[2:])
-        recon_perframe = F.mse_loss(pred_all, frames)
-
-        kl_all = (
-            (-0.5 * (1 + logvar_all - mu_all.pow(2) - logvar_all.exp()))
-            .clamp(min=free_bits)
-            .sum(dim=-1)
-            .mean()
-        )
-
-        # ── Alignment: one-step consistency from encoded states ────────────
-        # Step from (q_enc_t, p_enc_t) → compare to q_enc_{t+1}.
-        # Starting states are detached so gradients flow only through one RK4
-        # step, avoiding BPTT explosion across the full rollout.
-        alignment = torch.zeros(1, device=device)
-        if alignment_weight > 0.0:
-            for t in range(T):
-                u = actions[:, t].unsqueeze(-1)
-                q_pred, _ = model.controlled_step(
-                    qs_enc[:, t].detach(), ps_enc[:, t].detach(), u
-                )
-                alignment = alignment + F.mse_loss(q_pred, qs_enc[:, t + 1].detach())
-            alignment = alignment / T
+        trajectory = trajectory / T
 
         # ── Combined loss ──────────────────────────────────────────────────
         kl = kl0 + kl_all
-        loss = recon_rollout + recon_perframe + kl_weight * kl + alignment_weight * alignment
+        loss = recon_perframe + kl_weight * kl + trajectory
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_recon_rollout += recon_rollout.item()
         total_recon_perframe += recon_perframe.item()
         total_kl += kl.item()
+        total_trajectory += trajectory.item()
         total_loss += loss.item()
-        total_alignment += alignment.item()
 
         with torch.no_grad():
             qs_t = torch.stack([x.detach() for x in qs_dyn], dim=1)
@@ -175,10 +165,9 @@ def _train_epoch(
     n = len(loader)
     return {
         "train/loss": total_loss / n,
-        "train/recon_rollout": total_recon_rollout / n,
         "train/recon_perframe": total_recon_perframe / n,
         "train/kl": total_kl / n,
-        "train/alignment": total_alignment / n,
+        "train/trajectory": total_trajectory / n,
         "train/q_var": total_q_var / n,
         "train/p_var": total_p_var / n,
     }
@@ -526,13 +515,6 @@ def _log_structural_matrices(
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 @click.option(
-    "--alignment-weight",
-    type=float,
-    default=0.1,
-    show_default=True,
-    help="Weight for posterior-alignment loss ||q_rollout_t − q_enc_t||",
-)
-@click.option(
     "--ema-alpha",
     type=float,
     default=0.99,
@@ -682,7 +664,6 @@ def main(**kwargs):
             grad_clip=kwargs["grad_clip"],
             device=device,
             seq_len=seq_len,
-            alignment_weight=kwargs["alignment_weight"],
         )
 
         alpha = kwargs["ema_alpha"]
@@ -710,10 +691,9 @@ def main(**kwargs):
                 f"  seq_len={seq_len:3d}"
                 f"  loss={metrics['train/loss']:.4f}"
                 f"  ema={ema_loss:.4f}"
-                f"  recon_rollout={metrics['train/recon_rollout']:.4f}"
                 f"  recon_perframe={metrics['train/recon_perframe']:.4f}"
+                f"  trajectory={metrics['train/trajectory']:.4f}"
                 f"  kl={metrics['train/kl']:.4f}"
-                f"  align={metrics['train/alignment']:.4f}"
                 f"  q_var={metrics['train/q_var']:.4f}"
                 f"  p_var={metrics['train/p_var']:.4f}"
             )
