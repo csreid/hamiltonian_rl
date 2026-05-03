@@ -122,7 +122,9 @@ def _train_epoch(
         mu_all, logvar_all = model.encoder.forward_all(frames)
         logvar_all = logvar_all.clamp(-10, 2)
         z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
-        qs_enc = model.f_psi(z_all.reshape(B_T1_full, -1)).reshape(B_size, T_full + 1, -1)[:, :, :q_dim]
+        s_enc = model.f_psi(z_all.reshape(B_T1_full, -1)).reshape(B_size, T_full + 1, -1)
+        qs_enc = s_enc[:, :, :q_dim]
+        ps_enc = s_enc[:, :, q_dim:]
 
         pred_all = model.decoder(qs_enc.reshape(B_T1_full, q_dim)).reshape(B_size, T_full + 1, *frames.shape[2:])
         recon_perframe = F.mse_loss(pred_all, frames)
@@ -134,12 +136,18 @@ def _train_epoch(
             .mean()
         )
 
-        # ── Alignment: dynamics q → encoder q at each rollout step ─────────
-        # Detach qs_enc so only the dynamics side is penalised.
+        # ── Alignment: one-step consistency from encoded states ────────────
+        # Step from (q_enc_t, p_enc_t) → compare to q_enc_{t+1}.
+        # Starting states are detached so gradients flow only through one RK4
+        # step, avoiding BPTT explosion across the full rollout.
         alignment = torch.zeros(1, device=device)
         if alignment_weight > 0.0:
             for t in range(T):
-                alignment = alignment + F.mse_loss(qs_dyn[t + 1], qs_enc[:, t + 1].detach())
+                u = actions[:, t].unsqueeze(-1)
+                q_pred, _ = model.controlled_step(
+                    qs_enc[:, t].detach(), ps_enc[:, t].detach(), u
+                )
+                alignment = alignment + F.mse_loss(q_pred, qs_enc[:, t + 1].detach())
             alignment = alignment / T
 
         # ── Combined loss ──────────────────────────────────────────────────
