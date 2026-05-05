@@ -291,7 +291,7 @@ def _train_epoch_phase2(
     device: torch.device,
     seq_len: int,
 ) -> dict[str, float]:
-    """Dynamics-only epoch: learn Phi such that HamiltonianStep(Phi(h_t), u_t) ≈ Phi(h_{t+1})."""
+    """Dynamics-only epoch: learn Phi such that Phi^{-1}(HamiltonianStep(Phi(h_t), u_t)) ≈ h_{t+1}."""
     dyn_model.train()
     total_dynamics = total_q_var = total_p_var = 0.0
 
@@ -306,9 +306,8 @@ def _train_epoch_phase2(
         for t in range(T):
             q_t, p_t = dyn_model.encode(h_all[:, t])
             q_next, p_next = dyn_model.controlled_step(q_t, p_t, actions[:, t:t+1])
-            s_pred = torch.cat([q_next, p_next], dim=-1)
-            s_target = dyn_model.phi(h_all[:, t + 1]).detach()
-            loss = loss + F.mse_loss(s_pred, s_target)
+            h_pred = dyn_model.decode(q_next, p_next)
+            loss = loss + F.mse_loss(h_pred, h_all[:, t + 1])
             qs_log.append(q_t.detach())
             ps_log.append(p_t.detach())
         loss = loss / T
