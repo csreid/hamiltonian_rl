@@ -369,6 +369,70 @@ def _log_structural_matrices_phase2(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 dreaming video
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _log_dreamed_video_phase2(
+    phase1_model: ControlledDHGN_LSTM,
+    dyn_model: HamiltonianFlowModel,
+    val_traj: tuple,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    seq_len: int,
+    tag: str = "val/dreamed_phase2",
+    fps: int = 10,
+) -> None:
+    """Log a dreamed rollout alongside ground truth.
+
+    Context: 2 frames fed through the Phase 1 LSTM encoder → h.
+    Rollout: seq_len Hamiltonian steps in phase space, decoded back to pixels
+             via phi^{-1} → f_psi → decoder.
+    """
+    phase1_model.eval()
+    dyn_model.eval()
+    frames, actions, _ = val_traj
+    q_dim = phase1_model.latent_dim // 2
+    context_frames = 2
+
+    # Seed: encode context frames with Phase 1 LSTM
+    ctx = frames[:context_frames].unsqueeze(0).to(device)  # (1, 2, C, H, W)
+    mu_ctx, _ = phase1_model.encoder.forward_all(ctx)       # (1, 2, latent_dim)
+    h = mu_ctx[:, -1]                                        # (1, latent_dim)
+
+    # Map to phase space via Phase 2 phi
+    q, p = dyn_model.encode(h)  # (1, q_dim) each
+
+    # Roll out Hamiltonian dynamics, decode each step
+    n_steps = min(seq_len, len(actions) - (context_frames - 1))
+    dreamed_frames = []
+    for k in range(n_steps):
+        u = actions[context_frames - 1 + k].view(1, 1).to(device)  # (1, 1)
+        q, p = dyn_model.controlled_step(q, p, u)
+        h_pred = dyn_model.decode(q, p)                         # (1, latent_dim)
+        s_pred = phase1_model.f_psi(h_pred)                     # (1, latent_dim)
+        frame_pred = phase1_model.decoder(s_pred[:, :q_dim])    # (1, C, H, W)
+        dreamed_frames.append(frame_pred.squeeze(0).cpu())
+
+    if not dreamed_frames:
+        return
+
+    dreamed = torch.stack(dreamed_frames)                # (n_steps, C, H, W)
+    gt = frames[context_frames:context_frames + n_steps] # (n_steps, C, H, W)
+
+    gt_ann = torch.stack([
+        _annotate_frame(gt[i], f"gt {context_frames + i}") for i in range(len(gt))
+    ])
+    dream_ann = torch.stack([
+        _annotate_frame(dreamed[i].clamp(0, 1), f"dr {context_frames + i}") for i in range(len(dreamed))
+    ])
+    side_by_side = torch.cat([gt_ann, dream_ann], dim=3).unsqueeze(0)
+    writer.add_video(tag, (side_by_side.clamp(0, 1) * 255).byte(), epoch, fps=fps)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -454,7 +518,7 @@ def main(**kwargs):
     )
 
     val_energy, val_random, val_spin = [], [], []
-    if n_val > 0 and phase == "1":
+    if n_val > 0:
         print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
         val_energy = collect_val_trajectories(
             n_episodes=n_val, img_size=kwargs["img_size"],
@@ -588,11 +652,11 @@ def main(**kwargs):
         h_cache_path = kwargs["h_cache"]
         phase1_ckpt = kwargs["phase1_checkpoint"]
 
-        if h_cache_path is not None:
-            print(f"Loading h_cache from {h_cache_path}...")
-            cache = torch.load(h_cache_path, weights_only=False)
-        elif phase1_ckpt is not None:
-            print(f"Loading Phase 1 model from {phase1_ckpt} to precompute latents...")
+        # Load Phase 1 model whenever a checkpoint is given — kept alive for
+        # video logging throughout Phase 2 training.
+        phase1_model = None
+        if phase1_ckpt is not None:
+            print(f"Loading Phase 1 model from {phase1_ckpt}...")
             phase1_model = ControlledDHGN_LSTM(
                 pos_ch=kwargs["pos_ch"],
                 img_ch=3,
@@ -608,13 +672,22 @@ def main(**kwargs):
             phase1_model.load_state_dict(
                 torch.load(phase1_ckpt, map_location=device, weights_only=True)
             )
+            phase1_model.eval()
+
+        if h_cache_path is not None:
+            print(f"Loading h_cache from {h_cache_path}...")
+            cache = torch.load(h_cache_path, weights_only=False)
+        elif phase1_model is not None:
+            print("Precomputing latents from Phase 1 model...")
             cache = precompute_latents(phase1_model, episodes, device)
-            del phase1_model
             h_cache_save = run_dir / "h_cache.pt"
             torch.save(cache, h_cache_save)
             print(f"Saved h_cache to {h_cache_save}")
         else:
             raise click.UsageError("--phase 2 requires either --h-cache or --phase1-checkpoint")
+
+        if phase1_model is None:
+            print("Note: no --phase1-checkpoint provided; dreaming video logs will be skipped.")
 
         # Infer latent_dim from cache
         latent_dim = cache[0][0].shape[-1]
@@ -703,6 +776,16 @@ def main(**kwargs):
 
             if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
                 _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
+                if phase1_model is not None and val_energy:
+                    _log_dreamed_video_phase2(
+                        phase1_model=phase1_model,
+                        dyn_model=dyn_model,
+                        val_traj=val_energy[0],
+                        device=device,
+                        writer=writer,
+                        epoch=epoch,
+                        seq_len=seq_len,
+                    )
 
             if (
                 kwargs["checkpoint_every"] > 0
