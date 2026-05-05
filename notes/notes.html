@@ -458,6 +458,7 @@ Hamiltonian rollouts to ensure it generalizes</li>
 <ul>
 <li>Goal: confirm the port-Hamiltonian dynamics model can actually learn
 before adding pixel encoding back</li>
+<li>I found lots of stuff</li>
 </ul>
 </section>
 <section id="problem-structural-matrices-not-learning"
@@ -465,7 +466,7 @@ class="slide level2">
 <h2>Problem: Structural Matrices Not Learning</h2>
 <ul>
 <li>Analytic rollouts were ~static</li>
-<li>Hypothesis: <span class="math inline"><em>b</em></span> initialized
+<li>Suspected: <span class="math inline"><em>b</em></span> initialized
 near zero with a small lr <span class="math inline">→</span> contributes
 nothing to the Hamiltonian <span class="math inline">→</span> no
 gradient signal</li>
@@ -506,8 +507,8 @@ class="slide level2">
 <h2>Problem: Model (Still) Can’t Learn Long Sequences</h2>
 <ul>
 <li>Curriculum helped, but didn’t fix the issue</li>
-<li>Suspected: we detach the gradients in the dynamics rollout, so no
-gradients about long-term dependencies</li>
+<li>Suspected: we detach the gradients in the dynamics rollout, so
+gradients re: long-term dependencies are incorrect</li>
 <li>Fix: don’t detach those, let the Hessian come through</li>
 </ul>
 </section>
@@ -518,6 +519,85 @@ gradients about long-term dependencies</li>
 <li>Structural matrices have good/coherent values</li>
 <li>Predicted rollouts look really good</li>
 <li>Back to pixel space?</li>
+</ul>
+</section>
+
+<section id="section-4" class="title-slide slide level1">
+<h1>5/4</h1>
+
+</section>
+<section id="back-to-pixel-space-apr-29" class="slide level2">
+<h2>Back to Pixel Space (Apr 29)</h2>
+<ul>
+<li>Backported all the fixes discovered in the state-based model back to
+the pixel-space model</li>
+<li>Pixel-space model is now just responsible for mapping to a good
+phase space; dynamics happen in phase space as before</li>
+</ul>
+</section>
+<section id="problem-hamiltonian-drift-from-lstm-may-1"
+class="slide level2">
+<h2>Problem: Hamiltonian Drift from LSTM (May 1)</h2>
+<ul>
+<li>The LSTM encoder produces a <span
+class="math inline"><em>q</em></span> from the image sequence, but
+Hamiltonian rollouts were drifting away from it</li>
+<li>Fix: added a <strong>dynamic/LSTM alignment penalty</strong> — an
+extra loss term penalizing the encoder when the Hamiltonian dynamics
+rollout diverges from the <span class="math inline"><em>q</em></span>
+the LSTM learned</li>
+<li>Idea: force the Hamiltonian to stay “on-manifold” with respect to
+what the encoder actually sees</li>
+</ul>
+</section>
+<section id="problem-consistency-loss-blows-up-may-3"
+class="slide level2">
+<h2>Problem: Consistency Loss Blows Up (May 3)</h2>
+<ul>
+<li>The alignment/consistency loss was blowing up exponentially when
+propagated across the full rollout</li>
+<li>Fix: restrict the consistency loss to <strong>just one integrator
+step</strong> into the future rather than rolling out gradients through
+the entire sequence</li>
+<li>This keeps the loss bounded without sacrificing the core signal</li>
+</ul>
+</section>
+<section id="core-problem-f_psi-loses-information-may-3"
+class="slide level2">
+<h2>Core Problem: <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub></span> Loses
+Information (May 3)</h2>
+<ul>
+<li>Diagnosis: the LSTM hidden state <span
+class="math inline"><em>h</em><sub><em>t</em></sub></span> captures the
+environment really well — but the mapping <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub> : <em>h</em> → (<em>q</em>,<em>p</em>)</span>
+is a plain MLP and is lossy</li>
+<li>When the Hamiltonian is then rolled out, it produces phase-space
+coordinates the decoder can’t reconstruct from, because <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub></span> threw away
+information</li>
+</ul>
+</section>
+<section id="proposed-fix-normalizing-flow-for-h-to-q-p"
+class="slide level2">
+<h2>Proposed Fix: Normalizing Flow for <span
+class="math inline"><em>h</em> → (<em>q</em>,<em>p</em>)</span></h2>
+<ul>
+<li>Replace <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub></span> with a
+<strong>normalizing flow</strong></li>
+<li>A normalizing flow is invertible by construction, so all information
+in <span class="math inline"><em>h</em></span> survives the mapping to
+<span class="math inline">(<em>q</em>,<em>p</em>)</span></li>
+<li>Crucially: the flow goes both ways — we can map <span
+class="math inline"><em>h</em> → (<em>q</em>,<em>p</em>)</span> for
+Hamiltonian rollouts <em>and</em> map <span
+class="math inline">(<em>q</em>,<em>p</em>) → <em>h</em></span> to feed
+back into the decoder</li>
+<li>This should close the loop: Hamiltonian dynamics operate in a
+coherent phase space, and we can always invert back to the LSTM’s
+representation for decoding</li>
 </ul>
 </section>
 <!-- {{{{ dzslides core

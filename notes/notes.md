@@ -189,3 +189,34 @@ One large eigenvalue, 15 near zero — model correctly concentrates dissipation 
 * Structural matrices have good/coherent values
 * Predicted rollouts look really good
 * Back to pixel space?
+
+# 5/4
+
+## Back to Pixel Space (Apr 29)
+
+* Backported all the fixes discovered in the state-based model back to the pixel-space model
+* Pixel-space model is now just responsible for mapping to a good phase space; dynamics happen in phase space as before
+
+## Problem: Hamiltonian Drift from LSTM (May 1)
+
+* The LSTM encoder produces a $q$ from the image sequence, but Hamiltonian rollouts were drifting away from it
+* Fix: added a **dynamic/LSTM alignment penalty** --- an extra loss term penalizing the encoder when the Hamiltonian dynamics rollout diverges from the $q$ the LSTM learned
+* Idea: force the Hamiltonian to stay "on-manifold" with respect to what the encoder actually sees
+
+## Problem: Consistency Loss Blows Up (May 3)
+
+* The alignment/consistency loss was blowing up exponentially when propagated across the full rollout
+* Fix: restrict the consistency loss to **just one integrator step** into the future rather than rolling out gradients through the entire sequence
+* This keeps the loss bounded without sacrificing the core signal
+
+## Core Problem: $f_\psi$ Loses Information (May 3)
+
+* Diagnosis: the LSTM hidden state $h_t$ captures the environment really well --- but the mapping $f_\psi: h \to (q, p)$ is a plain MLP and is lossy
+* When the Hamiltonian is then rolled out, it produces phase-space coordinates the decoder can't reconstruct from, because $f_\psi$ threw away information
+
+## Proposed Fix: Normalizing Flow for $h \to (q, p)$
+
+* Replace $f_\psi$ with a **normalizing flow**
+* A normalizing flow is invertible by construction, so all information in $h$ survives the mapping to $(q, p)$
+* Crucially: the flow goes both ways --- we can map $h \to (q, p)$ for Hamiltonian rollouts *and* map $(q, p) \to h$ to feed back into the decoder
+* This should close the loop: Hamiltonian dynamics operate in a coherent phase space, and we can always invert back to the LSTM's representation for decoding

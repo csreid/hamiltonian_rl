@@ -657,3 +657,147 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
         mu, _ = self.encoder(imgs)
         s0 = self.f_psi(mu)
         return self._split(s0)
+
+
+# ---------------------------------------------------------------------------
+# HamiltonianFlowModel — Phase 2: dynamics-only model
+# ---------------------------------------------------------------------------
+
+
+class HamiltonianFlowModel(nn.Module):
+    """Phase 2 model: learns Φ mapping precomputed h_t → (q, p) for Hamiltonian dynamics.
+
+    Completely separate from Phase 1 (ControlledDHGN_LSTM). Takes precomputed
+    LSTM encoder outputs h_t as input — no encoder or decoder.
+
+    The controlled ODE integrated with RK4: dz/dt = (J − R) ∇H(z) + B u
+
+    Args:
+        latent_dim:      dimension of h_t (= ControlledDHGN_LSTM.latent_dim)
+        control_dim:     dimension of control input u
+        separable:       if True, use T + V Hamiltonian decomposition
+        learn_structure: if True, learn J/R/B; if False, use canonical J, R=0
+        dt:              integration step size
+        damping:         diagonal dissipation for fixed R (only when not learn_structure)
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        control_dim: int = 1,
+        separable: bool = True,
+        learn_structure: bool = True,
+        dt: float = 0.05,
+        damping: float = 0.0,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.dt = dt
+        self.learn_structure = learn_structure
+        q_dim = latent_dim // 2
+
+        self.phi = NormalizingFlow(latent_dim)
+        self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
+
+        if learn_structure:
+            self.A = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+            self.L_param = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+            nn.init.normal_(self.A, std=1e-2)
+            nn.init.normal_(self.L_param, std=1e-2)
+            self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
+            nn.init.normal_(self.B, std=1e-2)
+        else:
+            J_fixed = torch.zeros(latent_dim, latent_dim)
+            J_fixed[:q_dim, q_dim:] = torch.eye(q_dim)
+            J_fixed[q_dim:, :q_dim] = -torch.eye(q_dim)
+            self.register_buffer("J_fixed", J_fixed)
+            R_fixed = torch.zeros(latent_dim, latent_dim)
+            R_fixed[q_dim:, q_dim:] = damping * torch.eye(q_dim)
+            self.register_buffer("R_fixed", R_fixed)
+            self.register_buffer("B_fixed", torch.ones(q_dim, control_dim))
+
+    # ── Structure matrix accessors ──────────────────────────────────────────
+
+    def get_J(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.J_fixed
+        return self.A - self.A.T
+
+    def get_L(self) -> torch.Tensor:
+        L_lower = self.L_param.tril(-1)
+        diag_pos = F.softplus(self.L_param.diagonal())
+        return L_lower + torch.diag(diag_pos)
+
+    def get_R(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.R_fixed
+        L = self.get_L()
+        return L @ L.T
+
+    def get_B(self) -> torch.Tensor:
+        if not self.learn_structure:
+            return self.B_fixed
+        return self.B
+
+    def get_J_minus_R(self) -> torch.Tensor:
+        return self.get_J() - self.get_R()
+
+    # ── Dynamics ────────────────────────────────────────────────────────────
+
+    @torch.enable_grad()
+    def _dynamics(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        M: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        half = self.latent_dim // 2
+        z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
+        H_val = self.hamiltonian(z_[:, :half], z_[:, half:]).sum()
+        grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
+        dz = torch.einsum("ij,bj->bi", M, grad_H)
+        return dz[:, :half], dz[:, half:]
+
+    def _controlled_dynamics(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        u: torch.Tensor,
+        M: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dq, dp = self._dynamics(q, p, M)
+        Bu = u @ self.get_B().T
+        dp = dp + Bu
+        return dq, dp
+
+    @torch.enable_grad()
+    def controlled_step(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        u: torch.Tensor,
+        dt: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One RK4 step of dz/dt = (J − R) ∇H + B u."""
+        if dt is None:
+            dt = self.dt
+        M = self.get_J_minus_R()
+        dq1, dp1 = self._controlled_dynamics(q, p, u, M)
+        dq2, dp2 = self._controlled_dynamics(q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u, M)
+        dq3, dp3 = self._controlled_dynamics(q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u, M)
+        dq4, dp4 = self._controlled_dynamics(q + dt * dq3, p + dt * dp3, u, M)
+        q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
+        p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
+        return q_next, p_next
+
+    # ── Phase-space helpers ─────────────────────────────────────────────────
+
+    def encode(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """h_t → (q, p) via Φ."""
+        s = self.phi(h)
+        q_dim = self.latent_dim // 2
+        return s[:, :q_dim], s[:, q_dim:]
+
+    def decode(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        """(q, p) → h_t via Φ⁻¹."""
+        return self.phi.inverse(torch.cat([q, p], dim=-1))
