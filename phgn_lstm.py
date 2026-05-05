@@ -63,12 +63,13 @@ class FlexFrameCNN(nn.Module):
 
 
 class FlexLSTMEncoder(nn.Module):
-    """Bidirectional LSTM encoder: image sequence → (mu, logvar) flat vectors.
+    """Causal LSTM encoder: image sequence → (mu, logvar) flat vectors.
 
     (B, T, C, H, W) → (B, latent_dim), (B, latent_dim)
 
-    The LSTM hidden size matches feat_dim per direction (total 2*feat_dim),
-    then linear heads project to latent_dim.
+    The LSTM hidden size matches feat_dim; the linear heads project to latent_dim.
+    Forward-only (unidirectional) so h_t at time t encodes only frames 0..t —
+    no future leakage, which is required for valid dynamics training.
     """
 
     def __init__(
@@ -86,15 +87,10 @@ class FlexLSTMEncoder(nn.Module):
             hidden_size=feat_dim,
             num_layers=1,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=False,
         )
-        self.mu_head = nn.Linear(2 * feat_dim, latent_dim)
-        self.logvar_head = nn.Linear(2 * feat_dim, latent_dim)
-        # Directional heads: each takes only one half of the BiLSTM output
-        self.mu_fwd_head = nn.Linear(feat_dim, latent_dim)
-        self.logvar_fwd_head = nn.Linear(feat_dim, latent_dim)
-        self.mu_bwd_head = nn.Linear(feat_dim, latent_dim)
-        self.logvar_bwd_head = nn.Linear(feat_dim, latent_dim)
+        self.mu_head = nn.Linear(feat_dim, latent_dim)
+        self.logvar_head = nn.Linear(feat_dim, latent_dim)
 
     def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = imgs.shape
@@ -123,8 +119,8 @@ class FlexLSTMEncoder(nn.Module):
         else:
             _, (h_n, _) = self.lstm(feats)
 
-        # h_n: (2, B, feat_dim) — forward and backward final hidden states
-        h = h_n.permute(1, 0, 2).reshape(B, -1)  # (B, 2*feat_dim)
+        # h_n: (1, B, feat_dim) — final forward hidden state
+        h = h_n.squeeze(0)  # (B, feat_dim)
         return self.mu_head(h), self.logvar_head(h)
 
     def forward_all(
@@ -154,46 +150,8 @@ class FlexLSTMEncoder(nn.Module):
         else:
             out, _ = self.lstm(feats)
 
-        # out: (B, T, 2*feat_dim) — all-timestep hidden states
+        # out: (B, T, feat_dim) — all-timestep hidden states (causal)
         return self.mu_head(out), self.logvar_head(out)
-
-    def forward_all_split(
-        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, ...]:
-        """Encode each timestep with full, forward-only, and backward-only hidden states.
-
-        Returns mu/logvar for three prediction targets:
-          - full:    both directions → predicts current frame
-          - fwd:     forward half only → predicts next frame (caller uses [:, :-1])
-          - bwd:     backward half only → predicts previous frame (caller uses [:, 1:])
-
-        Returns:
-            mu_full, logvar_full, mu_fwd, logvar_fwd, mu_bwd, logvar_bwd:
-            each (B, T, latent_dim)
-        """
-        B, T = imgs.shape[:2]
-        feats = self._embed_frames(imgs)
-
-        if lengths is not None:
-            packed = pack_padded_sequence(
-                feats, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-            out, _ = self.lstm(packed)
-            out, _ = pad_packed_sequence(out, batch_first=True, total_length=T)
-        else:
-            out, _ = self.lstm(feats)
-
-        fwd = out[:, :, :self.feat_dim]
-        bwd = out[:, :, self.feat_dim:]
-
-        return (
-            self.mu_head(out),
-            self.logvar_head(out),
-            self.mu_fwd_head(fwd),
-            self.logvar_fwd_head(fwd),
-            self.mu_bwd_head(bwd),
-            self.logvar_bwd_head(bwd),
-        )
 
 
 # ---------------------------------------------------------------------------

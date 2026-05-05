@@ -96,48 +96,35 @@ def _train_epoch_phase1(
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
 
-    Three prediction targets force the BiLSTM to encode temporal dynamics:
-      - full hidden state  → current frame  (gives the encoder a reconstruction signal)
-      - forward half only  → next frame     (forward pass must anticipate the future)
-      - backward half only → previous frame (backward pass must remember the past)
+    Two prediction targets from the causal (forward-only) LSTM:
+      - h_t → current frame   (reconstruction signal)
+      - h_t → next frame      (predictive signal; h_t has seen only 0..t)
     """
     model.train()
-    total_recon = total_recon_next = total_recon_prev = total_kl = total_loss = 0.0
+    total_recon = total_recon_next = total_kl = total_loss = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
         B_size = frames.shape[0]
         T_full = frames.shape[1] - 1
         q_dim = model.latent_dim // 2
-        B_T1 = B_size * (T_full + 1)
 
-        # BiLSTM encode all frames — get full, forward-only, and backward-only latents
-        mu_all, logvar_all, mu_fwd, logvar_fwd, mu_bwd, logvar_bwd = (
-            model.encoder.forward_all_split(frames)
-        )
+        mu_all, logvar_all = model.encoder.forward_all(frames)
         logvar_all = logvar_all.clamp(-10, 2)
-        logvar_fwd = logvar_fwd.clamp(-10, 2)
-        logvar_bwd = logvar_bwd.clamp(-10, 2)
 
         z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
-        z_fwd = mu_fwd + torch.randn_like(mu_fwd) * (0.5 * logvar_fwd).exp()
-        z_bwd = mu_bwd + torch.randn_like(mu_bwd) * (0.5 * logvar_bwd).exp()
 
         def _decode(z: torch.Tensor, B: int, T: int):
             s = model.f_psi(z.reshape(B * T, -1))
             return model.decoder(s[:, :q_dim]).reshape(B, T, *frames.shape[2:])
 
-        # Current frame reconstruction (full BiLSTM)
+        # Current frame reconstruction
         pred_curr = _decode(z_all, B_size, T_full + 1)
         recon = F.mse_loss(pred_curr, frames)
 
-        # Next-frame prediction (forward half, t → t+1)
-        pred_next = _decode(z_fwd[:, :-1], B_size, T_full)
+        # Next-frame prediction (causal: h_t has seen only frames 0..t)
+        pred_next = _decode(z_all[:, :-1], B_size, T_full)
         recon_next = F.mse_loss(pred_next, frames[:, 1:])
-
-        # Previous-frame prediction (backward half, t → t-1)
-        pred_prev = _decode(z_bwd[:, 1:], B_size, T_full)
-        recon_prev = F.mse_loss(pred_prev, frames[:, :-1])
 
         def _kl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
             return (
@@ -147,9 +134,9 @@ def _train_epoch_phase1(
                 .mean()
             )
 
-        kl = _kl(mu_all, logvar_all) + _kl(mu_fwd, logvar_fwd) + _kl(mu_bwd, logvar_bwd)
+        kl = _kl(mu_all, logvar_all)
 
-        loss = recon + recon_next + recon_prev + kl_weight * kl
+        loss = recon + recon_next + kl_weight * kl
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
@@ -158,7 +145,6 @@ def _train_epoch_phase1(
 
         total_recon += recon.item()
         total_recon_next += recon_next.item()
-        total_recon_prev += recon_prev.item()
         total_kl += kl.item()
         total_loss += loss.item()
 
@@ -167,7 +153,6 @@ def _train_epoch_phase1(
         "phase1/loss": total_loss / n,
         "phase1/recon": total_recon / n,
         "phase1/recon_next": total_recon_next / n,
-        "phase1/recon_prev": total_recon_prev / n,
         "phase1/kl": total_kl / n,
     }
 
@@ -535,7 +520,6 @@ def main(**kwargs):
                     f"  ema={ema_loss:.4f}"
                     f"  recon={metrics['phase1/recon']:.4f}"
                     f"  next={metrics['phase1/recon_next']:.4f}"
-                    f"  prev={metrics['phase1/recon_prev']:.4f}"
                     f"  kl={metrics['phase1/kl']:.4f}"
                 )
 
