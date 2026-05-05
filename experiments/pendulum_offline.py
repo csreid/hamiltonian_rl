@@ -290,10 +290,15 @@ def _train_epoch_phase2(
     grad_clip: float,
     device: torch.device,
     seq_len: int,
+    logdet_weight: float,
 ) -> dict[str, float]:
-    """Dynamics-only epoch: learn Phi such that Phi^{-1}(HamiltonianStep(Phi(h_t), u_t)) ≈ h_{t+1}."""
+    """Dynamics-only epoch: learn Phi such that Phi^{-1}(HamiltonianStep(Phi(h_t), u_t)) ≈ h_{t+1}.
+
+    A log-det regulariser on Phi penalises log|det J_Phi|^2, keeping the flow
+    near-volume-preserving and preventing both collapse and explosive expansion.
+    """
     dyn_model.train()
-    total_dynamics = total_q_var = total_p_var = 0.0
+    total_dynamics = total_logdet_reg = total_q_var = total_p_var = 0.0
 
     for h_all, actions in loader:
         h_all = h_all.to(device)      # (B, T+1, latent_dim)
@@ -304,10 +309,11 @@ def _train_epoch_phase2(
         loss = torch.zeros(1, device=device)
         qs_log, ps_log = [], []
         for t in range(T):
-            q_t, p_t = dyn_model.encode(h_all[:, t])
+            q_t, p_t, log_det = dyn_model.encode_with_logdet(h_all[:, t])
             q_next, p_next = dyn_model.controlled_step(q_t, p_t, actions[:, t:t+1])
             h_pred = dyn_model.decode(q_next, p_next)
             loss = loss + F.mse_loss(h_pred, h_all[:, t + 1])
+            loss = loss + logdet_weight * log_det.pow(2).mean()
             qs_log.append(q_t.detach())
             ps_log.append(p_t.detach())
         loss = loss / T
@@ -318,6 +324,12 @@ def _train_epoch_phase2(
             torch.nn.utils.clip_grad_norm_(dyn_model.parameters(), grad_clip)
         optimizer.step()
 
+        with torch.no_grad():
+            logdet_reg = sum(
+                dyn_model.phi.forward_with_logdet(h_all[:, t])[1].pow(2).mean().item()
+                for t in range(T)
+            ) / T
+            total_logdet_reg += logdet_reg
         total_dynamics += loss.item()
         with torch.no_grad():
             q_var, p_var = _log_latent_variance(
@@ -329,6 +341,7 @@ def _train_epoch_phase2(
     n = len(loader)
     return {
         "phase2/dynamics": total_dynamics / n,
+        "phase2/logdet_reg": total_logdet_reg / n,
         "phase2/q_var": total_q_var / n,
         "phase2/p_var": total_p_var / n,
     }
@@ -397,6 +410,8 @@ def _log_structural_matrices_phase2(
 @click.option("--kl-weight", type=float, default=1e-3, show_default=True)
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
+@click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
+              help="Weight on log|det J_Phi|^2 regulariser (Phase 2 only); keeps flow near-volume-preserving")
 @click.option("--ema-alpha", type=float, default=0.99, show_default=True,
               help="EMA smoothing for loss-gated curriculum")
 @click.option("--seq-len-start", type=int, default=5, show_default=True,
@@ -653,6 +668,7 @@ def main(**kwargs):
                 grad_clip=kwargs["grad_clip"],
                 device=device,
                 seq_len=seq_len,
+                logdet_weight=kwargs["logdet_weight"],
             )
 
             alpha = kwargs["ema_alpha"]
@@ -680,6 +696,7 @@ def main(**kwargs):
                     f"  seq_len={seq_len:3d}"
                     f"  dynamics={metrics['phase2/dynamics']:.4f}"
                     f"  ema={ema_loss:.4f}"
+                    f"  logdet={metrics['phase2/logdet_reg']:.4f}"
                     f"  q_var={metrics['phase2/q_var']:.4f}"
                     f"  p_var={metrics['phase2/p_var']:.4f}"
                 )

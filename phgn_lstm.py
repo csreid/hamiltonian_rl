@@ -218,6 +218,16 @@ class AffineCouplingLayer(nn.Module):
             s, t = self.scale_net(x2), self.translate_net(x2)
             return torch.cat([x1 * s.exp() + t, x2], dim=-1)
 
+    def forward_with_logdet(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x1, x2 = x[..., :self.d1], x[..., self.d1:]
+        if self.mask_first:
+            s, t = self.scale_net(x1), self.translate_net(x1)
+            out = torch.cat([x1, x2 * s.exp() + t], dim=-1)
+        else:
+            s, t = self.scale_net(x2), self.translate_net(x2)
+            out = torch.cat([x1 * s.exp() + t, x2], dim=-1)
+        return out, s.sum(dim=-1)  # log|det J| contribution for this layer
+
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         y1, y2 = y[..., :self.d1], y[..., self.d1:]
         if self.mask_first:
@@ -246,6 +256,13 @@ class NormalizingFlow(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+    def forward_with_logdet(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        log_det = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+        for layer in self.layers:
+            x, ld = layer.forward_with_logdet(x)
+            log_det = log_det + ld
+        return x, log_det
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         for layer in reversed(self.layers):
@@ -799,6 +816,12 @@ class HamiltonianFlowModel(nn.Module):
         s = self.phi(h)
         q_dim = self.latent_dim // 2
         return s[:, :q_dim], s[:, q_dim:]
+
+    def encode_with_logdet(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """h_t → (q, p, log_det) via Φ. log_det is per-sample log|det J_Φ|."""
+        s, log_det = self.phi.forward_with_logdet(h)
+        q_dim = self.latent_dim // 2
+        return s[:, :q_dim], s[:, q_dim:], log_det
 
     def decode(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         """(q, p) → h_t via Φ⁻¹."""
