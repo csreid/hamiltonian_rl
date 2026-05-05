@@ -79,6 +79,7 @@ class FlexLSTMEncoder(nn.Module):
         img_size: int = 64,
     ):
         super().__init__()
+        self.feat_dim = feat_dim
         self.frame_cnn = FlexFrameCNN(img_ch=img_ch, feat_dim=feat_dim, img_size=img_size)
         self.lstm = nn.LSTM(
             input_size=feat_dim,
@@ -89,6 +90,11 @@ class FlexLSTMEncoder(nn.Module):
         )
         self.mu_head = nn.Linear(2 * feat_dim, latent_dim)
         self.logvar_head = nn.Linear(2 * feat_dim, latent_dim)
+        # Directional heads: each takes only one half of the BiLSTM output
+        self.mu_fwd_head = nn.Linear(feat_dim, latent_dim)
+        self.logvar_fwd_head = nn.Linear(feat_dim, latent_dim)
+        self.mu_bwd_head = nn.Linear(feat_dim, latent_dim)
+        self.logvar_bwd_head = nn.Linear(feat_dim, latent_dim)
 
     def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = imgs.shape
@@ -150,6 +156,44 @@ class FlexLSTMEncoder(nn.Module):
 
         # out: (B, T, 2*feat_dim) — all-timestep hidden states
         return self.mu_head(out), self.logvar_head(out)
+
+    def forward_all_split(
+        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, ...]:
+        """Encode each timestep with full, forward-only, and backward-only hidden states.
+
+        Returns mu/logvar for three prediction targets:
+          - full:    both directions → predicts current frame
+          - fwd:     forward half only → predicts next frame (caller uses [:, :-1])
+          - bwd:     backward half only → predicts previous frame (caller uses [:, 1:])
+
+        Returns:
+            mu_full, logvar_full, mu_fwd, logvar_fwd, mu_bwd, logvar_bwd:
+            each (B, T, latent_dim)
+        """
+        B, T = imgs.shape[:2]
+        feats = self._embed_frames(imgs)
+
+        if lengths is not None:
+            packed = pack_padded_sequence(
+                feats, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            out, _ = self.lstm(packed)
+            out, _ = pad_packed_sequence(out, batch_first=True, total_length=T)
+        else:
+            out, _ = self.lstm(feats)
+
+        fwd = out[:, :, :self.feat_dim]
+        bwd = out[:, :, self.feat_dim:]
+
+        return (
+            self.mu_head(out),
+            self.logvar_head(out),
+            self.mu_fwd_head(fwd),
+            self.logvar_fwd_head(fwd),
+            self.mu_bwd_head(bwd),
+            self.logvar_bwd_head(bwd),
+        )
 
 
 # ---------------------------------------------------------------------------
