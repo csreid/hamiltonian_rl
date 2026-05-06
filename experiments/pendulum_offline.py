@@ -292,10 +292,18 @@ def _train_epoch_phase2(
     seq_len: int,
     logdet_weight: float,
 ) -> dict[str, float]:
-    """Dynamics-only epoch: learn Phi such that Phi^{-1}(HamiltonianStep(Phi(h_t), u_t)) ≈ h_{t+1}.
+    """Dynamics-only epoch: closed-loop seq-to-seq rollout from h_1.
 
-    A log-det regulariser on Phi penalises log|det J_Phi|^2, keeping the flow
-    near-volume-preserving and preventing both collapse and explosive expansion.
+    Encodes h_1 (two frames seen by LSTM, carrying momentum info) to (q, p)
+    once, then rolls Hamiltonian dynamics forward for seq_len steps without
+    re-encoding, comparing phi^{-1}(q_k, p_k) against real h_{k+2}.
+
+    Teacher-forcing (re-encoding at every step) was the old approach; it
+    trained only 1-step predictions from real h values, so phi^{-1} drifted
+    out of the h-manifold during open-loop inference.
+
+    A log-det regulariser on the single phi(h_1) call keeps the flow
+    near-volume-preserving.
     """
     dyn_model.train()
     total_dynamics = total_logdet_reg = total_q_var = total_p_var = 0.0
@@ -304,18 +312,21 @@ def _train_epoch_phase2(
         h_all = h_all.to(device)      # (B, T+1, latent_dim)
         actions = actions.to(device)  # (B, T)
         T_full = actions.shape[1]
-        T = min(seq_len, T_full)
+        # Start from h_1; can predict h_2..h_{T_full}, using actions[1..T_full-1]
+        T = min(seq_len, T_full - 1)
 
-        loss = torch.zeros(1, device=device)
-        qs_log, ps_log = [], []
+        # Encode h_1 once — no re-encoding inside the rollout
+        q, p, log_det = dyn_model.encode_with_logdet(h_all[:, 1])
+        loss = logdet_weight * log_det.pow(2).mean()
+        qs_log, ps_log = [q.detach()], [p.detach()]
+
         for t in range(T):
-            q_t, p_t, log_det = dyn_model.encode_with_logdet(h_all[:, t])
-            q_next, p_next = dyn_model.controlled_step(q_t, p_t, actions[:, t:t+1])
-            h_pred = dyn_model.decode(q_next, p_next)
-            loss = loss + F.mse_loss(h_pred, h_all[:, t + 1])
-            loss = loss + logdet_weight * log_det.pow(2).mean()
-            qs_log.append(q_t.detach())
-            ps_log.append(p_t.detach())
+            # action[t+1] is the control that drives h_{t+1} → h_{t+2}
+            q, p = dyn_model.controlled_step(q, p, actions[:, t + 1:t + 2])
+            h_pred = dyn_model.decode(q, p)
+            loss = loss + F.mse_loss(h_pred, h_all[:, t + 2])
+            qs_log.append(q.detach())
+            ps_log.append(p.detach())
         loss = loss / T
 
         optimizer.zero_grad()
@@ -325,10 +336,7 @@ def _train_epoch_phase2(
         optimizer.step()
 
         with torch.no_grad():
-            logdet_reg = sum(
-                dyn_model.phi.forward_with_logdet(h_all[:, t])[1].pow(2).mean().item()
-                for t in range(T)
-            ) / T
+            logdet_reg = dyn_model.phi.forward_with_logdet(h_all[:, 1])[1].pow(2).mean().item()
             total_logdet_reg += logdet_reg
         total_dynamics += loss.item()
         with torch.no_grad():
@@ -727,7 +735,7 @@ def main(**kwargs):
         else:
             optimizer = torch.optim.Adam(dyn_model.parameters(), lr=kwargs["lr"])
 
-        full_seq_len = cache[0][1].shape[0]
+        full_seq_len = cache[0][1].shape[0] - 1  # -1: start from h_1, predict up to h_{T}
         seq_len = kwargs["seq_len_start"]
         ema_loss = None
         best_loss = float("inf")
