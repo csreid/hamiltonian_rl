@@ -109,7 +109,7 @@ def _train_epoch_phase1(
         T_full = frames.shape[1] - 1
         q_dim = model.latent_dim // 2
 
-        mu_all, logvar_all = model.encoder.forward_all(frames)
+        mu_all, logvar_all = model.encoder.forward_all(frames, actions)
         logvar_all = logvar_all.clamp(-10, 2)
 
         z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
@@ -166,9 +166,9 @@ def _eval_loss_phase1(
     model.eval()
     q_dim = model.latent_dim // 2
     total_perframe = 0.0
-    for frames, _, _ in val_trajs:
+    for frames, actions, _ in val_trajs:
         frames = frames.unsqueeze(0).to(device)
-        mu_all, _ = model.encoder.forward_all(frames)
+        mu_all, _ = model.encoder.forward_all(frames, actions.unsqueeze(0).to(device))
         s_all = model.f_psi(mu_all.squeeze(0))
         z_dec = s_all[:, :q_dim]
         pred = model.decoder(z_dec)
@@ -187,11 +187,11 @@ def _log_reconstruction_lstm_video(
     fps: int = 10,
 ) -> None:
     model.eval()
-    frames, _, _ = val_traj
+    frames, actions, _ = val_traj
     ctx = frames.unsqueeze(0).to(device)
     q_dim = model.latent_dim // 2
 
-    mu_all, _ = model.encoder.forward_all(ctx)
+    mu_all, _ = model.encoder.forward_all(ctx, actions.unsqueeze(0).to(device))
     s_all = model.f_psi(mu_all.squeeze(0))
     z_dec = s_all[:, :q_dim]
     recon = model.decoder(z_dec).cpu()
@@ -214,9 +214,9 @@ def _log_latent_scatter_phase1(
 ) -> None:
     model.eval()
     all_s, all_st = [], []
-    for frames, _, states in val_trajs:
+    for frames, actions, states in val_trajs:
         ctx = frames.unsqueeze(0).to(device)
-        mu_all, _ = model.encoder.forward_all(ctx)
+        mu_all, _ = model.encoder.forward_all(ctx, actions.unsqueeze(0).to(device))
         s_all = model.f_psi(mu_all.squeeze(0)).cpu()
         all_s.append(s_all)
         all_st.append(states.float())
@@ -273,7 +273,7 @@ def precompute_latents(
     cache = []
     with torch.no_grad():
         for frames, actions, _ in tqdm(episodes, desc="Precomputing latents"):
-            mu_all, _ = model.encoder.forward_all(frames.unsqueeze(0).to(device))
+            mu_all, _ = model.encoder.forward_all(frames.unsqueeze(0).to(device), actions.unsqueeze(0).to(device))
             cache.append((mu_all.squeeze(0).cpu(), actions))
     return cache
 
@@ -406,8 +406,9 @@ def _log_dreamed_video_phase2(
     context_frames = 2
 
     # Seed: encode context frames with Phase 1 LSTM
-    ctx = frames[:context_frames].unsqueeze(0).to(device)  # (1, 2, C, H, W)
-    mu_ctx, _ = phase1_model.encoder.forward_all(ctx)       # (1, 2, latent_dim)
+    ctx = frames[:context_frames].unsqueeze(0).to(device)             # (1, 2, C, H, W)
+    ctx_actions = actions[:context_frames - 1].unsqueeze(0).to(device)  # (1, 1)
+    mu_ctx, _ = phase1_model.encoder.forward_all(ctx, ctx_actions)    # (1, 2, latent_dim)
     h = mu_ctx[:, -1]                                        # (1, latent_dim)
 
     # Map to phase space via Phase 2 phi
