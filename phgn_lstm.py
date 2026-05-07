@@ -109,7 +109,7 @@ class FlexLSTMEncoder(nn.Module):
             if actions.dim() == 2:
                 actions = actions.unsqueeze(-1)  # (B, T_a, 1)
             zeros = torch.zeros(B, 1, self.control_dim, device=feats.device, dtype=feats.dtype)
-            act = torch.cat([zeros, actions.to(feats.dtype)], dim=1)[:, :T]  # (B, T, control_dim)
+            act = torch.cat([zeros, actions.to(device=feats.device, dtype=feats.dtype)], dim=1)[:, :T]  # (B, T, control_dim)
         return torch.cat([feats, act], dim=-1)
 
     def forward(
