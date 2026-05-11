@@ -395,7 +395,7 @@ def _log_dreamed_video_phase2(
 ) -> None:
     """Log a dreamed rollout alongside ground truth.
 
-    Context: 2 frames fed through the Phase 1 LSTM encoder → h.
+    Context: 5 frames fed through the Phase 1 bidirectional LSTM encoder → h.
     Rollout: seq_len Hamiltonian steps in phase space, decoded back to pixels
              via phi^{-1} → f_psi → decoder.
     """
@@ -403,13 +403,13 @@ def _log_dreamed_video_phase2(
     dyn_model.eval()
     frames, actions, _ = val_traj
     q_dim = phase1_model.latent_dim // 2
-    context_frames = 2
+    context_frames = 5
 
-    # Seed: encode context frames with Phase 1 LSTM
-    ctx = frames[:context_frames].unsqueeze(0).to(device)             # (1, 2, C, H, W)
-    ctx_actions = actions[:context_frames - 1].unsqueeze(0).to(device)  # (1, 1)
-    mu_ctx, _ = phase1_model.encoder.forward_all(ctx, ctx_actions)    # (1, 2, latent_dim)
-    h = mu_ctx[:, -1]                                        # (1, latent_dim)
+    # Seed: encode context frames with Phase 1 bidirectional LSTM
+    ctx = frames[:context_frames].unsqueeze(0).to(device)                  # (1, context_frames, C, H, W)
+    ctx_actions = actions[:context_frames - 1].unsqueeze(0).to(device)     # (1, context_frames-1)
+    mu_ctx, _ = phase1_model.encoder.forward_all(ctx, ctx_actions)         # (1, context_frames, latent_dim)
+    h = mu_ctx[:, -1]                                                       # (1, latent_dim)
 
     # Map to phase space via Phase 2 phi
     q, p = dyn_model.encode(h)  # (1, q_dim) each
@@ -450,10 +450,13 @@ def _log_dreamed_video_phase2(
 # phase control
 @click.option("--phase", type=click.Choice(["1", "2"]), default="1", show_default=True,
               help="Training phase: 1=autoencoder, 2=dynamics flow")
+@click.option("--phase1-run", type=str, default=None,
+              help="Path to a Phase 1 run directory (e.g. models/pendulum_offline_phase1/2026-05-11_10-00-00); "
+                   "loads best.pt as the checkpoint and h_cache.pt from the same directory")
 @click.option("--phase1-checkpoint", type=str, default=None,
-              help="Path to Phase 1 .pt checkpoint (used in --phase 2 to load encoder for precomputation)")
+              help="Path to Phase 1 .pt checkpoint; overrides --phase1-run if both given")
 @click.option("--h-cache", type=str, default=None,
-              help="Path to precomputed h_t cache .pt (skips re-running encoder in --phase 2)")
+              help="Path to precomputed h_t cache .pt; overrides --phase1-run if both given")
 # data
 @click.option("--n-episodes", type=int, default=200, show_default=True)
 @click.option("--img-size", type=int, default=64, show_default=True)
@@ -506,6 +509,14 @@ def main(**kwargs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     phase = kwargs["phase"]
+
+    if kwargs.get("phase1_run") and phase == "2":
+        from pathlib import Path as _Path
+        _run = _Path(kwargs["phase1_run"])
+        if kwargs.get("phase1_checkpoint") is None:
+            kwargs["phase1_checkpoint"] = str(_run / "best.pt")
+        if kwargs.get("h_cache") is None:
+            kwargs["h_cache"] = str(_run / "h_cache.pt")
 
     writer = SummaryWriter(comment=f"_pendulum_offline_phase{phase}")
     run_dir = make_run_dir(f"pendulum_offline_phase{phase}")
@@ -654,7 +665,7 @@ def main(**kwargs):
         h_cache_path = run_dir / "h_cache.pt"
         torch.save(cache, h_cache_path)
         print(f"Saved h_cache to {h_cache_path}")
-        print(f"\nTo run Phase 2:\n  uv run python experiments/pendulum_offline.py --phase 2 --h-cache {h_cache_path}")
+        print(f"\nTo run Phase 2:\n  uv run python experiments/pendulum_offline.py --phase 2 --phase1-run {run_dir}")
 
     # ── Phase 2 ───────────────────────────────────────────────────────────────
     else:

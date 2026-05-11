@@ -63,13 +63,12 @@ class FlexFrameCNN(nn.Module):
 
 
 class FlexLSTMEncoder(nn.Module):
-    """Causal LSTM encoder: image sequence → (mu, logvar) flat vectors.
+    """Bidirectional LSTM encoder: image sequence → (mu, logvar) flat vectors.
 
     (B, T, C, H, W) → (B, latent_dim), (B, latent_dim)
 
-    The LSTM hidden size matches feat_dim; the linear heads project to latent_dim.
-    Forward-only (unidirectional) so h_t at time t encodes only frames 0..t —
-    no future leakage, which is required for valid dynamics training.
+    The LSTM hidden size matches feat_dim; the linear heads project from
+    2*feat_dim (concatenated forward+backward) to latent_dim.
     """
 
     def __init__(
@@ -89,10 +88,10 @@ class FlexLSTMEncoder(nn.Module):
             hidden_size=feat_dim,
             num_layers=1,
             batch_first=True,
-            bidirectional=False,
+            bidirectional=True,
         )
-        self.mu_head = nn.Linear(feat_dim, latent_dim)
-        self.logvar_head = nn.Linear(feat_dim, latent_dim)
+        self.mu_head = nn.Linear(2 * feat_dim, latent_dim)
+        self.logvar_head = nn.Linear(2 * feat_dim, latent_dim)
 
     def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = imgs.shape
@@ -137,8 +136,8 @@ class FlexLSTMEncoder(nn.Module):
         else:
             _, (h_n, _) = self.lstm(feats)
 
-        # h_n: (1, B, feat_dim) — final forward hidden state
-        h = h_n.squeeze(0)  # (B, feat_dim)
+        # h_n: (2, B, feat_dim) — forward and backward final hidden states
+        h = torch.cat([h_n[0], h_n[1]], dim=-1)  # (B, 2*feat_dim)
         return self.mu_head(h), self.logvar_head(h)
 
     def forward_all(
@@ -170,7 +169,7 @@ class FlexLSTMEncoder(nn.Module):
         else:
             out, _ = self.lstm(feats)
 
-        # out: (B, T, feat_dim) — all-timestep hidden states (causal)
+        # out: (B, T, 2*feat_dim) — all-timestep concatenated forward+backward hidden states
         return self.mu_head(out), self.logvar_head(out)
 
 
