@@ -122,8 +122,10 @@ def _train_epoch_phase1(
         pred_curr = _decode(z_all, B_size, T_full + 1)
         recon = F.mse_loss(pred_curr, frames)
 
-        # Next-frame prediction (causal: h_t has seen only frames 0..t)
-        pred_next = _decode(z_all[:, :-1], B_size, T_full)
+        # Next-frame prediction: h_t + a_t → frame_{t+1}
+        h_curr = z_all[:, :-1].reshape(B_size * T_full, -1)   # (B*T, latent_dim)
+        a_curr = actions[:, :T_full].to(device=device, dtype=frames.dtype).reshape(B_size * T_full, 1)
+        pred_next = model.next_frame_decoder(h_curr, a_curr).reshape(B_size, T_full, *frames.shape[2:])
         recon_next = F.mse_loss(pred_next, frames[:, 1:])
 
         def _kl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -580,7 +582,8 @@ def main(**kwargs):
         optimizer = torch.optim.Adam(
             list(model.encoder.parameters())
             + list(model.f_psi.parameters())
-            + list(model.decoder.parameters()),
+            + list(model.decoder.parameters())
+            + list(model.next_frame_decoder.parameters()),
             lr=kwargs["lr"],
         )
 

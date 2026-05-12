@@ -360,6 +360,49 @@ class MLPStateDecoder(nn.Module):
         return self.net(torch.cat([q, p], dim=-1))
 
 
+class NextFrameDecoder(nn.Module):
+    """Predicts frame_{t+1} from (h_t, a_t).
+
+    Projects the concatenated latent + action to a spatial seed, then
+    progressively upsamples to the full image resolution — same architecture
+    as FlexDecoder but conditioned on the action taken.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        control_dim: int = 1,
+        pos_ch: int = 16,
+        img_ch: int = 3,
+        img_size: int = 64,
+    ):
+        super().__init__()
+        self.pos_ch = pos_ch
+        n_blocks = int(math.log2(img_size // 4))
+        assert 4 * (2**n_blocks) == img_size, f"img_size must be 4·2^k, got {img_size}"
+
+        in_dim = latent_dim + control_dim
+        self.expand = nn.Linear(in_dim, pos_ch * 4 * 4)
+        blocks = [_DecoderBlock(pos_ch)]
+        for _ in range(n_blocks - 1):
+            blocks.append(_DecoderBlock(64))
+        self.blocks = nn.ModuleList(blocks)
+        self.out_conv = nn.Conv2d(64, img_ch, 1)
+
+    def forward(self, h: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (B, latent_dim)
+            a: (B, control_dim) or (B,) — action at time t
+        """
+        if a.dim() == 1:
+            a = a.unsqueeze(-1)
+        x = self.expand(torch.cat([h, a], dim=-1)).reshape(h.shape[0], self.pos_ch, 4, 4)
+        for block in self.blocks:
+            x = block(x)
+        return _leaky_hard_sigmoid(self.out_conv(x))
+
+
 class MLPCoordHead(nn.Module):
     """Maps position q (B, q_dim) → pixel coords (B, 2) in [0, 1]."""
 
@@ -531,6 +574,10 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
         self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
         self.decoder = FlexDecoder(
             q_dim=q_dim, pos_ch=pos_ch, img_ch=img_ch, img_size=img_size
+        )
+        self.next_frame_decoder = NextFrameDecoder(
+            latent_dim=latent_dim, control_dim=control_dim,
+            pos_ch=pos_ch, img_ch=img_ch, img_size=img_size,
         )
         self.coord_head = MLPCoordHead(q_dim)
 
