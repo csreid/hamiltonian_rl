@@ -12,7 +12,10 @@ space and decodes back to pixels for comparison.
 from __future__ import annotations
 
 import io
+import re
 import sys
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -245,15 +248,67 @@ with st.sidebar:
         st.warning("No `.pt` checkpoints found under `models/` (excluding h_cache).")
         st.stop()
 
-    rel_names = [str(f.relative_to(models_root.parent)) for f in pt_files]
+    # Parse each .pt file into (identifier, date, time_str, file).
+    # Expected layout: models/<identifier>/<YYYY-MM-DD>_<HH-MM-SS>/<stem>.pt
+    _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})$")
+
+    # nested dict: identifier → date → time_str → [Path, ...]
+    _tree: dict[str, dict[date, dict[str, list[Path]]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
+    )
+    _unstructured: list[Path] = []
+
+    for f in pt_files:
+        rel = f.relative_to(models_root)
+        parts = rel.parts  # e.g. ("pendulum_offline", "2024-04-29_12-36-49", "checkpoint_5.pt")
+        if len(parts) >= 3:
+            *id_parts, ts_part, _ = parts
+            m = _TIMESTAMP_RE.match(ts_part)
+            if m:
+                identifier = "/".join(id_parts)
+                run_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+                run_time = m.group(2)
+                _tree[identifier][run_date][run_time].append(f)
+                continue
+        _unstructured.append(f)
+
+    def _pick_checkpoint(label: str, key_prefix: str) -> Path:
+        """Nested date-aware selector: identifier → date → time → checkpoint."""
+        identifiers = sorted(_tree.keys())
+        identifier = st.selectbox(
+            f"{label} — model",
+            identifiers,
+            key=f"{key_prefix}_id",
+        )
+        dates = sorted(_tree[identifier].keys(), reverse=True)
+        chosen_date = st.selectbox(
+            f"{label} — date",
+            dates,
+            format_func=lambda d: d.strftime("%A, %B %-d %Y"),
+            key=f"{key_prefix}_date",
+        )
+        times = sorted(_tree[identifier][chosen_date].keys(), reverse=True)
+        chosen_time = st.selectbox(
+            f"{label} — run",
+            times,
+            format_func=lambda t: t.replace("-", ":"),
+            key=f"{key_prefix}_time",
+        )
+        files = _tree[identifier][chosen_date][chosen_time]
+        file_names = [f.name for f in files]
+        chosen_name = st.selectbox(
+            f"{label} — checkpoint",
+            file_names,
+            index=len(file_names) - 1,  # default to last (highest epoch)
+            key=f"{key_prefix}_file",
+        )
+        return models_root / identifier / f"{chosen_date.strftime('%Y-%m-%d')}_{chosen_time}" / chosen_name
 
     st.subheader("Phase 1  (encoder + decoder)")
-    p1_name = st.selectbox("Phase 1 checkpoint", rel_names, key="p1_sel")
-    p1_path = models_root.parent / p1_name
+    p1_path = _pick_checkpoint("Phase 1", "p1")
 
     st.subheader("Phase 2  (dynamics flow)")
-    p2_name = st.selectbox("Phase 2 checkpoint", rel_names, key="p2_sel")
-    p2_path = models_root.parent / p2_name
+    p2_path = _pick_checkpoint("Phase 2", "p2")
 
     st.divider()
     st.header("Episode")
