@@ -63,12 +63,13 @@ class FlexFrameCNN(nn.Module):
 
 
 class FlexLSTMEncoder(nn.Module):
-    """Bidirectional LSTM encoder: image sequence → (mu, logvar) flat vectors.
+    """Causal LSTM encoder: image sequence → (mu, logvar) flat vectors.
 
     (B, T, C, H, W) → (B, latent_dim), (B, latent_dim)
 
-    The LSTM hidden size matches feat_dim; the linear heads project from
-    2*feat_dim (concatenated forward+backward) to latent_dim.
+    Forward-only so that h_t at training matches h_t at inference. Actions are
+    excluded — momentum is recoverable from frame differences, and actions enter
+    the dynamics model separately via the control port.
     """
 
     def __init__(
@@ -77,56 +78,37 @@ class FlexLSTMEncoder(nn.Module):
         feat_dim: int = 256,
         latent_dim: int = 32,
         img_size: int = 64,
-        control_dim: int = 0,
     ):
         super().__init__()
         self.feat_dim = feat_dim
-        self.control_dim = control_dim
         self.frame_cnn = FlexFrameCNN(img_ch=img_ch, feat_dim=feat_dim, img_size=img_size)
         self.lstm = nn.LSTM(
-            input_size=feat_dim + control_dim,
+            input_size=feat_dim,
             hidden_size=feat_dim,
             num_layers=1,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=False,
         )
-        self.mu_head = nn.Linear(2 * feat_dim, latent_dim)
-        self.logvar_head = nn.Linear(2 * feat_dim, latent_dim)
+        self.mu_head = nn.Linear(feat_dim, latent_dim)
+        self.logvar_head = nn.Linear(feat_dim, latent_dim)
 
     def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = imgs.shape
         return self.frame_cnn(imgs.reshape(B * T, C, H, W)).reshape(B, T, -1)
 
-    def _prepend_action(self, feats: torch.Tensor, actions: torch.Tensor | None) -> torch.Tensor:
-        """Concatenate a_{t-1} to frame embedding at step t (zero-padded at t=0)."""
-        if self.control_dim == 0:
-            return feats
-        B, T = feats.shape[:2]
-        if actions is None:
-            act = torch.zeros(B, T, self.control_dim, device=feats.device, dtype=feats.dtype)
-        else:
-            if actions.dim() == 2:
-                actions = actions.unsqueeze(-1)  # (B, T_a, 1)
-            zeros = torch.zeros(B, 1, self.control_dim, device=feats.device, dtype=feats.dtype)
-            act = torch.cat([zeros, actions.to(device=feats.device, dtype=feats.dtype)], dim=1)[:, :T]  # (B, T, control_dim)
-        return torch.cat([feats, act], dim=-1)
-
     def forward(
-        self, imgs: torch.Tensor, actions: torch.Tensor | None = None, lengths: torch.Tensor | None = None
+        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode a sequence of frames to (mu, logvar).
 
         Args:
             imgs:    (B, T, C, H, W)
-            actions: (B, T-1) or (B, T-1, control_dim) — action a_{t-1} that led to frame t
             lengths: (B,) actual sequence lengths; if None the full T is used.
 
         Returns:
             mu, logvar: each (B, latent_dim)
         """
-        B = imgs.shape[0]
-        feats = self._embed_frames(imgs)       # (B, T, feat_dim)
-        feats = self._prepend_action(feats, actions)  # (B, T, feat_dim + control_dim)
+        feats = self._embed_frames(imgs)  # (B, T, feat_dim)
 
         if lengths is not None:
             packed = pack_padded_sequence(
@@ -136,29 +118,23 @@ class FlexLSTMEncoder(nn.Module):
         else:
             _, (h_n, _) = self.lstm(feats)
 
-        # h_n: (2, B, feat_dim) — forward and backward final hidden states
-        h = torch.cat([h_n[0], h_n[1]], dim=-1)  # (B, 2*feat_dim)
+        h = h_n[0]  # (B, feat_dim) — final forward hidden state
         return self.mu_head(h), self.logvar_head(h)
 
     def forward_all(
-        self, imgs: torch.Tensor, actions: torch.Tensor | None = None, lengths: torch.Tensor | None = None
+        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode each timestep → per-step (mu, logvar).
 
-        Runs the full LSTM and projects every output hidden state, giving
-        one latent distribution per frame rather than one per sequence.
-
         Args:
             imgs:    (B, T, C, H, W)
-            actions: (B, T-1) or (B, T-1, control_dim) — action a_{t-1} that led to frame t
             lengths: (B,) actual sequence lengths; if None, full T is used.
 
         Returns:
             mu_all, logvar_all: each (B, T, latent_dim)
         """
         B, T = imgs.shape[:2]
-        feats = self._embed_frames(imgs)              # (B, T, feat_dim)
-        feats = self._prepend_action(feats, actions)  # (B, T, feat_dim + control_dim)
+        feats = self._embed_frames(imgs)  # (B, T, feat_dim)
 
         if lengths is not None:
             packed = pack_padded_sequence(
@@ -169,7 +145,7 @@ class FlexLSTMEncoder(nn.Module):
         else:
             out, _ = self.lstm(feats)
 
-        # out: (B, T, 2*feat_dim) — all-timestep concatenated forward+backward hidden states
+        # out: (B, T, feat_dim) — per-timestep forward hidden states
         return self.mu_head(out), self.logvar_head(out)
 
 
@@ -568,7 +544,6 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
             feat_dim=feat_dim,
             latent_dim=latent_dim,
             img_size=img_size,
-            control_dim=control_dim,
         )
         self.f_psi = NormalizingFlow(latent_dim)
         self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
