@@ -515,6 +515,10 @@ def _log_dreamed_video_phase2(
               help="Expected h-space distance per timestep; pairs closer than scale*dt are penalised")
 @click.option("--ema-alpha", type=float, default=0.99, show_default=True,
               help="EMA smoothing for loss-gated curriculum")
+@click.option("--convergence-patience", type=int, default=0, show_default=True,
+              help="Epochs of stable EMA before stopping; 0 disables convergence stopping")
+@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True,
+              help="Relative per-epoch EMA change below which an epoch counts as stable")
 @click.option("--seq-len-start", type=int, default=5, show_default=True,
               help="Initial rollout length for curriculum")
 @click.option("--seq-len-advance-threshold", type=float, default=0.005, show_default=True,
@@ -614,6 +618,7 @@ def main(**kwargs):
         best_loss = float("inf")
         full_seq_len = episodes[0][1].shape[0]
         ema_loss = None
+        converge_streak = 0
 
         print("\n=== Phase 1: reconstruction training ===")
         for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 1"):
@@ -630,11 +635,25 @@ def main(**kwargs):
             )
 
             alpha = kwargs["ema_alpha"]
+            prev_ema = ema_loss
             ema_loss = (
                 metrics["phase1/loss"]
                 if ema_loss is None
                 else alpha * ema_loss + (1.0 - alpha) * metrics["phase1/loss"]
             )
+
+            if prev_ema is not None and kwargs["convergence_patience"] > 0:
+                rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
+                if rel_change < kwargs["convergence_threshold"]:
+                    converge_streak += 1
+                    if converge_streak >= kwargs["convergence_patience"]:
+                        tqdm.write(
+                            f"  Phase 1 converged at epoch {epoch + 1}"
+                            f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+                        )
+                        break
+                else:
+                    converge_streak = 0
 
             if (epoch + 1) % kwargs["log_every"] == 0:
                 for k, v in metrics.items():
@@ -780,6 +799,7 @@ def main(**kwargs):
         seq_len = kwargs["seq_len_start"]
         ema_loss = None
         best_loss = float("inf")
+        converge_streak = 0
 
         print("\n=== Phase 2: dynamics flow training ===")
         for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 2"):
@@ -794,11 +814,26 @@ def main(**kwargs):
             )
 
             alpha = kwargs["ema_alpha"]
+            prev_ema = ema_loss
             ema_loss = (
                 metrics["phase2/dynamics"]
                 if ema_loss is None
                 else alpha * ema_loss + (1.0 - alpha) * metrics["phase2/dynamics"]
             )
+
+            if prev_ema is not None and kwargs["convergence_patience"] > 0:
+                rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
+                if rel_change < kwargs["convergence_threshold"]:
+                    converge_streak += 1
+                    if converge_streak >= kwargs["convergence_patience"]:
+                        tqdm.write(
+                            f"  Phase 2 converged at epoch {epoch + 1}"
+                            f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+                        )
+                        break
+                else:
+                    converge_streak = 0
+
             if ema_loss < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
                 seq_len += 1
 
