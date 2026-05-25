@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from checkpoint_common import make_run_dir, save_checkpoint
+from checkpoint_common import save_checkpoint
 from data.cartpole import FrameBuffer, preprocess_frame
 from diag_common import ActivationMonitor
 from training.logging_mixin import LoggingMixin
@@ -585,8 +585,6 @@ class EMTrainer(LoggingMixin):
 	# ── Collection ────────────────────────────────────────────────────────────
 
 	def _collect_phase(self, use_mppi: bool, total_env_steps_ref) -> list[int]:
-		import gymnasium as gym
-		from replay_buffer import Episode
 
 		cfg = self.cfg
 		ep_lens = []

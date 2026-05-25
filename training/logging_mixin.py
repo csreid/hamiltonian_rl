@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 
 from diag_common import (
-	ActivationMonitor,
 	log_gradient_stats,
 	log_hamiltonian_grad_stats,
 	log_histograms,

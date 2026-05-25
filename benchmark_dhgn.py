@@ -55,7 +55,6 @@ from diag_common import (
 	log_latent_stats,
 	log_marker_video,
 	log_weight_norms,
-	render_frame,
 )
 
 

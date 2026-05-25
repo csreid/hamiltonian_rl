@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from checkpoint_common import make_run_dir, save_checkpoint
+from checkpoint_common import save_checkpoint
 from diag_common import ActivationMonitor, image_centroid
 from training.logging_mixin import LoggingMixin, increment_step
 from training.losses import LossConfig, LossResult, compute_standard_loss
@@ -35,6 +36,9 @@ class TrainerConfig:
 	train_rollout: int = 30
 	context_len: int = 31
 	loss: LossConfig = field(default_factory=LossConfig)
+	convergence_patience: int = 0
+	convergence_threshold: float = 1e-4
+	ema_alpha: float = 0.1
 
 	@classmethod
 	def from_kwargs(cls, kwargs: dict) -> "TrainerConfig":
@@ -45,6 +49,7 @@ class TrainerConfig:
 			coord_weight=kwargs.get("coord_weight", 0.0),
 			energy_weight=kwargs.get("energy_weight", 0.0),
 			state_weight=kwargs.get("state_weight", 0.0),
+			l1_weight=kwargs.get("l1_weight", 0.0),
 		)
 		return cls(
 			n_epochs=kwargs["n_epochs"],
@@ -57,6 +62,9 @@ class TrainerConfig:
 			train_rollout=kwargs.get("train_rollout", 30),
 			context_len=kwargs.get("n_frames", 31),
 			loss=loss,
+			convergence_patience=kwargs.get("convergence_patience", 0),
+			convergence_threshold=kwargs.get("convergence_threshold", 1e-4),
+			ema_alpha=kwargs.get("ema_alpha", 0.1),
 		)
 
 
@@ -104,9 +112,16 @@ class BaseTrainer(LoggingMixin):
 	# ── Main loop ─────────────────────────────────────────────────────────────
 
 	def fit(self) -> None:
-		for epoch in (
-			epoch_bar := tqdm(range(self.cfg.n_epochs), desc="Epochs")
-		):
+		use_convergence = self.cfg.convergence_patience > 0
+		epoch_source = itertools.count() if use_convergence else range(self.cfg.n_epochs)
+		ema_loss: float | None = None
+		converge_streak = 0
+
+		for epoch in (epoch_bar := tqdm(epoch_source, desc="Epochs")):
+			if epoch >= self.cfg.n_epochs:
+				tqdm.write(f"Reached max epochs ({self.cfg.n_epochs}) without convergence.")
+				break
+
 			self.model.train()
 			self._act_monitor = ActivationMonitor(self.model)
 			epoch_totals: dict[str, float] = {}
@@ -119,9 +134,30 @@ class BaseTrainer(LoggingMixin):
 					epoch_totals[k] = epoch_totals.get(k, 0.0) + v
 
 			n = len(self.train_loader)
-			epoch_bar.set_postfix(
-				loss=f"{epoch_totals.get('train/loss', 0.0) / n:.4f}"
-			)
+			epoch_loss = epoch_totals.get("train/loss", 0.0) / n
+
+			if use_convergence:
+				if ema_loss is None:
+					ema_loss = epoch_loss
+				else:
+					prev_ema = ema_loss
+					ema_loss = self.cfg.ema_alpha * epoch_loss + (1 - self.cfg.ema_alpha) * ema_loss
+					rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
+					self.writer.add_scalar("train/loss_ema", ema_loss, epoch)
+					if rel_change < self.cfg.convergence_threshold:
+						converge_streak += 1
+						if converge_streak >= self.cfg.convergence_patience:
+							tqdm.write(
+								f"Converged at epoch {epoch + 1}"
+								f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+							)
+							self.maybe_log_histograms(epoch)
+							break
+					else:
+						converge_streak = 0
+				epoch_bar.set_postfix(loss=f"{epoch_loss:.4f}", ema=f"{ema_loss:.4f}", streak=converge_streak)
+			else:
+				epoch_bar.set_postfix(loss=f"{epoch_loss:.4f}")
 
 			self.maybe_log_histograms(epoch)
 
@@ -245,6 +281,7 @@ class StandardTrainer(BaseTrainer):
 		with torch.no_grad():
 			gt_coords = image_centroid(target_frames)
 
+		hamiltonian = getattr(self.model, "hamiltonian", None)
 		result = compute_standard_loss(
 			pred_frames,
 			target_frames,
@@ -257,6 +294,7 @@ class StandardTrainer(BaseTrainer):
 			H_fn=self.model.H if need_states else None,
 			q0=q0,
 			p0=p0,
+			hamiltonian_params=list(hamiltonian.parameters()) if hamiltonian is not None else None,
 		)
 
 		self._backward_and_step(result.total)

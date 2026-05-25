@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 
 import gymnasium as gym
-import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 import torch

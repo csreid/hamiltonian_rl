@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ class LossConfig:
 	coord_weight: float = 0.0
 	energy_weight: float = 0.0
 	state_weight: float = 0.0
+	l1_weight: float = 0.0
 
 
 @dataclass
@@ -33,6 +34,7 @@ class LossResult:
 	coord: float = 0.0
 	energy: float = 0.0
 	state: float = 0.0
+	hamiltonian_l1: float = 0.0
 
 	def as_dict(self) -> dict[str, float]:
 		return {
@@ -42,6 +44,7 @@ class LossResult:
 			"train/coord_loss": self.coord,
 			"train/energy_loss": self.energy,
 			"train/state_loss": self.state,
+			"train/hamiltonian_l1": self.hamiltonian_l1,
 		}
 
 
@@ -57,6 +60,7 @@ def compute_standard_loss(
 	H_fn=None,
 	q0: torch.Tensor | None = None,
 	p0: torch.Tensor | None = None,
+	hamiltonian_params=None,
 ) -> LossResult:
 	"""Compute the composite reconstruction + KL + optional auxiliary loss.
 
@@ -70,6 +74,7 @@ def compute_standard_loss(
 	    qs, ps:       list of (B, ...) latent tensors per rollout step (optional)
 	    H_fn:         callable H_fn(q, p) -> (B,) for energy conservation loss
 	    q0, p0:       initial latent state for energy baseline (optional)
+	    hamiltonian_params: iterable of tensors (model.hamiltonian.parameters()) for L1 reg
 	"""
 	recon_loss = F.mse_loss(pred_frames, target_frames)
 	kl_loss = kl.clamp(min=cfg.free_bits).mean()
@@ -100,6 +105,12 @@ def compute_standard_loss(
 		total = total + cfg.energy_weight * energy_loss
 		energy_val = energy_loss.item()
 
+	l1_val = 0.0
+	if cfg.l1_weight > 0 and hamiltonian_params is not None:
+		l1_loss = sum(p.abs().sum() for p in hamiltonian_params)
+		total = total + cfg.l1_weight * l1_loss
+		l1_val = l1_loss.item()
+
 	return LossResult(
 		total=total,
 		recon=recon_loss.item(),
@@ -107,4 +118,5 @@ def compute_standard_loss(
 		coord=coord_val,
 		energy=energy_val,
 		state=state_val,
+		hamiltonian_l1=l1_val,
 	)

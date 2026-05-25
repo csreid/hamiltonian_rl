@@ -93,6 +93,8 @@ def _train_epoch_phase1(
     free_bits: float,
     grad_clip: float,
     device: torch.device,
+    temporal_reg_weight: float = 0.0,
+    temporal_scale: float = 0.01,
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
 
@@ -101,7 +103,7 @@ def _train_epoch_phase1(
       - h_t → next frame      (predictive signal; h_t has seen only 0..t)
     """
     model.train()
-    total_recon = total_recon_next = total_kl = total_loss = 0.0
+    total_recon = total_recon_next = total_kl = total_temporal = total_loss = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
@@ -139,6 +141,22 @@ def _train_epoch_phase1(
         kl = _kl(mu_all, logvar_all)
 
         loss = recon + recon_next + kl_weight * kl
+
+        # Temporal metric regulariser: random pairs should be at least
+        # temporal_scale * |t1 - t2| apart in h-space.  One-sided so we only
+        # penalise being too close, not too far.
+        if temporal_reg_weight > 0:
+            T_seq = mu_all.shape[1]
+            t1 = torch.randint(T_seq, (T_seq,), device=device)
+            t2 = torch.randint(T_seq, (T_seq,), device=device)
+            dt = (t1 - t2).abs().float()                   # (T_seq,)
+            h1 = mu_all[:, t1]                             # (B, T_seq, D)
+            h2 = mu_all[:, t2]                             # (B, T_seq, D)
+            dist = torch.norm(h1 - h2, dim=-1)             # (B, T_seq)
+            temporal_reg = F.relu(temporal_scale * dt - dist).mean()
+            loss = loss + temporal_reg_weight * temporal_reg
+            total_temporal += temporal_reg.item()
+
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
@@ -156,6 +174,7 @@ def _train_epoch_phase1(
         "phase1/recon": total_recon / n,
         "phase1/recon_next": total_recon_next / n,
         "phase1/kl": total_kl / n,
+        "phase1/temporal_reg": total_temporal / n,
     }
 
 
@@ -490,6 +509,10 @@ def _log_dreamed_video_phase2(
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 @click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
               help="Weight on log|det J_Phi|^2 regulariser (Phase 2 only); keeps flow near-volume-preserving")
+@click.option("--temporal-reg-weight", type=float, default=0.1, show_default=True,
+              help="Phase 1 temporal metric regulariser weight (0 to disable)")
+@click.option("--temporal-scale", type=float, default=0.01, show_default=True,
+              help="Expected h-space distance per timestep; pairs closer than scale*dt are penalised")
 @click.option("--ema-alpha", type=float, default=0.99, show_default=True,
               help="EMA smoothing for loss-gated curriculum")
 @click.option("--seq-len-start", type=int, default=5, show_default=True,
@@ -602,6 +625,8 @@ def main(**kwargs):
                 free_bits=kwargs["free_bits"],
                 grad_clip=kwargs["grad_clip"],
                 device=device,
+                temporal_reg_weight=kwargs["temporal_reg_weight"],
+                temporal_scale=kwargs["temporal_scale"],
             )
 
             alpha = kwargs["ema_alpha"]
@@ -622,6 +647,7 @@ def main(**kwargs):
                     f"  recon={metrics['phase1/recon']:.4f}"
                     f"  next={metrics['phase1/recon_next']:.4f}"
                     f"  kl={metrics['phase1/kl']:.4f}"
+                    f"  tc={metrics['phase1/temporal_reg']:.4f}"
                 )
 
             if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:

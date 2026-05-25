@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import click
-import torch
 import torchvision.transforms.functional as tvf
 from torch.utils.data import TensorDataset, DataLoader
 from data.base import DataLoaderAdapter
-from torch.utils.tensorboard import SummaryWriter
 
 from cli_common import shared_options
 from data.sho import generate_dataset
@@ -21,7 +18,7 @@ from diag_common import (
 )
 from experiments.base import Experiment, ExperimentConfig
 from hgn_lstm import HGN_LSTM
-from training.trainer import StandardTrainer, TrainerConfig
+from training.trainer import StandardTrainer
 
 
 def _log_correlation_plots(writer, pred_frames, q_gt, epoch):
@@ -175,6 +172,10 @@ class HGNLSTMExperiment(Experiment):
 @click.option("--feat-dim", type=int, default=256, show_default=True)
 @click.option("--coord-weight", type=float, default=0.0, show_default=True)
 @click.option("--energy-weight", type=float, default=0.0, show_default=True)
+@click.option("--l1-weight", type=float, default=0.0, show_default=True)
+@click.option("--convergence-patience", type=int, default=0, show_default=True, help="Epochs of EMA stability before stopping; 0 disables")
+@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True, help="Relative EMA change below which an epoch counts as stable")
+@click.option("--ema-alpha", type=float, default=0.1, show_default=True, help="EMA smoothing factor for loss convergence tracking")
 def main(**kwargs):
 	context_len = kwargs["n_frames"]
 	assert kwargs["img_size"] == 32, (

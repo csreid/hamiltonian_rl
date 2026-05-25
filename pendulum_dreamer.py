@@ -22,7 +22,7 @@ import numpy as np
 import streamlit as st
 import torch
 import yaml
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).parent))
 

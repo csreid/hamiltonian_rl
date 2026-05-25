@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -45,6 +44,10 @@ class ExperimentConfig:
 	coord_weight: float = 0.0
 	energy_weight: float = 0.0
 	state_weight: float = 0.0
+	l1_weight: float = 0.0
+	convergence_patience: int = 0
+	convergence_threshold: float = 1e-4
+	ema_alpha: float = 0.1
 	grad_clip: float = 1.0
 	log_every: int = 10
 	diag_every: int = 1

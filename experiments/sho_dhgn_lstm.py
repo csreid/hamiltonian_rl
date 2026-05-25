@@ -90,6 +90,10 @@ class DHGNLSTMExperiment(Experiment):
 @click.option("--damping", type=float, default=0.5, show_default=True)
 @click.option("--coord-weight", type=float, default=0.0, show_default=True)
 @click.option("--energy-weight", type=float, default=0.0, show_default=True)
+@click.option("--l1-weight", type=float, default=0.0, show_default=True)
+@click.option("--convergence-patience", type=int, default=0, show_default=True, help="Epochs of EMA stability before stopping; 0 disables")
+@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True, help="Relative EMA change below which an epoch counts as stable")
+@click.option("--ema-alpha", type=float, default=0.1, show_default=True, help="EMA smoothing factor for loss convergence tracking")
 def main(**kwargs):
 	assert kwargs["img_size"] == 32, (
 		"HGN decoder outputs 32x32; set --img-size 32"

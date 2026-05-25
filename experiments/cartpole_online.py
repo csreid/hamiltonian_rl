@@ -29,7 +29,6 @@ class CartPoleOnlineExperiment(Experiment):
 		)
 
 	def run(self, cfg: CartPoleEMConfig) -> None:
-		import torch
 
 		device, writer, run_dir = self._setup()
 
