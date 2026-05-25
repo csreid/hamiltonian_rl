@@ -312,6 +312,7 @@ def _train_epoch_phase2(
     device: torch.device,
     seq_len: int,
     logdet_weight: float,
+    l1_weight: float = 0.0,
 ) -> dict[str, float]:
     """Dynamics-only epoch: closed-loop seq-to-seq rollout from h_1.
 
@@ -327,7 +328,7 @@ def _train_epoch_phase2(
     near-volume-preserving.
     """
     dyn_model.train()
-    total_dynamics = total_logdet_reg = total_q_var = total_p_var = 0.0
+    total_dynamics = total_logdet_reg = total_q_var = total_p_var = total_hamiltonian_l1 = 0.0
 
     for h_all, actions in loader:
         h_all = h_all.to(device)      # (B, T+1, latent_dim)
@@ -349,6 +350,11 @@ def _train_epoch_phase2(
             qs_log.append(q.detach())
             ps_log.append(p.detach())
         loss = loss / T
+
+        if l1_weight > 0:
+            l1_loss = sum(p.abs().sum() for p in dyn_model.hamiltonian.parameters())
+            loss = loss + l1_weight * l1_loss
+            total_hamiltonian_l1 += l1_loss.item()
 
         optimizer.zero_grad()
         loss.backward()
@@ -373,6 +379,7 @@ def _train_epoch_phase2(
         "phase2/logdet_reg": total_logdet_reg / n,
         "phase2/q_var": total_q_var / n,
         "phase2/p_var": total_p_var / n,
+        "phase2/hamiltonian_l1": total_hamiltonian_l1 / n,
     }
 
 
@@ -509,6 +516,8 @@ def _log_dreamed_video_phase2(
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 @click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
               help="Weight on log|det J_Phi|^2 regulariser (Phase 2 only); keeps flow near-volume-preserving")
+@click.option("--l1-weight", type=float, default=0.0, show_default=True,
+              help="L1 penalty on Hamiltonian network weights (Phase 2 only); encourages simpler dynamics")
 @click.option("--temporal-reg-weight", type=float, default=0.1, show_default=True,
               help="Phase 1 temporal metric regulariser weight (0 to disable)")
 @click.option("--temporal-scale", type=float, default=0.01, show_default=True,
@@ -811,6 +820,7 @@ def main(**kwargs):
                 device=device,
                 seq_len=seq_len,
                 logdet_weight=kwargs["logdet_weight"],
+                l1_weight=kwargs["l1_weight"],
             )
 
             alpha = kwargs["ema_alpha"]
