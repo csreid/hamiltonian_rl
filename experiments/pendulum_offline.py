@@ -95,6 +95,7 @@ def _train_epoch_phase1(
     device: torch.device,
     temporal_reg_weight: float = 0.0,
     temporal_scale: float = 0.01,
+    max_context_len: int = 0,
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
 
@@ -108,6 +109,10 @@ def _train_epoch_phase1(
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
         B_size = frames.shape[0]
+        if max_context_len >= 2:
+            max_L = min(max_context_len, frames.shape[1])
+            L = int(torch.randint(2, max_L + 1, (1,)).item())
+            frames = frames[:, :L]
         T_full = frames.shape[1] - 1
         q_dim = model.latent_dim // 2
 
@@ -328,7 +333,7 @@ def _train_epoch_phase2(
     near-volume-preserving.
     """
     dyn_model.train()
-    total_dynamics = total_logdet_reg = total_q_var = total_p_var = total_hamiltonian_l1 = 0.0
+    total_dynamics = total_logdet_reg = total_q_var = total_p_var = total_hamiltonian_l1 = total_grad_H_norm = 0.0
 
     for h_all, actions in loader:
         h_all = h_all.to(device)      # (B, T+1, latent_dim)
@@ -365,6 +370,13 @@ def _train_epoch_phase2(
         with torch.no_grad():
             logdet_reg = dyn_model.phi.forward_with_logdet(h_all[:, 1])[1].pow(2).mean().item()
             total_logdet_reg += logdet_reg
+        with torch.enable_grad():
+            q_dim = dyn_model.latent_dim // 2
+            q_eval, p_eval = dyn_model.encode(h_all[:, 1].detach())
+            z_eval = torch.cat([q_eval, p_eval], dim=-1).requires_grad_(True)
+            H_eval = dyn_model.hamiltonian(z_eval[:, :q_dim], z_eval[:, q_dim:]).sum()
+            grad_eval = torch.autograd.grad(H_eval, z_eval)[0]
+            total_grad_H_norm += grad_eval.norm(dim=-1).mean().item()
         total_dynamics += loss.item()
         with torch.no_grad():
             q_var, p_var = _log_latent_variance(
@@ -380,6 +392,7 @@ def _train_epoch_phase2(
         "phase2/q_var": total_q_var / n,
         "phase2/p_var": total_p_var / n,
         "phase2/hamiltonian_l1": total_hamiltonian_l1 / n,
+        "phase2/grad_H_norm": total_grad_H_norm / n,
     }
 
 
@@ -518,6 +531,9 @@ def _log_dreamed_video_phase2(
               help="Weight on log|det J_Phi|^2 regulariser (Phase 2 only); keeps flow near-volume-preserving")
 @click.option("--l1-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on Hamiltonian network weights (Phase 2 only); encourages simpler dynamics")
+@click.option("--max-context-len", type=int, default=0, show_default=True,
+              help="Max frames fed to LSTM per Phase 1 batch step (0 = full sequence). "
+                   "Context length is sampled uniformly from [2, max-context-len] each step.")
 @click.option("--temporal-reg-weight", type=float, default=0.1, show_default=True,
               help="Phase 1 temporal metric regulariser weight (0 to disable)")
 @click.option("--temporal-scale", type=float, default=0.01, show_default=True,
@@ -641,6 +657,7 @@ def main(**kwargs):
                 device=device,
                 temporal_reg_weight=kwargs["temporal_reg_weight"],
                 temporal_scale=kwargs["temporal_scale"],
+                max_context_len=kwargs["max_context_len"],
             )
 
             alpha = kwargs["ema_alpha"]
