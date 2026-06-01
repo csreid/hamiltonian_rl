@@ -318,6 +318,7 @@ def _train_epoch_phase2(
     seq_len: int,
     logdet_weight: float,
     l1_weight: float = 0.0,
+    max_seed_k: int = 0,
 ) -> dict[str, float]:
     """Dynamics-only epoch: closed-loop seq-to-seq rollout from h_1.
 
@@ -339,19 +340,24 @@ def _train_epoch_phase2(
         h_all = h_all.to(device)      # (B, T+1, latent_dim)
         actions = actions.to(device)  # (B, T)
         T_full = actions.shape[1]
-        # Start from h_1; can predict h_2..h_{T_full}, using actions[1..T_full-1]
-        T = min(seq_len, T_full - 1)
 
-        # Encode h_1 once — no re-encoding inside the rollout
-        q, p, log_det = dyn_model.encode_with_logdet(h_all[:, 1])
+        # Sample a random start timestep so phi sees h values encoded from
+        # varying context lengths — matching what the encoder produces at inference.
+        # max_seed_k is independent of seq_len; T then adjusts to stay in bounds.
+        if max_seed_k >= 2:
+            k = int(torch.randint(1, min(max_seed_k, T_full - 1) + 1, (1,)).item())
+        else:
+            k = 1
+        T = min(seq_len, T_full - k)
+
+        q, p, log_det = dyn_model.encode_with_logdet(h_all[:, k])
         loss = logdet_weight * log_det.pow(2).mean()
         qs_log, ps_log = [q.detach()], [p.detach()]
 
         for t in range(T):
-            # action[t+1] is the control that drives h_{t+1} → h_{t+2}
-            q, p = dyn_model.controlled_step(q, p, actions[:, t + 1:t + 2])
+            q, p = dyn_model.controlled_step(q, p, actions[:, k + t:k + t + 1])
             h_pred = dyn_model.decode(q, p)
-            loss = loss + F.mse_loss(h_pred, h_all[:, t + 2])
+            loss = loss + F.mse_loss(h_pred, h_all[:, k + 1 + t])
             qs_log.append(q.detach())
             ps_log.append(p.detach())
         loss = loss / T
@@ -368,11 +374,11 @@ def _train_epoch_phase2(
         optimizer.step()
 
         with torch.no_grad():
-            logdet_reg = dyn_model.phi.forward_with_logdet(h_all[:, 1])[1].pow(2).mean().item()
+            logdet_reg = dyn_model.phi.forward_with_logdet(h_all[:, k])[1].pow(2).mean().item()
             total_logdet_reg += logdet_reg
         with torch.enable_grad():
             q_dim = dyn_model.latent_dim // 2
-            q_eval, p_eval = dyn_model.encode(h_all[:, 1].detach())
+            q_eval, p_eval = dyn_model.encode(h_all[:, k].detach())
             z_eval = torch.cat([q_eval, p_eval], dim=-1).requires_grad_(True)
             H_eval = dyn_model.hamiltonian(z_eval[:, :q_dim], z_eval[:, q_dim:]).sum()
             grad_eval = torch.autograd.grad(H_eval, z_eval)[0]
@@ -838,6 +844,7 @@ def main(**kwargs):
                 seq_len=seq_len,
                 logdet_weight=kwargs["logdet_weight"],
                 l1_weight=kwargs["l1_weight"],
+                max_seed_k=kwargs["max_context_len"],
             )
 
             alpha = kwargs["ema_alpha"]
@@ -887,16 +894,23 @@ def main(**kwargs):
 
             if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
                 _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
-                if phase1_model is not None and val_energy:
-                    _log_dreamed_video_phase2(
-                        phase1_model=phase1_model,
-                        dyn_model=dyn_model,
-                        val_traj=val_energy[0],
-                        device=device,
-                        writer=writer,
-                        epoch=epoch,
-                        seq_len=seq_len,
-                    )
+                if phase1_model is not None:
+                    for val_trajs, label in (
+                        (val_energy, "energy_pump"),
+                        (val_random, "random"),
+                        (val_spin, "spin"),
+                    ):
+                        if val_trajs:
+                            _log_dreamed_video_phase2(
+                                phase1_model=phase1_model,
+                                dyn_model=dyn_model,
+                                val_traj=val_trajs[0],
+                                device=device,
+                                writer=writer,
+                                epoch=epoch,
+                                seq_len=seq_len,
+                                tag=f"val/dreamed_phase2/{label}",
+                            )
 
             if (
                 kwargs["checkpoint_every"] > 0
