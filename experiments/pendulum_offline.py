@@ -319,51 +319,83 @@ def _train_epoch_phase2(
     logdet_weight: float,
     l1_weight: float = 0.0,
     max_seed_k: int = 0,
+    teacher_force_weight: float = 1.0,
 ) -> dict[str, float]:
-    """Dynamics-only epoch: closed-loop seq-to-seq rollout from h_1.
+    """Dynamics epoch: joint teacher-forced + closed-loop rollout.
 
-    Encodes h_1 (two frames seen by LSTM, carrying momentum info) to (q, p)
-    once, then rolls Hamiltonian dynamics forward for seq_len steps without
-    re-encoding, comparing phi^{-1}(q_k, p_k) against real h_{k+2}.
+    The full h sequence is encoded through phi in one batched call, sharing
+    that forward pass between both objectives.
 
-    Teacher-forcing (re-encoding at every step) was the old approach; it
-    trained only 1-step predictions from real h values, so phi^{-1} drifted
-    out of the h-manifold during open-loop inference.
+    Teacher-forced: for every consecutive pair (h_t, h_{t+1}), take one RK4
+    step from (q_t, p_t) and compare the decoded prediction to h_{t+1}.  All
+    T steps are independent so they are batched as (B*T, q_dim) — no Python
+    loop, no sequential graph depth.
 
-    A log-det regulariser on the single phi(h_1) call keeps the flow
-    near-volume-preserving.
+    Closed-loop: starting from (q_k, p_k) already computed above, roll
+    seq_len Hamiltonian steps without re-encoding and compare each decoded
+    prediction to the corresponding real h value.  Gradients from the
+    closed-loop loss flow back through phi at position k alongside those from
+    the teacher-forced objective.
+
+    Logdet regulariser is applied over all T+1 encoded timesteps rather than
+    a single seed point, so its strength stays constant as seq_len grows.
     """
     dyn_model.train()
-    total_dynamics = total_logdet_reg = total_q_var = total_p_var = total_hamiltonian_l1 = total_grad_H_norm = 0.0
+    total_dynamics = total_tf = total_cl = total_logdet_reg = 0.0
+    total_q_var = total_p_var = total_hamiltonian_l1 = total_grad_H_norm = 0.0
+    q_dim = dyn_model.latent_dim // 2
 
     for h_all, actions in loader:
         h_all = h_all.to(device)      # (B, T+1, latent_dim)
         actions = actions.to(device)  # (B, T)
-        T_full = actions.shape[1]
+        B_size, T_seq, D = h_all.shape
+        T_full = actions.shape[1]     # = T_seq - 1
 
-        # Sample a random start timestep so phi sees h values encoded from
-        # varying context lengths — matching what the encoder produces at inference.
-        # max_seed_k is independent of seq_len; T then adjusts to stay in bounds.
+        # --- Encode the full sequence through phi in one batched call ---
+        h_flat = h_all.reshape(B_size * T_seq, D)
+        s_flat, log_det_flat = dyn_model.phi.forward_with_logdet(h_flat)
+        q_all = s_flat[:, :q_dim].reshape(B_size, T_seq, q_dim)  # (B, T+1, q_dim)
+        p_all = s_flat[:, q_dim:].reshape(B_size, T_seq, q_dim)
+        log_det_all = log_det_flat.reshape(B_size, T_seq)         # (B, T+1)
+        logdet_metric = log_det_all.pow(2).mean().item()          # save before backward
+
+        logdet_reg = logdet_weight * log_det_all.pow(2).mean()
+
+        # --- Teacher-forced loss: one batched RK4 step at every t ---
+        # All T steps are independent — reshape to (B*T, q_dim) for one forward pass.
+        q_tf = q_all[:, :T_full].reshape(B_size * T_full, q_dim)
+        p_tf = p_all[:, :T_full].reshape(B_size * T_full, q_dim)
+        a_tf = actions.reshape(B_size * T_full, 1)
+        q_tf_next, p_tf_next = dyn_model.controlled_step(q_tf, p_tf, a_tf)
+        h_tf_pred = dyn_model.decode(q_tf_next, p_tf_next)
+        h_tf_target = h_all[:, 1:].reshape(B_size * T_full, D)
+        tf_loss = F.mse_loss(h_tf_pred, h_tf_target)
+
+        # --- Closed-loop rollout from seed k ---
+        # Seed (q_k, p_k) is taken from the already-encoded sequence so the
+        # phi forward pass is shared with the teacher-forced objective.
         if max_seed_k >= 2:
             k = int(torch.randint(1, min(max_seed_k, T_full - 1) + 1, (1,)).item())
         else:
             k = 1
         T = min(seq_len, T_full - k)
 
-        q, p, log_det = dyn_model.encode_with_logdet(h_all[:, k])
-        loss = logdet_weight * log_det.pow(2).mean()
-        qs_log, ps_log = [q.detach()], [p.detach()]
-
+        q, p = q_all[:, k], p_all[:, k]
+        q_k_log, p_k_log = q.detach(), p.detach()  # save before graph is freed
+        qs_log, ps_log = [q_k_log], [p_k_log]
+        cl_loss = torch.zeros((), device=device)
         for t in range(T):
             q, p = dyn_model.controlled_step(q, p, actions[:, k + t:k + t + 1])
             h_pred = dyn_model.decode(q, p)
-            loss = loss + F.mse_loss(h_pred, h_all[:, k + 1 + t])
+            cl_loss = cl_loss + F.mse_loss(h_pred, h_all[:, k + 1 + t])
             qs_log.append(q.detach())
             ps_log.append(p.detach())
-        loss = loss / T
+        cl_loss = cl_loss / T
+
+        loss = logdet_reg + teacher_force_weight * tf_loss + cl_loss
 
         if l1_weight > 0:
-            l1_loss = sum(p.abs().sum() for p in dyn_model.hamiltonian.parameters())
+            l1_loss = sum(param.abs().sum() for param in dyn_model.hamiltonian.parameters())
             loss = loss + l1_weight * l1_loss
             total_hamiltonian_l1 += l1_loss.item()
 
@@ -373,16 +405,16 @@ def _train_epoch_phase2(
             torch.nn.utils.clip_grad_norm_(dyn_model.parameters(), grad_clip)
         optimizer.step()
 
-        with torch.no_grad():
-            logdet_reg = dyn_model.phi.forward_with_logdet(h_all[:, k])[1].pow(2).mean().item()
-            total_logdet_reg += logdet_reg
+        # Gradient of H norm — use the saved seed point, no re-encoding needed
         with torch.enable_grad():
-            q_dim = dyn_model.latent_dim // 2
-            q_eval, p_eval = dyn_model.encode(h_all[:, k].detach())
-            z_eval = torch.cat([q_eval, p_eval], dim=-1).requires_grad_(True)
+            z_eval = torch.cat([q_k_log, p_k_log], dim=-1).requires_grad_(True)
             H_eval = dyn_model.hamiltonian(z_eval[:, :q_dim], z_eval[:, q_dim:]).sum()
             grad_eval = torch.autograd.grad(H_eval, z_eval)[0]
             total_grad_H_norm += grad_eval.norm(dim=-1).mean().item()
+
+        total_logdet_reg += logdet_metric
+        total_tf += tf_loss.item()
+        total_cl += cl_loss.item()
         total_dynamics += loss.item()
         with torch.no_grad():
             q_var, p_var = _log_latent_variance(
@@ -394,6 +426,8 @@ def _train_epoch_phase2(
     n = len(loader)
     return {
         "phase2/dynamics": total_dynamics / n,
+        "phase2/tf_loss": total_tf / n,
+        "phase2/cl_loss": total_cl / n,
         "phase2/logdet_reg": total_logdet_reg / n,
         "phase2/q_var": total_q_var / n,
         "phase2/p_var": total_p_var / n,
@@ -537,6 +571,8 @@ def _log_dreamed_video_phase2(
               help="Weight on log|det J_Phi|^2 regulariser (Phase 2 only); keeps flow near-volume-preserving")
 @click.option("--l1-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on Hamiltonian network weights (Phase 2 only); encourages simpler dynamics")
+@click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the teacher-forced 1-step loss (Phase 2 only); set 0 to disable")
 @click.option("--max-context-len", type=int, default=0, show_default=True,
               help="Max frames fed to LSTM per Phase 1 batch step (0 = full sequence). "
                    "Context length is sampled uniformly from [2, max-context-len] each step.")
@@ -830,6 +866,7 @@ def main(**kwargs):
         full_seq_len = cache[0][1].shape[0] - 1  # -1: start from h_1, predict up to h_{T}
         seq_len = kwargs["seq_len_start"]
         ema_loss = None
+        ema_cl = None   # separate EMA for closed-loop loss — used for seq_len curriculum
         best_loss = float("inf")
         converge_streak = 0
 
@@ -845,6 +882,7 @@ def main(**kwargs):
                 logdet_weight=kwargs["logdet_weight"],
                 l1_weight=kwargs["l1_weight"],
                 max_seed_k=kwargs["max_context_len"],
+                teacher_force_weight=kwargs["teacher_force_weight"],
             )
 
             alpha = kwargs["ema_alpha"]
@@ -853,6 +891,11 @@ def main(**kwargs):
                 metrics["phase2/dynamics"]
                 if ema_loss is None
                 else alpha * ema_loss + (1.0 - alpha) * metrics["phase2/dynamics"]
+            )
+            ema_cl = (
+                metrics["phase2/cl_loss"]
+                if ema_cl is None
+                else alpha * ema_cl + (1.0 - alpha) * metrics["phase2/cl_loss"]
             )
 
             if prev_ema is not None and kwargs["convergence_patience"] > 0:
@@ -868,7 +911,9 @@ def main(**kwargs):
                 else:
                     converge_streak = 0
 
-            if ema_loss < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
+            # Gate seq_len curriculum on cl_loss EMA so the teacher-forced
+            # component (which is always T_full steps) doesn't drown out the signal.
+            if ema_cl < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
                 seq_len += 1
 
             if (epoch + 1) % kwargs["log_every"] == 0:
@@ -876,6 +921,7 @@ def main(**kwargs):
                     writer.add_scalar(k, v, epoch)
                 writer.add_scalar("phase2/seq_len", seq_len, epoch)
                 writer.add_scalar("phase2/ema_loss", ema_loss, epoch)
+                writer.add_scalar("phase2/ema_cl", ema_cl, epoch)
                 if kwargs["learn_structure"]:
                     writer.add_scalar(
                         "phase2/structure/B_norm",
@@ -885,8 +931,10 @@ def main(**kwargs):
                 tqdm.write(
                     f"  epoch {epoch + 1:4d}"
                     f"  seq_len={seq_len:3d}"
-                    f"  dynamics={metrics['phase2/dynamics']:.4f}"
-                    f"  ema={ema_loss:.4f}"
+                    f"  loss={metrics['phase2/dynamics']:.4f}"
+                    f"  tf={metrics['phase2/tf_loss']:.4f}"
+                    f"  cl={metrics['phase2/cl_loss']:.4f}"
+                    f"  ema_cl={ema_cl:.4f}"
                     f"  logdet={metrics['phase2/logdet_reg']:.4f}"
                     f"  q_var={metrics['phase2/q_var']:.4f}"
                     f"  p_var={metrics['phase2/p_var']:.4f}"
