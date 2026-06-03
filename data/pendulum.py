@@ -127,41 +127,44 @@ def _collect_episodes(
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
 
-    for _ in tqdm(range(n_episodes), desc=desc):
-        kp = random.uniform(2.0, 15.0)
-        kd = random.uniform(0.5, 5.0)
+    try:
+        for _ in tqdm(range(n_episodes), desc=desc):
+            kp = random.uniform(2.0, 15.0)
+            kd = random.uniform(0.5, 5.0)
 
-        obs, _ = env.reset()
-        theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
-        frames = [torch.from_numpy(obs).float() / 255.0]
-        actions = []
-        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+            obs, _ = env.reset()
+            theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+            frames = [torch.from_numpy(obs).float() / 255.0]
+            actions = []
+            states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
-        for _ in range(max_steps):
-            theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
+            for _ in range(max_steps):
+                theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
 
-            if random.random() < epsilon:
-                action = float(np.random.uniform(-2.0, 2.0))
-            elif abs(theta) < _UPRIGHT_THRESHOLD:
-                action = _pd_action(theta, theta_dot, kp, kd)
-            else:
-                action = _energy_pumping_action(theta, theta_dot, energy_k)
+                if random.random() < epsilon:
+                    action = float(np.random.uniform(-2.0, 2.0))
+                elif abs(theta) < _UPRIGHT_THRESHOLD:
+                    action = _pd_action(theta, theta_dot, kp, kd)
+                else:
+                    action = _energy_pumping_action(theta, theta_dot, energy_k)
 
-            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
-            theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]  # post-damping
-            frames.append(torch.from_numpy(obs).float() / 255.0)
-            actions.append(action)
-            states.append(
-                np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32)
+                obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+                theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]  # post-damping
+                frames.append(torch.from_numpy(obs).float() / 255.0)
+                actions.append(action)
+                states.append(
+                    np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32)
+                )
+
+            episodes.append(
+                (
+                    torch.stack(frames),  # (T+1, 3, H, W)
+                    torch.tensor(actions, dtype=torch.float32),  # (T,)
+                    torch.from_numpy(np.stack(states)),  # (T+1, 3)
+                )
             )
-
-        episodes.append(
-            (
-                torch.stack(frames),  # (T+1, 3, H, W)
-                torch.tensor(actions, dtype=torch.float32),  # (T,)
-                torch.from_numpy(np.stack(states)),  # (T+1, 2)
-            )
-        )
+    finally:
+        env.close()
 
     return episodes
 
@@ -248,29 +251,32 @@ def _collect_spin_episodes(
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
 
-    for _ in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
-        obs, _ = env.reset()
-        theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
-        frames = [torch.from_numpy(obs).float() / 255.0]
-        actions = []
-        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
+    try:
+        for _ in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
+            obs, _ = env.reset()
+            theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+            frames = [torch.from_numpy(obs).float() / 255.0]
+            actions = []
+            states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
-        for _ in range(max_steps):
-            _, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
-            action = _spin_action(theta_dot)
-            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
-            theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
-            frames.append(torch.from_numpy(obs).float() / 255.0)
-            actions.append(action)
-            states.append(np.array([theta_next, theta_dot_next], dtype=np.float32))
+            for _ in range(max_steps):
+                theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
+                action = _spin_action(theta_dot)
+                obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+                theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
+                frames.append(torch.from_numpy(obs).float() / 255.0)
+                actions.append(action)
+                states.append(np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32))
 
-        episodes.append(
-            (
-                torch.stack(frames),
-                torch.tensor(actions, dtype=torch.float32),
-                torch.from_numpy(np.stack(states)),
+            episodes.append(
+                (
+                    torch.stack(frames),
+                    torch.tensor(actions, dtype=torch.float32),
+                    torch.from_numpy(np.stack(states)),  # (T+1, 3)
+                )
             )
-        )
+    finally:
+        env.close()
 
     return episodes
 

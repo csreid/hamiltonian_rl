@@ -1,32 +1,35 @@
 """Offline Pendulum world-model training — two-phase regimen.
 
-Phase 1 (--phase 1):
+Phase 1 (phase1 subcommand):
     Train the HGN autoencoder (encoder + f_psi + decoder) for reconstruction.
     Loss = MSE(decoder(f_psi(z)[:q_dim]), frame) + kl_weight * KL.
     After training, precomputes and saves h_t = encoder_mu(frame_t) for every
     frame of every training episode to h_cache.pt in the run directory.
 
-Phase 2 (--phase 2):
+Phase 2 (phase2 subcommand):
     Load precomputed h_t cache. Train a new HamiltonianFlowModel (Phi + H + J/R/B)
     that maps h_t → (q, p) such that Hamiltonian dynamics hold:
 
-        L = MSE(HamiltonianStep(Phi(h_t), u_t),  Phi(h_{t+1}).detach())
+        L_tf  = MSE(phi^{-1}(RK4(phi(h_t), u_t)),  h_{t+1})       [teacher-forced, all t]
+        L_cl  = MSE(phi^{-1}(RK4^k(phi(h_seed), u)), h_{seed+k})  [closed-loop, seq_len steps]
 
-    No images needed during training — very fast.
+    Architecture params (latent_dim, img_size, etc.) are loaded automatically
+    from the Phase 1 checkpoint YAML — no need to re-specify them.
 
 Inference (dreaming) after both phases:
-    h_0  = encoder(frame_0)
-    q, p = Phi(h_0)                                  [Phase 2 forward]
-    q_k, p_k = HamiltonianRollout(q, p, actions)     [Phase 2 dynamics]
-    h_k  = Phi^{-1}(q_k, p_k)                       [Phase 2 inverse]
-    q_dec= f_psi(h_k)[:q_dim]                        [Phase 1 f_psi]
-    frame= decoder(q_dec)                            [Phase 1 decoder]
+    h_0  = encoder(frame_0..frame_{ctx-1})              [Phase 1 encoder]
+    q, p = Phi(h_{ctx-1})                               [Phase 2 forward]
+    q_k, p_k = HamiltonianRollout(q, p, actions)        [Phase 2 dynamics]
+    h_k  = Phi^{-1}(q_k, p_k)                          [Phase 2 inverse]
+    q_dec= f_psi(h_k)[:q_dim]                           [Phase 1 f_psi]
+    frame= decoder(q_dec)                               [Phase 1 decoder]
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -35,6 +38,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
@@ -47,7 +51,6 @@ from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
-    _G,
 )
 from phgn_lstm import ControlledDHGN_LSTM, HamiltonianFlowModel
 
@@ -65,12 +68,6 @@ def _log_latent_variance(
     q_var = qs.detach().reshape(-1, q_dim).var(dim=0).mean().item()
     p_var = ps.detach().reshape(-1, q_dim).var(dim=0).mean().item()
     return q_var, p_var
-
-
-def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
-    cos_theta = states[:, 0].numpy()
-    theta_dot = states[:, 2].numpy()
-    return 0.5 * theta_dot**2 + _G * (1.0 + cos_theta)
 
 
 def _annotate_frame(frame: torch.Tensor, text: str) -> torch.Tensor:
@@ -457,11 +454,6 @@ def _log_structural_matrices_phase2(
         plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Phase 2 dreaming video
-# ---------------------------------------------------------------------------
-
-
 @torch.no_grad()
 def _log_dreamed_video_phase2(
     phase1_model: ControlledDHGN_LSTM,
@@ -471,12 +463,13 @@ def _log_dreamed_video_phase2(
     writer: SummaryWriter,
     epoch: int,
     seq_len: int,
+    context_frames: int = 5,
     tag: str = "val/dreamed_phase2",
     fps: int = 10,
 ) -> None:
     """Log a dreamed rollout alongside ground truth.
 
-    Context: 5 frames fed through the Phase 1 bidirectional LSTM encoder → h.
+    Context: context_frames frames fed through the Phase 1 LSTM encoder → h.
     Rollout: seq_len Hamiltonian steps in phase space, decoded back to pixels
              via phi^{-1} → f_psi → decoder.
     """
@@ -484,13 +477,11 @@ def _log_dreamed_video_phase2(
     dyn_model.eval()
     frames, actions, _ = val_traj
     q_dim = phase1_model.latent_dim // 2
-    context_frames = 5
 
-    # Seed: encode context frames with Phase 1 bidirectional LSTM
-    ctx = frames[:context_frames].unsqueeze(0).to(device)                  # (1, context_frames, C, H, W)
-    ctx_actions = actions[:context_frames - 1].unsqueeze(0).to(device)     # (1, context_frames-1)
-    mu_ctx, _ = phase1_model.encoder.forward_all(ctx)                       # (1, context_frames, latent_dim)
-    h = mu_ctx[:, -1]                                                       # (1, latent_dim)
+    # Seed: encode context frames with Phase 1 LSTM encoder
+    ctx = frames[:context_frames].unsqueeze(0).to(device)   # (1, context_frames, C, H, W)
+    mu_ctx, _ = phase1_model.encoder.forward_all(ctx)        # (1, context_frames, latent_dim)
+    h = mu_ctx[:, -1]                                        # (1, latent_dim)
 
     # Map to phase space via Phase 2 phi
     q, p = dyn_model.encode(h)  # (1, q_dim) each
@@ -523,21 +514,49 @@ def _log_dreamed_video_phase2(
 
 
 # ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_phase1_hparams(run_dir: Path) -> dict:
+    """Load hparams from Phase 1 YAML (tries best.yaml, falls back to final.yaml)."""
+    for stem in ("best", "final"):
+        p = run_dir / f"{stem}.yaml"
+        if p.exists():
+            return yaml.safe_load(p.read_text())["hparams"]
+    raise click.UsageError(
+        f"No checkpoint YAML found in {run_dir}. "
+        "Expected best.yaml or final.yaml from a completed Phase 1 run."
+    )
+
+
+def _make_phase1_model(hp: dict, device: torch.device) -> ControlledDHGN_LSTM:
+    return ControlledDHGN_LSTM(
+        pos_ch=hp["pos_ch"],
+        img_ch=3,
+        dt=hp["dt"],
+        feat_dim=hp["feat_dim"],
+        latent_dim=hp["latent_dim"],
+        img_size=hp["img_size"],
+        control_dim=1,
+        separable=hp["separable"],
+        learn_structure=hp["learn_structure"],
+        damping=hp["damping"],
+    ).to(device)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
-@click.command()
-# phase control
-@click.option("--phase", type=click.Choice(["1", "2"]), default="1", show_default=True,
-              help="Training phase: 1=autoencoder, 2=dynamics flow")
-@click.option("--phase1-run", type=str, default=None,
-              help="Path to a Phase 1 run directory (e.g. models/pendulum_offline_phase1/2026-05-11_10-00-00); "
-                   "loads best.pt as the checkpoint and h_cache.pt from the same directory")
-@click.option("--phase1-checkpoint", type=str, default=None,
-              help="Path to Phase 1 .pt checkpoint; overrides --phase1-run if both given")
-@click.option("--h-cache", type=str, default=None,
-              help="Path to precomputed h_t cache .pt; overrides --phase1-run if both given")
+@click.group()
+def cli():
+    """Offline Pendulum world-model training (two phases)."""
+    pass
+
+
+@cli.command("phase1")
 # data
 @click.option("--n-episodes", type=int, default=200, show_default=True)
 @click.option("--img-size", type=int, default=64, show_default=True)
@@ -549,47 +568,32 @@ def _log_dreamed_video_phase2(
               help="Number of steps per episode")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
-# model
+# model architecture
 @click.option("--pos-ch", type=int, default=8, show_default=True)
 @click.option("--feat-dim", type=int, default=256, show_default=True)
-@click.option("--latent-dim", type=int, default=32, show_default=True,
-              help="Encoder output / phase-space dimension (must match Phase 1 when running Phase 2)")
+@click.option("--latent-dim", type=int, default=32, show_default=True)
 @click.option("--dt", type=float, default=0.05, show_default=True)
 @click.option("--no-separable", "separable", default=True, flag_value=False)
 @click.option("--learn-structure/--no-learn-structure", default=True, show_default=True,
               help="Learn J/R/B matrices; --no-learn-structure fixes J to canonical symplectic, R=0, B=1")
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
-@click.option("--batch-size", type=int, default=8, show_default=True,
-              help="Episodes per batch")
+@click.option("--batch-size", type=int, default=8, show_default=True)
 @click.option("--lr", type=float, default=1e-4, show_default=True)
-@click.option("--structural-lr", type=float, default=1e-2, show_default=True)
 @click.option("--kl-weight", type=float, default=1e-3, show_default=True)
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
-@click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
-              help="Weight on log|det J_Phi|^2 regulariser (Phase 2 only); keeps flow near-volume-preserving")
-@click.option("--l1-weight", type=float, default=0.0, show_default=True,
-              help="L1 penalty on Hamiltonian network weights (Phase 2 only); encourages simpler dynamics")
-@click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
-              help="Weight on the teacher-forced 1-step loss (Phase 2 only); set 0 to disable")
 @click.option("--max-context-len", type=int, default=0, show_default=True,
-              help="Max frames fed to LSTM per Phase 1 batch step (0 = full sequence). "
-                   "Context length is sampled uniformly from [2, max-context-len] each step.")
+              help="Max frames fed to LSTM per batch step (0 = full sequence). "
+                   "Sampled uniformly from [2, max-context-len] each step.")
 @click.option("--temporal-reg-weight", type=float, default=0.1, show_default=True,
-              help="Phase 1 temporal metric regulariser weight (0 to disable)")
+              help="Temporal metric regulariser weight (0 to disable)")
 @click.option("--temporal-scale", type=float, default=0.01, show_default=True,
-              help="Expected h-space distance per timestep; pairs closer than scale*dt are penalised")
-@click.option("--ema-alpha", type=float, default=0.99, show_default=True,
-              help="EMA smoothing for loss-gated curriculum")
+              help="Expected h-space distance per timestep")
+@click.option("--ema-alpha", type=float, default=0.99, show_default=True)
 @click.option("--convergence-patience", type=int, default=0, show_default=True,
-              help="Epochs of stable EMA before stopping; 0 disables convergence stopping")
-@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True,
-              help="Relative per-epoch EMA change below which an epoch counts as stable")
-@click.option("--seq-len-start", type=int, default=5, show_default=True,
-              help="Initial rollout length for curriculum")
-@click.option("--seq-len-advance-threshold", type=float, default=0.005, show_default=True,
-              help="EMA loss below which rollout length advances by 1")
+              help="Epochs of stable EMA before stopping; 0 disables")
+@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True)
 # logging
 @click.option("--log-every", type=int, default=5, show_default=True)
 @click.option("--val-every", type=int, default=10, show_default=True,
@@ -599,23 +603,15 @@ def _log_dreamed_video_phase2(
 @click.option("--val-max-steps", type=int, default=0, show_default=True,
               help="Steps per val episode (0 = 2x --max-steps)")
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
-def main(**kwargs):
+def phase1_cmd(**kwargs):
+    """Phase 1: train HGN autoencoder (encoder + f_psi + decoder)."""
     assert kwargs["img_size"] % 8 == 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    phase = kwargs["phase"]
 
-    if kwargs.get("phase1_run") and phase == "2":
-        from pathlib import Path as _Path
-        _run = _Path(kwargs["phase1_run"])
-        if kwargs.get("phase1_checkpoint") is None:
-            kwargs["phase1_checkpoint"] = str(_run / "best.pt")
-        if kwargs.get("h_cache") is None:
-            kwargs["h_cache"] = str(_run / "h_cache.pt")
-
-    writer = SummaryWriter(comment=f"_pendulum_offline_phase{phase}")
-    run_dir = make_run_dir(f"pendulum_offline_phase{phase}")
+    writer = SummaryWriter(comment="_pendulum_offline_phase1")
+    run_dir = make_run_dir("pendulum_offline_phase1")
 
     n_val_episodes = kwargs["n_val_episodes"]
     if n_val_episodes < 0:
@@ -649,326 +645,405 @@ def main(**kwargs):
             max_steps=val_steps, damping=kwargs["damping"],
         )
 
-    # ── Phase 1 ───────────────────────────────────────────────────────────────
-    if phase == "1":
-        dataset = PendulumDataset(episodes)
-        loader = DataLoader(
-            dataset, batch_size=kwargs["batch_size"], shuffle=True,
-            num_workers=0, pin_memory=device.type == "cuda",
+    dataset = PendulumDataset(episodes)
+    loader = DataLoader(
+        dataset, batch_size=kwargs["batch_size"], shuffle=True,
+        num_workers=0, pin_memory=device.type == "cuda",
+    )
+    print(f"Dataset: {len(dataset)} episodes")
+
+    model = ControlledDHGN_LSTM(
+        pos_ch=kwargs["pos_ch"],
+        img_ch=3,
+        dt=kwargs["dt"],
+        feat_dim=kwargs["feat_dim"],
+        latent_dim=kwargs["latent_dim"],
+        img_size=kwargs["img_size"],
+        control_dim=1,
+        separable=kwargs["separable"],
+        learn_structure=kwargs["learn_structure"],
+        damping=kwargs["damping"],
+    ).to(device)
+    print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Only train reconstruction components — Hamiltonian/structure unused in Phase 1
+    optimizer = torch.optim.Adam(
+        list(model.encoder.parameters())
+        + list(model.f_psi.parameters())
+        + list(model.decoder.parameters())
+        + list(model.next_frame_decoder.parameters()),
+        lr=kwargs["lr"],
+    )
+
+    hparams = {k: v for k, v in kwargs.items()}
+    best_loss = float("inf")
+    ema_loss = None
+    converge_streak = 0
+
+    print("\n=== Phase 1: reconstruction training ===")
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 1"):
+        metrics = _train_epoch_phase1(
+            model=model,
+            loader=loader,
+            optimizer=optimizer,
+            kl_weight=kwargs["kl_weight"],
+            free_bits=kwargs["free_bits"],
+            grad_clip=kwargs["grad_clip"],
+            device=device,
+            temporal_reg_weight=kwargs["temporal_reg_weight"],
+            temporal_scale=kwargs["temporal_scale"],
+            max_context_len=kwargs["max_context_len"],
         )
-        print(f"Dataset: {len(dataset)} episodes")
 
-        model = ControlledDHGN_LSTM(
-            pos_ch=kwargs["pos_ch"],
-            img_ch=3,
-            dt=kwargs["dt"],
-            feat_dim=kwargs["feat_dim"],
-            latent_dim=kwargs["latent_dim"],
-            img_size=kwargs["img_size"],
-            control_dim=1,
-            separable=kwargs["separable"],
-            learn_structure=kwargs["learn_structure"],
-            damping=kwargs["damping"],
-        ).to(device)
-        print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-        # Optimize only the reconstruction components — Hamiltonian/structure unused in Phase 1
-        optimizer = torch.optim.Adam(
-            list(model.encoder.parameters())
-            + list(model.f_psi.parameters())
-            + list(model.decoder.parameters())
-            + list(model.next_frame_decoder.parameters()),
-            lr=kwargs["lr"],
+        alpha = kwargs["ema_alpha"]
+        prev_ema = ema_loss
+        ema_loss = (
+            metrics["phase1/loss"]
+            if ema_loss is None
+            else alpha * ema_loss + (1.0 - alpha) * metrics["phase1/loss"]
         )
 
-        hparams = {k: v for k, v in kwargs.items()}
-        best_loss = float("inf")
-        full_seq_len = episodes[0][1].shape[0]
-        ema_loss = None
-        converge_streak = 0
+        if prev_ema is not None and kwargs["convergence_patience"] > 0:
+            rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
+            if rel_change < kwargs["convergence_threshold"]:
+                converge_streak += 1
+                if converge_streak >= kwargs["convergence_patience"]:
+                    tqdm.write(
+                        f"  Phase 1 converged at epoch {epoch + 1}"
+                        f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+                    )
+                    break
+            else:
+                converge_streak = 0
 
-        print("\n=== Phase 1: reconstruction training ===")
-        for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 1"):
-            metrics = _train_epoch_phase1(
-                model=model,
-                loader=loader,
-                optimizer=optimizer,
-                kl_weight=kwargs["kl_weight"],
-                free_bits=kwargs["free_bits"],
-                grad_clip=kwargs["grad_clip"],
-                device=device,
-                temporal_reg_weight=kwargs["temporal_reg_weight"],
-                temporal_scale=kwargs["temporal_scale"],
-                max_context_len=kwargs["max_context_len"],
+        if (epoch + 1) % kwargs["log_every"] == 0:
+            for k, v in metrics.items():
+                writer.add_scalar(k, v, epoch)
+            writer.add_scalar("phase1/ema_loss", ema_loss, epoch)
+            tqdm.write(
+                f"  epoch {epoch + 1:4d}"
+                f"  loss={metrics['phase1/loss']:.4f}"
+                f"  ema={ema_loss:.4f}"
+                f"  recon={metrics['phase1/recon']:.4f}"
+                f"  next={metrics['phase1/recon_next']:.4f}"
+                f"  kl={metrics['phase1/kl']:.4f}"
+                f"  tc={metrics['phase1/temporal_reg']:.4f}"
             )
 
-            alpha = kwargs["ema_alpha"]
-            prev_ema = ema_loss
-            ema_loss = (
-                metrics["phase1/loss"]
-                if ema_loss is None
-                else alpha * ema_loss + (1.0 - alpha) * metrics["phase1/loss"]
-            )
-
-            if prev_ema is not None and kwargs["convergence_patience"] > 0:
-                rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
-                if rel_change < kwargs["convergence_threshold"]:
-                    converge_streak += 1
-                    if converge_streak >= kwargs["convergence_patience"]:
-                        tqdm.write(
-                            f"  Phase 1 converged at epoch {epoch + 1}"
-                            f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
-                        )
-                        break
-                else:
-                    converge_streak = 0
-
-            if (epoch + 1) % kwargs["log_every"] == 0:
-                for k, v in metrics.items():
-                    writer.add_scalar(k, v, epoch)
-                writer.add_scalar("phase1/ema_loss", ema_loss, epoch)
-                tqdm.write(
-                    f"  epoch {epoch + 1:4d}"
-                    f"  loss={metrics['phase1/loss']:.4f}"
-                    f"  ema={ema_loss:.4f}"
-                    f"  recon={metrics['phase1/recon']:.4f}"
-                    f"  next={metrics['phase1/recon_next']:.4f}"
-                    f"  kl={metrics['phase1/kl']:.4f}"
-                    f"  tc={metrics['phase1/temporal_reg']:.4f}"
+        if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
+            for val_trajs, label in (
+                (val_energy, "energy_pump"),
+                (val_random, "random"),
+                (val_spin, "spin"),
+            ):
+                if not val_trajs:
+                    continue
+                val_metrics = _eval_loss_phase1(model, val_trajs, device)
+                for k, v in val_metrics.items():
+                    writer.add_scalar(f"{k}/{label}", v, epoch)
+                _log_reconstruction_lstm_video(
+                    model=model, val_traj=val_trajs[0],
+                    device=device, writer=writer, epoch=epoch,
+                    tag=f"val/reconstruction_lstm/{label}",
                 )
+            if val_energy:
+                _log_latent_scatter_phase1(
+                    model=model, val_trajs=val_energy,
+                    device=device, writer=writer, epoch=epoch,
+                )
+            _log_reconstruction_lstm_video(
+                model=model, val_traj=episodes[0],
+                device=device, writer=writer, epoch=epoch,
+                tag="train/reconstruction_lstm",
+            )
 
-            if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
+        if (
+            kwargs["checkpoint_every"] > 0
+            and (epoch + 1) % kwargs["checkpoint_every"] == 0
+            and metrics["phase1/loss"] < best_loss
+        ):
+            save_checkpoint(run_dir, epoch, model, hparams, metrics, stem="best")
+            best_loss = metrics["phase1/loss"]
+
+    # Always save final checkpoint
+    save_checkpoint(run_dir, epoch, model, hparams, metrics, stem="final")
+
+    # Precompute and save h_t cache
+    print(f"\nPrecomputing h_t cache for {len(episodes)} episodes...")
+    cache = precompute_latents(model, episodes, device)
+    h_cache_path = run_dir / "h_cache.pt"
+    torch.save(cache, h_cache_path)
+    print(f"Saved h_cache to {h_cache_path}")
+    print(f"\nTo run Phase 2:\n  uv run python experiments/pendulum_offline.py phase2 --phase1-run {run_dir}")
+
+    writer.close()
+    print("\nDone. Run: tensorboard --logdir runs")
+    os._exit(0)
+
+
+@cli.command("phase2")
+# input — architecture + data params are loaded from the Phase 1 YAML
+@click.option("--phase1-run", type=str, required=True,
+              help="Path to a Phase 1 run directory; loads best.yaml for arch/data params, "
+                   "best.pt for the model, and h_cache.pt for latents")
+@click.option("--phase1-checkpoint", type=str, default=None,
+              help="Override the Phase 1 model checkpoint (default: {phase1-run}/best.pt)")
+@click.option("--h-cache", type=str, default=None,
+              help="Override the h_t cache path (default: {phase1-run}/h_cache.pt)")
+# training
+@click.option("--epochs", type=int, default=3000, show_default=True)
+@click.option("--batch-size", type=int, default=8, show_default=True)
+@click.option("--lr", type=float, default=1e-4, show_default=True)
+@click.option("--structural-lr", type=float, default=1e-2, show_default=True,
+              help="Learning rate for J/R/B structure matrices")
+@click.option("--grad-clip", type=float, default=1.0, show_default=True)
+@click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
+              help="Weight on log|det J_Phi|^2 regulariser; keeps flow near-volume-preserving")
+@click.option("--l1-weight", type=float, default=0.0, show_default=True,
+              help="L1 penalty on Hamiltonian network weights; encourages simpler dynamics")
+@click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
+              help="Weight on teacher-forced 1-step loss (set 0 to disable)")
+@click.option("--max-seed-k", type=int, default=0, show_default=True,
+              help="Max closed-loop seed timestep (0 = always start from h_1); "
+                   "randomises seed in [1, max-seed-k] to match varying encoder context lengths")
+@click.option("--seq-len-start", type=int, default=5, show_default=True,
+              help="Initial closed-loop rollout length for curriculum")
+@click.option("--seq-len-advance-threshold", type=float, default=0.005, show_default=True,
+              help="Closed-loop EMA loss below which rollout length advances by 1")
+@click.option("--ema-alpha", type=float, default=0.99, show_default=True)
+@click.option("--convergence-patience", type=int, default=0, show_default=True,
+              help="Epochs of stable EMA before stopping; 0 disables")
+@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True)
+# logging
+@click.option("--log-every", type=int, default=5, show_default=True)
+@click.option("--val-every", type=int, default=10, show_default=True,
+              help="Epochs between dreaming video logs (0 to disable; requires Phase 1 model)")
+@click.option("--n-val-episodes", type=int, default=-1, show_default=True,
+              help="Val episodes per type (-1 = phase1 n_episodes // 2)")
+@click.option("--val-max-steps", type=int, default=0, show_default=True,
+              help="Steps per val episode (0 = 2x phase1 max_steps)")
+@click.option("--val-context-frames", type=int, default=5, show_default=True,
+              help="Context frames fed to encoder before dreaming rollout")
+@click.option("--checkpoint-every", type=int, default=10, show_default=True)
+def phase2_cmd(**kwargs):
+    """Phase 2: train Hamiltonian flow dynamics on precomputed latents."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    run1 = Path(kwargs["phase1_run"])
+    hp1 = _load_phase1_hparams(run1)
+    print("Loaded Phase 1 hparams: " + ", ".join(
+        f"{k}={hp1[k]}" for k in
+        ("latent_dim", "img_size", "feat_dim", "pos_ch", "dt", "separable", "learn_structure", "damping")
+    ))
+
+    phase1_ckpt = kwargs["phase1_checkpoint"] or str(run1 / "best.pt")
+    h_cache_path = kwargs["h_cache"] or str(run1 / "h_cache.pt")
+
+    writer = SummaryWriter(comment="_pendulum_offline_phase2")
+    run_dir = make_run_dir("pendulum_offline_phase2")
+
+    # Load Phase 1 model (kept alive for dreaming video logs)
+    phase1_model = None
+    if Path(phase1_ckpt).exists():
+        print(f"Loading Phase 1 model from {phase1_ckpt}...")
+        phase1_model = _make_phase1_model(hp1, device)
+        phase1_model.load_state_dict(
+            torch.load(phase1_ckpt, map_location=device, weights_only=True)
+        )
+        phase1_model.eval()
+    else:
+        print(f"Warning: {phase1_ckpt} not found — dreaming video logs will be skipped.")
+
+    # Load h_cache
+    if Path(h_cache_path).exists():
+        print(f"Loading h_cache from {h_cache_path}...")
+        cache = torch.load(h_cache_path, weights_only=False)
+    elif phase1_model is not None:
+        raise click.UsageError(
+            f"h_cache not found at {h_cache_path}. "
+            "Re-run Phase 1 to regenerate it, or pass --h-cache explicitly."
+        )
+    else:
+        raise click.UsageError(
+            "--phase1-run must point to a directory containing h_cache.pt and best.pt."
+        )
+
+    # Collect val episodes (only if dreaming logs are enabled and Phase 1 model is available)
+    val_energy, val_random, val_spin = [], [], []
+    if kwargs["val_every"] > 0 and phase1_model is not None:
+        n_val = kwargs["n_val_episodes"]
+        if n_val < 0:
+            n_val = hp1.get("n_episodes", 200) // 2
+        val_steps = kwargs["val_max_steps"] or hp1.get("max_steps", 200) * 2
+        print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
+        val_energy = collect_val_trajectories(
+            n_episodes=n_val, img_size=hp1["img_size"],
+            max_steps=val_steps, energy_k=hp1.get("energy_k", 1.0),
+            damping=hp1.get("damping", 0.0),
+        )
+        val_random = collect_random_trajectories(
+            n_episodes=n_val, img_size=hp1["img_size"],
+            max_steps=val_steps, damping=hp1.get("damping", 0.0),
+        )
+        val_spin = collect_spin_trajectories(
+            n_episodes=n_val, img_size=hp1["img_size"],
+            max_steps=val_steps, damping=hp1.get("damping", 0.0),
+        )
+
+    # Infer latent_dim from cache (authoritative; overrides any stale default)
+    latent_dim = cache[0][0].shape[-1]
+    print(f"Latent dim from cache: {latent_dim}")
+
+    latent_dataset = LatentDataset(cache)
+    latent_loader = DataLoader(
+        latent_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
+    )
+    print(f"Latent dataset: {len(latent_dataset)} episodes")
+
+    dyn_model = HamiltonianFlowModel(
+        latent_dim=latent_dim,
+        control_dim=1,
+        separable=hp1["separable"],
+        learn_structure=hp1["learn_structure"],
+        dt=hp1["dt"],
+        damping=hp1["damping"],
+    ).to(device)
+    print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
+
+    if hp1["learn_structure"]:
+        optimizer = torch.optim.Adam([
+            {
+                "params": (
+                    list(dyn_model.phi.parameters())
+                    + list(dyn_model.hamiltonian.parameters())
+                ),
+                "lr": kwargs["lr"],
+            },
+            {
+                "params": [dyn_model.A, dyn_model.L_param, dyn_model.B],
+                "lr": kwargs["structural_lr"],
+            },
+        ])
+    else:
+        optimizer = torch.optim.Adam(dyn_model.parameters(), lr=kwargs["lr"])
+
+    # Store both phase2 CLI kwargs and the phase1 arch params that govern the run
+    hparams = {
+        **kwargs,
+        "phase1_hparams": {k: hp1[k] for k in (
+            "latent_dim", "pos_ch", "feat_dim", "img_size", "dt",
+            "separable", "learn_structure", "damping",
+        )},
+    }
+
+    full_seq_len = cache[0][1].shape[0] - 1  # max steps starting from h_1
+    seq_len = kwargs["seq_len_start"]
+    ema_loss = None
+    ema_cl = None   # separate EMA for closed-loop loss — gates seq_len curriculum
+    best_loss = float("inf")
+    converge_streak = 0
+
+    print("\n=== Phase 2: dynamics flow training ===")
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 2"):
+        metrics = _train_epoch_phase2(
+            dyn_model=dyn_model,
+            loader=latent_loader,
+            optimizer=optimizer,
+            grad_clip=kwargs["grad_clip"],
+            device=device,
+            seq_len=seq_len,
+            logdet_weight=kwargs["logdet_weight"],
+            l1_weight=kwargs["l1_weight"],
+            max_seed_k=kwargs["max_seed_k"],
+            teacher_force_weight=kwargs["teacher_force_weight"],
+        )
+
+        alpha = kwargs["ema_alpha"]
+        prev_ema = ema_loss
+        ema_loss = (
+            metrics["phase2/dynamics"]
+            if ema_loss is None
+            else alpha * ema_loss + (1.0 - alpha) * metrics["phase2/dynamics"]
+        )
+        ema_cl = (
+            metrics["phase2/cl_loss"]
+            if ema_cl is None
+            else alpha * ema_cl + (1.0 - alpha) * metrics["phase2/cl_loss"]
+        )
+
+        if prev_ema is not None and kwargs["convergence_patience"] > 0:
+            rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
+            if rel_change < kwargs["convergence_threshold"]:
+                converge_streak += 1
+                if converge_streak >= kwargs["convergence_patience"]:
+                    tqdm.write(
+                        f"  Phase 2 converged at epoch {epoch + 1}"
+                        f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+                    )
+                    break
+            else:
+                converge_streak = 0
+
+        # Gate seq_len curriculum on cl_loss EMA so the teacher-forced
+        # component (always T_full steps) doesn't drown out the signal.
+        if ema_cl < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
+            seq_len += 1
+
+        if (epoch + 1) % kwargs["log_every"] == 0:
+            for k, v in metrics.items():
+                writer.add_scalar(k, v, epoch)
+            writer.add_scalar("phase2/seq_len", seq_len, epoch)
+            writer.add_scalar("phase2/ema_loss", ema_loss, epoch)
+            writer.add_scalar("phase2/ema_cl", ema_cl, epoch)
+            if hp1["learn_structure"]:
+                writer.add_scalar(
+                    "phase2/structure/B_norm",
+                    dyn_model.get_B().norm().item(),
+                    epoch,
+                )
+            tqdm.write(
+                f"  epoch {epoch + 1:4d}"
+                f"  seq_len={seq_len:3d}"
+                f"  loss={metrics['phase2/dynamics']:.4f}"
+                f"  tf={metrics['phase2/tf_loss']:.4f}"
+                f"  cl={metrics['phase2/cl_loss']:.4f}"
+                f"  ema_cl={ema_cl:.4f}"
+                f"  logdet={metrics['phase2/logdet_reg']:.4f}"
+                f"  q_var={metrics['phase2/q_var']:.4f}"
+                f"  p_var={metrics['phase2/p_var']:.4f}"
+            )
+
+        if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
+            _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
+            if phase1_model is not None:
                 for val_trajs, label in (
                     (val_energy, "energy_pump"),
                     (val_random, "random"),
                     (val_spin, "spin"),
                 ):
-                    if not val_trajs:
-                        continue
-                    val_metrics = _eval_loss_phase1(model, val_trajs, device)
-                    for k, v in val_metrics.items():
-                        writer.add_scalar(f"{k}/{label}", v, epoch)
-                    _log_reconstruction_lstm_video(
-                        model=model, val_traj=val_trajs[0],
-                        device=device, writer=writer, epoch=epoch,
-                        tag=f"val/reconstruction_lstm/{label}",
-                    )
-                if val_energy:
-                    _log_latent_scatter_phase1(
-                        model=model, val_trajs=val_energy,
-                        device=device, writer=writer, epoch=epoch,
-                    )
-                _log_reconstruction_lstm_video(
-                    model=model, val_traj=episodes[0],
-                    device=device, writer=writer, epoch=epoch,
-                    tag="train/reconstruction_lstm",
-                )
-
-            if (
-                kwargs["checkpoint_every"] > 0
-                and (epoch + 1) % kwargs["checkpoint_every"] == 0
-                and metrics["phase1/loss"] < best_loss
-            ):
-                save_checkpoint(run_dir, epoch, model, hparams, metrics, stem="best")
-                best_loss = metrics["phase1/loss"]
-
-        # Always save final checkpoint
-        save_checkpoint(run_dir, kwargs["epochs"] - 1, model, hparams, metrics, stem="final")
-
-        # Precompute and save h_t cache
-        print(f"\nPrecomputing h_t cache for {len(episodes)} episodes...")
-        cache = precompute_latents(model, episodes, device)
-        h_cache_path = run_dir / "h_cache.pt"
-        torch.save(cache, h_cache_path)
-        print(f"Saved h_cache to {h_cache_path}")
-        print(f"\nTo run Phase 2:\n  uv run python experiments/pendulum_offline.py --phase 2 --phase1-run {run_dir}")
-
-    # ── Phase 2 ───────────────────────────────────────────────────────────────
-    else:
-        h_cache_path = kwargs["h_cache"]
-        phase1_ckpt = kwargs["phase1_checkpoint"]
-
-        # Load Phase 1 model whenever a checkpoint is given — kept alive for
-        # video logging throughout Phase 2 training.
-        phase1_model = None
-        if phase1_ckpt is not None:
-            print(f"Loading Phase 1 model from {phase1_ckpt}...")
-            phase1_model = ControlledDHGN_LSTM(
-                pos_ch=kwargs["pos_ch"],
-                img_ch=3,
-                dt=kwargs["dt"],
-                feat_dim=kwargs["feat_dim"],
-                latent_dim=kwargs["latent_dim"],
-                img_size=kwargs["img_size"],
-                control_dim=1,
-                separable=kwargs["separable"],
-                learn_structure=kwargs["learn_structure"],
-                damping=kwargs["damping"],
-            ).to(device)
-            phase1_model.load_state_dict(
-                torch.load(phase1_ckpt, map_location=device, weights_only=True)
-            )
-            phase1_model.eval()
-
-        if h_cache_path is not None:
-            print(f"Loading h_cache from {h_cache_path}...")
-            cache = torch.load(h_cache_path, weights_only=False)
-        elif phase1_model is not None:
-            print("Precomputing latents from Phase 1 model...")
-            cache = precompute_latents(phase1_model, episodes, device)
-            h_cache_save = run_dir / "h_cache.pt"
-            torch.save(cache, h_cache_save)
-            print(f"Saved h_cache to {h_cache_save}")
-        else:
-            raise click.UsageError("--phase 2 requires either --h-cache or --phase1-checkpoint")
-
-        if phase1_model is None:
-            print("Note: no --phase1-checkpoint provided; dreaming video logs will be skipped.")
-
-        # Infer latent_dim from cache
-        latent_dim = cache[0][0].shape[-1]
-        print(f"Latent dim from cache: {latent_dim}")
-
-        latent_dataset = LatentDataset(cache)
-        latent_loader = DataLoader(
-            latent_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
-        )
-        print(f"Latent dataset: {len(latent_dataset)} episodes")
-
-        dyn_model = HamiltonianFlowModel(
-            latent_dim=latent_dim,
-            control_dim=1,
-            separable=kwargs["separable"],
-            learn_structure=kwargs["learn_structure"],
-            dt=kwargs["dt"],
-            damping=kwargs["damping"],
-        ).to(device)
-        print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
-
-        hparams = {k: v for k, v in kwargs.items()}
-        if kwargs["learn_structure"]:
-            optimizer = torch.optim.Adam([
-                {
-                    "params": (
-                        list(dyn_model.phi.parameters())
-                        + list(dyn_model.hamiltonian.parameters())
-                    ),
-                    "lr": kwargs["lr"],
-                },
-                {
-                    "params": [dyn_model.A, dyn_model.L_param, dyn_model.B],
-                    "lr": kwargs["structural_lr"],
-                },
-            ])
-        else:
-            optimizer = torch.optim.Adam(dyn_model.parameters(), lr=kwargs["lr"])
-
-        full_seq_len = cache[0][1].shape[0] - 1  # -1: start from h_1, predict up to h_{T}
-        seq_len = kwargs["seq_len_start"]
-        ema_loss = None
-        ema_cl = None   # separate EMA for closed-loop loss — used for seq_len curriculum
-        best_loss = float("inf")
-        converge_streak = 0
-
-        print("\n=== Phase 2: dynamics flow training ===")
-        for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 2"):
-            metrics = _train_epoch_phase2(
-                dyn_model=dyn_model,
-                loader=latent_loader,
-                optimizer=optimizer,
-                grad_clip=kwargs["grad_clip"],
-                device=device,
-                seq_len=seq_len,
-                logdet_weight=kwargs["logdet_weight"],
-                l1_weight=kwargs["l1_weight"],
-                max_seed_k=kwargs["max_context_len"],
-                teacher_force_weight=kwargs["teacher_force_weight"],
-            )
-
-            alpha = kwargs["ema_alpha"]
-            prev_ema = ema_loss
-            ema_loss = (
-                metrics["phase2/dynamics"]
-                if ema_loss is None
-                else alpha * ema_loss + (1.0 - alpha) * metrics["phase2/dynamics"]
-            )
-            ema_cl = (
-                metrics["phase2/cl_loss"]
-                if ema_cl is None
-                else alpha * ema_cl + (1.0 - alpha) * metrics["phase2/cl_loss"]
-            )
-
-            if prev_ema is not None and kwargs["convergence_patience"] > 0:
-                rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
-                if rel_change < kwargs["convergence_threshold"]:
-                    converge_streak += 1
-                    if converge_streak >= kwargs["convergence_patience"]:
-                        tqdm.write(
-                            f"  Phase 2 converged at epoch {epoch + 1}"
-                            f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+                    if val_trajs:
+                        _log_dreamed_video_phase2(
+                            phase1_model=phase1_model,
+                            dyn_model=dyn_model,
+                            val_traj=val_trajs[0],
+                            device=device,
+                            writer=writer,
+                            epoch=epoch,
+                            seq_len=seq_len,
+                            context_frames=kwargs["val_context_frames"],
+                            tag=f"val/dreamed_phase2/{label}",
                         )
-                        break
-                else:
-                    converge_streak = 0
 
-            # Gate seq_len curriculum on cl_loss EMA so the teacher-forced
-            # component (which is always T_full steps) doesn't drown out the signal.
-            if ema_cl < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
-                seq_len += 1
+        if (
+            kwargs["checkpoint_every"] > 0
+            and (epoch + 1) % kwargs["checkpoint_every"] == 0
+            and metrics["phase2/dynamics"] < best_loss
+        ):
+            save_checkpoint(run_dir, epoch, dyn_model, hparams, metrics, stem="best")
+            best_loss = metrics["phase2/dynamics"]
 
-            if (epoch + 1) % kwargs["log_every"] == 0:
-                for k, v in metrics.items():
-                    writer.add_scalar(k, v, epoch)
-                writer.add_scalar("phase2/seq_len", seq_len, epoch)
-                writer.add_scalar("phase2/ema_loss", ema_loss, epoch)
-                writer.add_scalar("phase2/ema_cl", ema_cl, epoch)
-                if kwargs["learn_structure"]:
-                    writer.add_scalar(
-                        "phase2/structure/B_norm",
-                        dyn_model.get_B().norm().item(),
-                        epoch,
-                    )
-                tqdm.write(
-                    f"  epoch {epoch + 1:4d}"
-                    f"  seq_len={seq_len:3d}"
-                    f"  loss={metrics['phase2/dynamics']:.4f}"
-                    f"  tf={metrics['phase2/tf_loss']:.4f}"
-                    f"  cl={metrics['phase2/cl_loss']:.4f}"
-                    f"  ema_cl={ema_cl:.4f}"
-                    f"  logdet={metrics['phase2/logdet_reg']:.4f}"
-                    f"  q_var={metrics['phase2/q_var']:.4f}"
-                    f"  p_var={metrics['phase2/p_var']:.4f}"
-                )
-
-            if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
-                _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
-                if phase1_model is not None:
-                    for val_trajs, label in (
-                        (val_energy, "energy_pump"),
-                        (val_random, "random"),
-                        (val_spin, "spin"),
-                    ):
-                        if val_trajs:
-                            _log_dreamed_video_phase2(
-                                phase1_model=phase1_model,
-                                dyn_model=dyn_model,
-                                val_traj=val_trajs[0],
-                                device=device,
-                                writer=writer,
-                                epoch=epoch,
-                                seq_len=seq_len,
-                                tag=f"val/dreamed_phase2/{label}",
-                            )
-
-            if (
-                kwargs["checkpoint_every"] > 0
-                and (epoch + 1) % kwargs["checkpoint_every"] == 0
-                and metrics["phase2/dynamics"] < best_loss
-            ):
-                save_checkpoint(run_dir, epoch, dyn_model, hparams, metrics, stem="best")
-                best_loss = metrics["phase2/dynamics"]
-
-        save_checkpoint(run_dir, kwargs["epochs"] - 1, dyn_model, hparams, metrics, stem="final")
+    save_checkpoint(run_dir, epoch, dyn_model, hparams, metrics, stem="final")
 
     writer.close()
     print("\nDone. Run: tensorboard --logdir runs")
@@ -976,4 +1051,4 @@ def main(**kwargs):
 
 
 if __name__ == "__main__":
-    main()
+    cli()
