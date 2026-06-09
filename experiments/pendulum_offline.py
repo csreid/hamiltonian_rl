@@ -317,6 +317,7 @@ def _train_epoch_phase2(
     l1_weight: float = 0.0,
     max_seed_k: int = 0,
     teacher_force_weight: float = 1.0,
+    structural_reg_weight: float = 0.0,
 ) -> dict[str, float]:
     """Dynamics epoch: joint teacher-forced + closed-loop rollout.
 
@@ -339,7 +340,7 @@ def _train_epoch_phase2(
     """
     dyn_model.train()
     total_dynamics = total_tf = total_cl = total_logdet_reg = 0.0
-    total_q_var = total_p_var = total_hamiltonian_l1 = total_grad_H_norm = 0.0
+    total_q_var = total_p_var = total_hamiltonian_l1 = total_grad_H_norm = total_struct_reg = 0.0
     q_dim = dyn_model.latent_dim // 2
 
     for h_all, actions in loader:
@@ -396,6 +397,11 @@ def _train_epoch_phase2(
             loss = loss + l1_weight * l1_loss
             total_hamiltonian_l1 += l1_loss.item()
 
+        if structural_reg_weight > 0 and dyn_model.learn_structure:
+            struct_reg = dyn_model.get_J().pow(2).sum() + dyn_model.get_R().pow(2).sum()
+            loss = loss + structural_reg_weight * struct_reg
+            total_struct_reg += struct_reg.item()
+
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
@@ -430,6 +436,7 @@ def _train_epoch_phase2(
         "phase2/p_var": total_p_var / n,
         "phase2/hamiltonian_l1": total_hamiltonian_l1 / n,
         "phase2/grad_H_norm": total_grad_H_norm / n,
+        "phase2/struct_reg": total_struct_reg / n,
     }
 
 
@@ -441,6 +448,8 @@ def _log_structural_matrices_phase2(
 ) -> None:
     J = dyn_model.get_J().cpu()
     R = dyn_model.get_R().cpu()
+    writer.add_scalar("phase2/structure/J_frob", J.pow(2).sum().sqrt().item(), epoch)
+    writer.add_scalar("phase2/structure/R_frob", R.pow(2).sum().sqrt().item(), epoch)
     writer.add_histogram("phase2/structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch)
     for name, mat in (("J", J), ("R", R)):
         fig, ax = plt.subplots(figsize=(4, 4))
@@ -801,6 +810,8 @@ def phase1_cmd(**kwargs):
               help="Weight on log|det J_Phi|^2 regulariser; keeps flow near-volume-preserving")
 @click.option("--l1-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on Hamiltonian network weights; encourages simpler dynamics")
+@click.option("--structural-reg-weight", type=float, default=0.0, show_default=True,
+              help="Frobenius norm penalty on J and R (Phase 2, learn-structure only); prevents structural matrices from growing unbounded")
 @click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
               help="Weight on teacher-forced 1-step loss (set 0 to disable)")
 @click.option("--max-seed-k", type=int, default=0, show_default=True,
@@ -957,6 +968,7 @@ def phase2_cmd(**kwargs):
             l1_weight=kwargs["l1_weight"],
             max_seed_k=kwargs["max_seed_k"],
             teacher_force_weight=kwargs["teacher_force_weight"],
+            structural_reg_weight=kwargs["structural_reg_weight"],
         )
 
         alpha = kwargs["ema_alpha"]
