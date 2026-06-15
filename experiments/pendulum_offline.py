@@ -441,6 +441,57 @@ def _train_epoch_phase2(
 
 
 @torch.no_grad()
+def _eval_loss_phase2(
+    phase1_model: ControlledDHGN_LSTM,
+    dyn_model: HamiltonianFlowModel,
+    val_trajs: list,
+    device: torch.device,
+    seq_len: int,
+) -> dict[str, float]:
+    phase1_model.eval()
+    dyn_model.eval()
+    total_teacher_forced = total_closed_loop = 0.0
+    q_dim = dyn_model.latent_dim // 2
+
+    for frames, actions, _ in val_trajs:
+        frames_b = frames.unsqueeze(0).to(device)    # (1, T+1, C, H, W)
+        actions_b = actions.unsqueeze(0).to(device)  # (1, T)
+        mu_all, _ = phase1_model.encoder.forward_all(frames_b)
+        h_all = mu_all  # (1, T+1, latent_dim)
+        B, T_seq, D = h_all.shape
+        T_full = actions_b.shape[1]
+
+        h_flat = h_all.reshape(B * T_seq, D)
+        q_flat, p_flat = dyn_model.encode(h_flat)
+        q_all = q_flat.reshape(B, T_seq, q_dim)
+        p_all = p_flat.reshape(B, T_seq, q_dim)
+
+        q_teacher = q_all[:, :T_full].reshape(B * T_full, q_dim)
+        p_teacher = p_all[:, :T_full].reshape(B * T_full, q_dim)
+        actions_teacher = actions_b.float().reshape(B * T_full, 1)
+        q_next, p_next = dyn_model.controlled_step(q_teacher, p_teacher, actions_teacher)
+        h_teacher_pred = dyn_model.decode(q_next, p_next)
+        h_teacher_target = h_all[:, 1:].reshape(B * T_full, D)
+        total_teacher_forced += F.mse_loss(h_teacher_pred, h_teacher_target).item()
+
+        n_rollout_steps = min(seq_len, T_full - 1)
+        q, p = q_all[:, 1], p_all[:, 1]
+        closed_loop_sum = 0.0
+        for t in range(n_rollout_steps):
+            u = actions_b[:, 1 + t: 2 + t].float()
+            q, p = dyn_model.controlled_step(q, p, u)
+            h_pred = dyn_model.decode(q, p)
+            closed_loop_sum += F.mse_loss(h_pred, h_all[:, 2 + t]).item()
+        total_closed_loop += closed_loop_sum / n_rollout_steps if n_rollout_steps > 0 else 0.0
+
+    n = len(val_trajs)
+    return {
+        "phase2/val_tf_loss": total_teacher_forced / n,
+        "phase2/val_cl_loss": total_closed_loop / n,
+    }
+
+
+@torch.no_grad()
 def _log_structural_matrices_phase2(
     dyn_model: HamiltonianFlowModel,
     writer: SummaryWriter,
@@ -881,6 +932,7 @@ def phase2_cmd(**kwargs):
         )
 
     # Collect val episodes (only if dreaming logs are enabled and Phase 1 model is available)
+    train_sample_trajs = []
     val_energy, val_random, val_spin = [], [], []
     if kwargs["val_every"] > 0 and phase1_model is not None:
         n_val = kwargs["n_val_episodes"]
@@ -900,6 +952,15 @@ def phase2_cmd(**kwargs):
         val_spin = collect_spin_trajectories(
             n_episodes=n_val, img_size=hp1["img_size"],
             max_steps=val_steps, damping=hp1.get("damping", 0.0),
+        )
+        print("Collecting 3 training-distribution episodes for video logging...")
+        train_sample_trajs = collect_data(
+            n_episodes=3,
+            img_size=hp1["img_size"],
+            epsilon=hp1.get("epsilon", 0.1),
+            energy_k=hp1.get("energy_k", 1.0),
+            max_steps=hp1.get("max_steps", 200),
+            damping=hp1.get("damping", 0.0),
         )
 
     # Infer latent_dim from cache (authoritative; overrides any stale default)
@@ -1035,6 +1096,15 @@ def phase2_cmd(**kwargs):
                     (val_spin, "spin"),
                 ):
                     if val_trajs:
+                        val_loss_metrics = _eval_loss_phase2(
+                            phase1_model=phase1_model,
+                            dyn_model=dyn_model,
+                            val_trajs=val_trajs,
+                            device=device,
+                            seq_len=seq_len,
+                        )
+                        for k, v in val_loss_metrics.items():
+                            writer.add_scalar(f"{k}/{label}", v, epoch)
                         _log_dreamed_video_phase2(
                             phase1_model=phase1_model,
                             dyn_model=dyn_model,
@@ -1046,6 +1116,18 @@ def phase2_cmd(**kwargs):
                             context_frames=kwargs["val_context_frames"],
                             tag=f"val/dreamed_phase2/{label}",
                         )
+                for i, train_traj in enumerate(train_sample_trajs):
+                    _log_dreamed_video_phase2(
+                        phase1_model=phase1_model,
+                        dyn_model=dyn_model,
+                        val_traj=train_traj,
+                        device=device,
+                        writer=writer,
+                        epoch=epoch,
+                        seq_len=seq_len,
+                        context_frames=kwargs["val_context_frames"],
+                        tag=f"train/dreamed_phase2/sample_{i}",
+                    )
 
         if (
             kwargs["checkpoint_every"] > 0
