@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<head>
+  <meta charset="utf-8">
+  <meta name="generator" content="pandoc">
+  <meta name="author" content="Cameron Reid">
+  <title>Port-Hamiltonian World Models from Pixels</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+<style>
+  html, .view body { background-color: black; counter-reset: slideidx; }
+  body, .view section { background-color: white; border-radius: 12px }
+  /* A section is a slide. It's size is 800x600, and this will never change */
+  section, .view head > title {
+      font-family: 'DejaVu Sans Condensed', 'Liberation Sans', 'Nimbus Sans L', arial, serif;
+      font-size: 30px;
+  }
+
+  .view section:after {
+    counter-increment: slideidx;
+    content: counter(slideidx, decimal-leading-zero);
+    position: absolute; bottom: -80px; right: 100px;
+    color: white;
+  }
+
+  .view head > title {
+    color: white;
+    text-align: center;
+    margin: 1em 0 1em 0;
+  }
+
+  h1, h2 {
+    margin-top: 200px;
+    text-align: center;
+    font-size: 80px;
+  }
+  h3 {
+    margin: 100px 0 50px 100px;
+  }
+
+  ul {
+      margin: 50px 200px;
+  }
+  li > ul {
+      margin: 15px 50px;
+  }
+
+  p {
+    margin: 75px;
+    font-size: 50px;
+  }
+
+  blockquote {
+    height: 100%;
+    background-color: black;
+    color: white;
+    font-size: 60px;
+    padding: 50px;
+  }
+  blockquote:before {
+    content: open-quote;
+  }
+  blockquote:after {
+    content: close-quote;
+  }
+
+  /* Figures are displayed full-page, with the caption
+     on top of the image/video */
+  figure {
+    background-color: black;
+    width: 100%;
+    height: 100%;
+  }
+  figure > * {
+    position: absolute;
+  }
+  figure > img, figure > video {
+    width: 100%; height: 100%;
+  }
+  figcaption {
+    margin: 70px;
+    font-size: 50px;
+  }
+
+  footer {
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+    padding: 40px;
+    text-align: right;
+    background-color: #F3F4F8;
+    border-top: 1px solid #CCC;
+  }
+
+  /* Transition effect */
+  /* Feel free to change the transition effect for original
+     animations. See here:
+     https://developer.mozilla.org/en/CSS/CSS_transitions
+     How to use CSS3 Transitions: */
+  section {
+    -moz-transition: left 400ms linear 0s;
+    -webkit-transition: left 400ms linear 0s;
+    -ms-transition: left 400ms linear 0s;
+    transition: left 400ms linear 0s;
+  }
+  .view section {
+    -moz-transition: none;
+    -webkit-transition: none;
+    -ms-transition: none;
+    transition: none;
+  }
+
+  .view section[aria-selected] {
+    border: 5px red solid;
+  }
+
+  /* Before */
+  section { left: -150%; }
+  /* Now */
+  section[aria-selected] { left: 0; }
+  /* After */
+  section[aria-selected] ~ section { left: +150%; }
+
+  /* Incremental elements */
+
+  /* By default, visible */
+  .incremental > * { opacity: 1; }
+
+  /* The current item */
+  .incremental > *[aria-selected] { opacity: 1; }
+
+  /* The items to-be-selected */
+  .incremental > *[aria-selected] ~ * { opacity: 0; }
+
+  /* The progressbar, at the bottom of the slides, show the global
+     progress of the presentation. */
+  #progress-bar {
+    height: 2px;
+    background: #AAA;
+  }
+</style>
+  <style>
+    section {
+      font-size: 16px;
+    }
+    h1, h2 {
+      margin-top: 20px;
+      margin-left: 20px;
+      text-align: left;
+      font-size: 32px;
+    }
+    h3 {
+      margin: 10px 0 20px 40px;
+      font-size: 24px;
+    }
+    ul {
+      margin: 20px 60px;
+    }
+    p {
+      margin: 20px 40px;
+      font-size: 16px;
+    }
+    ol {
+      margin: 20px 60px;
+    }
+    img {
+      height: 400px;
+      width: auto;
+      display: block;
+      margin: 0 auto;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+<section class="title">
+  <h1 class="title">Port-Hamiltonian World Models from Pixels</h1>
+  <footer>
+    <span class="author">Cameron Reid</span> · 
+  </footer>
+</section>
+<section id="motivation" class="title-slide slide level1">
+<h1>Motivation</h1>
+
+</section>
+<section id="the-problem" class="slide level2">
+<h2>The Problem</h2>
+<ul>
+<li>Physical systems have rich structure: energy, dissipation, control
+ports</li>
+<li>Black-box models (e.g. DreamerV3) ignore this — data-hungry and
+opaque</li>
+<li><strong>Goal:</strong> learn a world model that is physically
+interpretable <em>and</em> sample-efficient</li>
+</ul>
+</section>
+<section id="port-hamiltonian-systems" class="slide level2">
+<h2>Port-Hamiltonian Systems</h2>
+<p>A port-Hamiltonian system evolves as:</p>
+<p><span
+class="math display"><em>ż</em> = (<em>J</em>−<em>R</em>)∇ℋ(<em>z</em>) + <em>B</em><em>u</em></span></p>
+<ul>
+<li><span class="math inline"><em>J</em></span> — symplectic
+(energy-routing) matrix: <span
+class="math inline"><em>J</em> =  − <em>J</em><sup>⊤</sup></span></li>
+<li><span class="math inline"><em>R</em></span> — dissipation matrix:
+<span
+class="math inline"><em>R</em> = <em>R</em><sup>⊤</sup> ≽ 0</span></li>
+<li><span class="math inline">ℋ</span> — Hamiltonian (total energy)</li>
+<li><span class="math inline"><em>B</em></span> — control input
+matrix</li>
+</ul>
+<p>Encodes energy conservation, dissipation, and controllability in the
+<em>structure</em> of the ODE</p>
+</section>
+<section id="why-from-pixels" class="slide level2">
+<h2>Why From Pixels?</h2>
+<ul>
+<li>Prior work (port-Hamiltonian Neural ODEs) assumes direct access to
+<span class="math inline">(<em>q</em>,<em>p</em>)</span></li>
+<li>In practice, sensors give images, not joint angles and momenta</li>
+<li><strong>Challenge:</strong> discover a phase space <em>and</em>
+port-Hamiltonian structure from image sequences</li>
+</ul>
+</section>
+
+<section id="approach" class="title-slide slide level1">
+<h1>Approach</h1>
+
+</section>
+<section id="overview" class="slide level2">
+<h2>Overview</h2>
+<p>Two-phase training pipeline:</p>
+<ol type="1">
+<li><strong>Phase 1</strong> — learn a compact latent representation
+<span class="math inline"><em>h</em><sub><em>t</em></sub></span> from
+image sequences (recurrent autoencoder)</li>
+<li><strong>Phase 2</strong> — learn a normalizing flow <span
+class="math inline"><em>Φ</em> : <em>h</em> → (<em>q</em>,<em>p</em>)</span>
+such that Hamiltonian dynamics hold in <span
+class="math inline">(<em>q</em>,<em>p</em>)</span> space</li>
+</ol>
+<p>Inference: encode a few context frames <span
+class="math inline">→</span> map to phase space <span
+class="math inline">→</span> roll out dynamics <span
+class="math inline">→</span> invert back to pixels</p>
+</section>
+<section id="phase-1-recurrent-autoencoder" class="slide level2">
+<h2>Phase 1: Recurrent Autoencoder</h2>
+<ul>
+<li>Causal LSTM over frame sequence <span
+class="math inline"><em>x</em><sub>0</sub>, …, <em>x</em><sub><em>T</em></sub></span>
+produces hidden state <span
+class="math inline"><em>h</em><sub><em>t</em></sub></span> at each
+step</li>
+<li><span class="math inline"><em>h</em><sub><em>t</em></sub></span> is
+projected to a latent <span
+class="math inline">(<em>q</em>,<em>p</em>)</span> pair via a learned
+MLP <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub></span></li>
+<li>Trained on two pixel-space objectives:
+<ul>
+<li><strong>Reconstruction:</strong> decode <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub>(<em>h</em><sub><em>t</em></sub>)</span>
+back to <span
+class="math inline"><em>x</em><sub><em>t</em></sub></span></li>
+<li><strong>Next-frame prediction:</strong> decode <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub>(<em>h</em><sub><em>t</em></sub>)</span>
+to <span class="math inline"><em>x</em><sub><em>t</em> + 1</sub></span>
+given action <span
+class="math inline"><em>u</em><sub><em>t</em></sub></span></li>
+</ul></li>
+<li>Also includes a KL regularizer (VAE-style) and a temporal metric
+regularizer</li>
+</ul>
+</section>
+<section id="phase-1-temporal-metric-regularizer" class="slide level2">
+<h2>Phase 1: Temporal Metric Regularizer</h2>
+<ul>
+<li>Problem: <span
+class="math inline"><em>h</em><sub><em>t</em></sub></span>
+representations could be arbitrarily permuted in latent space</li>
+<li>Fix: penalize pairs <span
+class="math inline">(<em>h</em><sub><em>t</em><sub>1</sub></sub>,<em>h</em><sub><em>t</em><sub>2</sub></sub>)</span>
+that are <em>closer</em> in <span
+class="math inline"><em>h</em></span>-space than expected from <span
+class="math inline">|<em>t</em><sub>1</sub>−<em>t</em><sub>2</sub>|</span></li>
+<li>Forces <span
+class="math inline"><em>h</em><sub><em>t</em></sub></span> to be
+temporally ordered in latent space — smoother manifold for Phase 2</li>
+</ul>
+</section>
+<section id="phase-2-why-a-normalizing-flow" class="slide level2">
+<h2>Phase 2: Why a Normalizing Flow?</h2>
+<p><span class="math inline"><em>h</em><sub><em>t</em></sub></span>
+already encodes the phase space implicitly:</p>
+<ul>
+<li>Reconstructing <span
+class="math inline"><em>x</em><sub><em>t</em></sub></span> requires
+position information (<span class="math inline"><em>q</em></span>)</li>
+<li>Predicting <span
+class="math inline"><em>x</em><sub><em>t</em> + 1</sub></span> requires
+velocity information (<span class="math inline"><em>p</em></span>)</li>
+</ul>
+<p>But this implicit phase space has no reason to respect
+port-Hamiltonian structure — it’s just whatever the LSTM found
+convenient.</p>
+<p><strong>Fix:</strong> learn a normalizing flow <span
+class="math inline"><em>Φ</em> : <em>h</em> → (<em>q</em>,<em>p</em>)</span></p>
+<ul>
+<li>A lossless change of coordinates from the LSTM’s arbitrary phase
+space to one that is <em>induced</em> to follow port-Hamiltonian
+dynamics</li>
+<li>Invertible by construction: <span
+class="math inline"><em>Φ</em><sup>−1</sup>(<em>q</em>,<em>p</em>) = <em>h</em></span>
+lets us decode back to pixels through the Phase 1 network</li>
+</ul>
+</section>
+<section id="phase-2-training-objectives" class="slide level2">
+<h2>Phase 2: Training Objectives</h2>
+<p>Both objectives share one <span class="math inline"><em>Φ</em></span>
+forward pass over the full sequence:</p>
+<p><strong>Teacher-forced</strong> — one RK4 step from every <span
+class="math inline"><em>h</em><sub><em>t</em></sub></span>, batched:</p>
+<p><span
+class="math display">ℒ<sub>tf</sub> = MSE (<em>Φ</em><sup>−1</sup> (RK4(<em>Φ</em>(<em>h</em><sub><em>t</em></sub>),<em>u</em><sub><em>t</em></sub>)), <em>h</em><sub><em>t</em> + 1</sub>)</span></p>
+<p><strong>Closed-loop</strong> — autonomous rollout from seed <span
+class="math inline"><em>h</em><sub><em>k</em></sub></span> for <span
+class="math inline">ℓ</span> steps:</p>
+<p><span class="math display">$$\mathcal{L}_\text{cl} =
+\frac{1}{\ell}\sum_{i=1}^{\ell}\text{MSE}\!\left(\Phi^{-1}\!\left(\text{RK4}^i(\Phi(h_k),
+u)\right),\; h_{k+i}\right)$$</span></p>
+<ul>
+<li><span class="math inline">ℓ</span> starts small and advances via a
+<strong>performance-gated curriculum</strong>: only grow once <span
+class="math inline">ℒ<sub>cl</sub></span> is sufficiently low</li>
+</ul>
+</section>
+<section id="learned-structure-split-learning-rates"
+class="slide level2">
+<h2>Learned Structure: Split Learning Rates</h2>
+<p><span class="math inline"><em>J</em></span>, <span
+class="math inline"><em>R</em></span>, <span
+class="math inline"><em>B</em></span>, <span
+class="math inline">ℋ</span>, and <span
+class="math inline"><em>Φ</em></span> are all learned jointly, but with
+two separate learning rates:</p>
+<ul>
+<li><span class="math inline">ℋ</span> and <span
+class="math inline"><em>Φ</em></span> use a small LR (e.g. <span
+class="math inline">10<sup>−4</sup></span>)</li>
+<li><span class="math inline"><em>J</em></span>, <span
+class="math inline"><em>R</em></span>, <span
+class="math inline"><em>B</em></span> use a much larger LR (e.g. <span
+class="math inline">10<sup>−2</sup></span>)</li>
+</ul>
+<p><strong>Why:</strong> structural matrices are initialized near zero,
+so their gradient signal is negligible early in training — <span
+class="math inline">∇ℋ</span> is small, so <span
+class="math inline">(<em>J</em>−<em>R</em>)∇ℋ ≈ 0</span> regardless of
+<span class="math inline"><em>J</em></span> and <span
+class="math inline"><em>R</em></span>. Without a higher LR they never
+escape this regime and the dynamics reduce to <span
+class="math inline"><em>ż</em> ≈ <em>B</em><em>u</em></span>.</p>
+</section>
+<section id="learned-structure-frobenius-regularization"
+class="slide level2">
+<h2>Learned Structure: Frobenius Regularization</h2>
+<p><span
+class="math display">ℒ<sub>struct</sub> = <em>λ</em><sub><em>s</em></sub>(∥<em>J</em>∥<sub><em>F</em></sub><sup>2</sup>+∥<em>R</em>∥<sub><em>F</em></sub><sup>2</sup>)</span></p>
+<p><strong>Why:</strong> without regularization, <span
+class="math inline"><em>J</em></span> and <span
+class="math inline"><em>R</em></span> grow to large values over long
+training runs. Large structural matrices amplify <span
+class="math inline">∇ℋ</span> in the dynamics step, producing large and
+chaotic phase-space trajectories on held-out data. The regularizer
+penalizes the optimizer for finding solutions that rely on extreme
+matrix values.</p>
+</section>
+<section id="learned-structure-logdet-regularizer" class="slide level2">
+<h2>Learned Structure: Logdet Regularizer</h2>
+<p><span
+class="math display">ℒ<sub>logdet</sub> = <em>λ</em><sub><em>Φ</em></sub> ⋅ 𝔼 [(log|det<em>J</em><sub><em>Φ</em></sub>|)<sup>2</sup>]</span></p>
+<p><strong>Why:</strong> a normalizing flow can in principle collapse
+the entire latent space to a small region (large negative log-det) or
+expand it without bound (large positive log-det). Either pathology makes
+the inverse <span class="math inline"><em>Φ</em><sup>−1</sup></span>
+poorly conditioned. Penalizing the squared log-determinant keeps <span
+class="math inline"><em>Φ</em></span> near-volume-preserving, which
+stabilizes both the forward and inverse passes.</p>
+</section>
+<section id="inference" class="slide level2">
+<h2>Inference</h2>
+<p>Given a short context of frames:</p>
+<ol type="1">
+<li>Encode context with Phase 1 LSTM: <span
+class="math inline"><em>h</em><sub>0</sub>, …, <em>h</em><sub><em>k</em></sub></span></li>
+<li>Map to phase space: <span
+class="math inline">(<em>q</em><sub><em>k</em></sub>,<em>p</em><sub><em>k</em></sub>) = <em>Φ</em>(<em>h</em><sub><em>k</em></sub>)</span></li>
+<li>Roll out port-Hamiltonian dynamics for <span
+class="math inline"><em>T</em></span> steps: <span
+class="math inline">(<em>q</em><sub><em>k</em></sub>,<em>p</em><sub><em>k</em></sub>) → ⋯ → (<em>q</em><sub><em>k</em> + <em>T</em></sub>,<em>p</em><sub><em>k</em> + <em>T</em></sub>)</span></li>
+<li>Invert back: <span
+class="math inline"><em>h</em><sub><em>k</em> + <em>i</em></sub> = <em>Φ</em><sup>−1</sup>(<em>q</em><sub><em>k</em> + <em>i</em></sub>,<em>p</em><sub><em>k</em> + <em>i</em></sub>)</span></li>
+<li>Decode to pixels via Phase 1 <span
+class="math inline"><em>f</em><sub><em>ψ</em></sub></span> and
+decoder</li>
+</ol>
+</section>
+
+<section id="current-status" class="title-slide slide level1">
+<h1>Current Status</h1>
+
+</section>
+<section id="whats-working" class="slide level2">
+<h2>What’s Working</h2>
+<ul>
+<li>Phase 1 autoencoder learns good reconstructions and next-frame
+predictions</li>
+<li>Phase 2 teacher-forced loss converges reliably</li>
+</ul>
+</section>
+<section id="current-issue-overfitting" class="slide level2">
+<h2>Current Issue: Overfitting</h2>
+<ul>
+<li>Training losses (both <span
+class="math inline">ℒ<sub>tf</sub></span> and <span
+class="math inline">ℒ<sub>cl</sub></span>) converge well</li>
+<li>Held-out dreamed rollouts look chaotic — dynamics don’t
+generalize</li>
+<li>Structural matrices (<span class="math inline"><em>J</em></span>,
+<span class="math inline"><em>R</em></span>) grow large and produce
+high-variance gradients in the dynamics step</li>
+<li>Added Frobenius regularization on <span
+class="math inline"><em>J</em>, <em>R</em></span> as a first fix; added
+train/val loss logging to confirm the gap</li>
+<li>Structural matrices don’t look right: with dissipation set to zero
+in data collection, <span class="math inline"><em>R</em></span> should
+converge to zero, but instead persistently develops one large eigenvalue
+concentrated at a single latent dimension; <span
+class="math inline"><em>J</em></span> develops correspondingly large
+entries at the same coordinates, possibly attempting to cancel the
+spurious dissipation</li>
+</ul>
+</section>
+<section id="next-steps" class="slide level2">
+<h2>Next Steps</h2>
+<ul>
+<li>Confirm train vs. val gap quantitatively in TensorBoard</li>
+<li>Investigate root cause:
+<ul>
+<li>Phase 2 overfitting to the cached <span
+class="math inline"><em>h</em><sub><em>t</em></sub></span>
+representations?</li>
+</ul></li>
+</ul>
+</section>
+<!-- {{{{ dzslides core
+#
+#
+#     __  __  __       .  __   ___  __
+#    |  \  / /__` |    | |  \ |__  /__`
+#    |__/ /_ .__/ |___ | |__/ |___ .__/ core :€
+#
+#
+# The following block of code is not supposed to be edited.
+# But if you want to change the behavior of these slides,
+# feel free to hack it!
+#
+-->
+
+<div id="progress-bar"></div>
+
+<!-- Default Style -->
+<style>
+  * { margin: 0; padding: 0; -moz-box-sizing: border-box; -webkit-box-sizing: border-box; box-sizing: border-box; }
+  [role="note"] { display: none; }
+  body {
+    width: 800px; height: 600px;
+    margin-left: -400px; margin-top: -300px;
+    position: absolute; top: 50%; left: 50%;
+    overflow: hidden;
+    display: none;
+  }
+  .view body {
+    position: static;
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    display: inline-block;
+    overflow: visible; overflow-x: hidden;
+    /* undo Dz.onresize */
+    transform: none !important;
+    -moz-transform: none !important;
+    -webkit-transform: none !important;
+    -o-transform: none !important;
+    -ms-transform: none !important;
+  }
+  .view head, .view head > title { display: block }
+  section {
+    position: absolute;
+    pointer-events: none;
+    width: 100%; height: 100%;
+  }
+  .view section {
+    pointer-events: auto;
+    position: static;
+    width: 800px; height: 600px;
+    margin: -150px -200px;
+    float: left;
+
+    transform: scale(.4);
+    -moz-transform: scale(.4);
+    -webkit-transform: scale(.4);
+    -o-transform: scale(.4);
+    -ms-transform: scale(.4);
+  }
+  .view section > * { pointer-events: none; }
+  section[aria-selected] { pointer-events: auto; }
+  html { overflow: hidden; }
+  html.view { overflow: visible; }
+  body.loaded { display: block; }
+  .incremental {visibility: hidden; }
+  .incremental[active] {visibility: visible; }
+  #progress-bar{
+    bottom: 0;
+    position: absolute;
+    -moz-transition: width 400ms linear 0s;
+    -webkit-transition: width 400ms linear 0s;
+    -ms-transition: width 400ms linear 0s;
+    transition: width 400ms linear 0s;
+  }
+  .view #progress-bar {
+    display: none;
+  }
+</style>
+
+<script>
+  var Dz = {
+    remoteWindows: [],
+    idx: -1,
+    step: 0,
+    html: null,
+    slides: null,
+    progressBar : null,
+    params: {
+      autoplay: "1"
+    }
+  };
+
+  Dz.init = function() {
+    document.body.className = "loaded";
+    this.slides = Array.prototype.slice.call($$("body > section"));
+    this.progressBar = $("#progress-bar");
+    this.html = document.body.parentNode;
+    this.setupParams();
+    this.onhashchange();
+    this.setupTouchEvents();
+    this.onresize();
+    this.setupView();
+  }
+
+  Dz.setupParams = function() {
+    var p = window.location.search.substr(1).split('&');
+    p.forEach(function(e, i, a) {
+      var keyVal = e.split('=');
+      Dz.params[keyVal[0]] = decodeURIComponent(keyVal[1]);
+    });
+  // Specific params handling
+    if (!+this.params.autoplay)
+      $$.forEach($$("video"), function(v){ v.controls = true });
+  }
+
+  Dz.onkeydown = function(aEvent) {
+    // Don't intercept keyboard shortcuts
+    if (aEvent.altKey
+      || aEvent.ctrlKey
+      || aEvent.metaKey
+      || aEvent.shiftKey) {
+      return;
+    }
+    if ( aEvent.keyCode == 37 // left arrow
+      || aEvent.keyCode == 38 // up arrow
+      || aEvent.keyCode == 33 // page up
+    ) {
+      aEvent.preventDefault();
+      this.back();
+    }
+    if ( aEvent.keyCode == 39 // right arrow
+      || aEvent.keyCode == 40 // down arrow
+      || aEvent.keyCode == 34 // page down
+    ) {
+      aEvent.preventDefault();
+      this.forward();
+    }
+    if (aEvent.keyCode == 35) { // end
+      aEvent.preventDefault();
+      this.goEnd();
+    }
+    if (aEvent.keyCode == 36) { // home
+      aEvent.preventDefault();
+      this.goStart();
+    }
+    if (aEvent.keyCode == 32) { // space
+      aEvent.preventDefault();
+      this.toggleContent();
+    }
+    if (aEvent.keyCode == 70) { // f
+      aEvent.preventDefault();
+      this.goFullscreen();
+    }
+    if (aEvent.keyCode == 79) { // o
+      aEvent.preventDefault();
+      this.toggleView();
+    }
+  }
+
+  /* Touch Events */
+
+  Dz.setupTouchEvents = function() {
+    var orgX, newX;
+    var tracking = false;
+
+    var db = document.body;
+    db.addEventListener("touchstart", start.bind(this), false);
+    db.addEventListener("touchmove", move.bind(this), false);
+
+    function start(aEvent) {
+      aEvent.preventDefault();
+      tracking = true;
+      orgX = aEvent.changedTouches[0].pageX;
+    }
+
+    function move(aEvent) {
+      if (!tracking) return;
+      newX = aEvent.changedTouches[0].pageX;
+      if (orgX - newX > 100) {
+        tracking = false;
+        this.forward();
+      } else {
+        if (orgX - newX < -100) {
+          tracking = false;
+          this.back();
+        }
+      }
+    }
+  }
+
+  Dz.setupView = function() {
+    document.body.addEventListener("click", function ( e ) {
+      if (!Dz.html.classList.contains("view")) return;
+      if (!e.target || e.target.nodeName != "SECTION") return;
+
+      Dz.html.classList.remove("view");
+      Dz.setCursor(Dz.slides.indexOf(e.target) + 1);
+    }, false);
+  }
+
+  /* Adapt the size of the slides to the window */
+
+  Dz.onresize = function() {
+    var db = document.body;
+    var sx = db.clientWidth / window.innerWidth;
+    var sy = db.clientHeight / window.innerHeight;
+    var transform = "scale(" + (1/Math.max(sx, sy)) + ")";
+
+    db.style.MozTransform = transform;
+    db.style.WebkitTransform = transform;
+    db.style.OTransform = transform;
+    db.style.msTransform = transform;
+    db.style.transform = transform;
+  }
+
+
+  Dz.getNotes = function(aIdx) {
+    var s = $("section:nth-of-type(" + aIdx + ")");
+    var d = s.$("[role='note']");
+    return d ? d.innerHTML : "";
+  }
+
+  Dz.onmessage = function(aEvent) {
+    var argv = aEvent.data.split(" "), argc = argv.length;
+    argv.forEach(function(e, i, a) { a[i] = decodeURIComponent(e) });
+    var win = aEvent.source;
+    if (argv[0] === "REGISTER" && argc === 1) {
+      this.remoteWindows.push(win);
+      this.postMsg(win, "REGISTERED", document.title, this.slides.length);
+      this.postMsg(win, "CURSOR", this.idx + "." + this.step);
+      return;
+    }
+    if (argv[0] === "BACK" && argc === 1)
+      this.back();
+    if (argv[0] === "FORWARD" && argc === 1)
+      this.forward();
+    if (argv[0] === "START" && argc === 1)
+      this.goStart();
+    if (argv[0] === "END" && argc === 1)
+      this.goEnd();
+    if (argv[0] === "TOGGLE_CONTENT" && argc === 1)
+      this.toggleContent();
+    if (argv[0] === "SET_CURSOR" && argc === 2)
+      window.location.hash = "#" + argv[1];
+    if (argv[0] === "GET_CURSOR" && argc === 1)
+      this.postMsg(win, "CURSOR", this.idx + "." + this.step);
+    if (argv[0] === "GET_NOTES" && argc === 1)
+      this.postMsg(win, "NOTES", this.getNotes(this.idx));
+  }
+
+  Dz.toggleContent = function() {
+    // If a Video is present in this new slide, play it.
+    // If a Video is present in the previous slide, stop it.
+    var s = $("section[aria-selected]");
+    if (s) {
+      var video = s.$("video");
+      if (video) {
+        if (video.ended || video.paused) {
+          video.play();
+        } else {
+          video.pause();
+        }
+      }
+    }
+  }
+
+  Dz.setCursor = function(aIdx, aStep) {
+    // If the user change the slide number in the URL bar, jump
+    // to this slide.
+    aStep = (aStep != 0 && typeof aStep !== "undefined") ? "." + aStep : ".0";
+    window.location.hash = "#" + aIdx + aStep;
+  }
+
+  Dz.onhashchange = function() {
+    var cursor = window.location.hash.split("#"),
+        newidx = 1,
+        newstep = 0;
+    if (cursor.length == 2) {
+      newidx = ~~cursor[1].split(".")[0];
+      newstep = ~~cursor[1].split(".")[1];
+      if (newstep > Dz.slides[newidx - 1].$$('.incremental > *').length) {
+        newstep = 0;
+        newidx++;
+      }
+    }
+    this.setProgress(newidx, newstep);
+    if (newidx != this.idx) {
+      this.setSlide(newidx);
+    }
+    if (newstep != this.step) {
+      this.setIncremental(newstep);
+    }
+    for (var i = 0; i < this.remoteWindows.length; i++) {
+      this.postMsg(this.remoteWindows[i], "CURSOR", this.idx + "." + this.step);
+    }
+  }
+
+  Dz.back = function() {
+    if (this.idx == 1 && this.step == 0) {
+      return;
+    }
+    if (this.step == 0) {
+      this.setCursor(this.idx - 1,
+                     this.slides[this.idx - 2].$$('.incremental > *').length);
+    } else {
+      this.setCursor(this.idx, this.step - 1);
+    }
+  }
+
+  Dz.forward = function() {
+    if (this.idx >= this.slides.length &&
+        this.step >= this.slides[this.idx - 1].$$('.incremental > *').length) {
+        return;
+    }
+    if (this.step >= this.slides[this.idx - 1].$$('.incremental > *').length) {
+      this.setCursor(this.idx + 1, 0);
+    } else {
+      this.setCursor(this.idx, this.step + 1);
+    }
+  }
+
+  Dz.goStart = function() {
+    this.setCursor(1, 0);
+  }
+
+  Dz.goEnd = function() {
+    var lastIdx = this.slides.length;
+    var lastStep = this.slides[lastIdx - 1].$$('.incremental > *').length;
+    this.setCursor(lastIdx, lastStep);
+  }
+
+  Dz.toggleView = function() {
+    this.html.classList.toggle("view");
+
+    if (this.html.classList.contains("view")) {
+      $("section[aria-selected]").scrollIntoView(true);
+    }
+  }
+
+  Dz.setSlide = function(aIdx) {
+    this.idx = aIdx;
+    var old = $("section[aria-selected]");
+    var next = $("section:nth-of-type("+ this.idx +")");
+    if (old) {
+      old.removeAttribute("aria-selected");
+      var video = old.$("video");
+      if (video) {
+        video.pause();
+      }
+    }
+    if (next) {
+      next.setAttribute("aria-selected", "true");
+      if (this.html.classList.contains("view")) {
+        next.scrollIntoView();
+      }
+      var video = next.$("video");
+      if (video && !!+this.params.autoplay) {
+        video.play();
+      }
+    } else {
+      // That should not happen
+      this.idx = -1;
+      // console.warn("Slide doesn't exist.");
+    }
+  }
+
+  Dz.setIncremental = function(aStep) {
+    this.step = aStep;
+    var old = this.slides[this.idx - 1].$('.incremental > *[aria-selected]');
+    if (old) {
+      old.removeAttribute('aria-selected');
+    }
+    var incrementals = $$('.incremental');
+    if (this.step <= 0) {
+      $$.forEach(incrementals, function(aNode) {
+        aNode.removeAttribute('active');
+      });
+      return;
+    }
+    var next = this.slides[this.idx - 1].$$('.incremental > *')[this.step - 1];
+    if (next) {
+      next.setAttribute('aria-selected', true);
+      next.parentNode.setAttribute('active', true);
+      var found = false;
+      $$.forEach(incrementals, function(aNode) {
+        if (aNode != next.parentNode)
+          if (found)
+            aNode.removeAttribute('active');
+          else
+            aNode.setAttribute('active', true);
+        else
+          found = true;
+      });
+    } else {
+      setCursor(this.idx, 0);
+    }
+    return next;
+  }
+
+  Dz.goFullscreen = function() {
+    var html = $('html'),
+        requestFullscreen = html.requestFullscreen || html.requestFullScreen || html.mozRequestFullScreen || html.webkitRequestFullScreen;
+    if (requestFullscreen) {
+      requestFullscreen.apply(html);
+    }
+  }
+  
+  Dz.setProgress = function(aIdx, aStep) {
+    var slide = $("section:nth-of-type("+ aIdx +")");
+    if (!slide)
+      return;
+    var steps = slide.$$('.incremental > *').length + 1,
+        slideSize = 100 / (this.slides.length - 1),
+        stepSize = slideSize / steps;
+    this.progressBar.style.width = ((aIdx - 1) * slideSize + aStep * stepSize) + '%';
+  }
+  
+  Dz.postMsg = function(aWin, aMsg) { // [arg0, [arg1...]]
+    aMsg = [aMsg];
+    for (var i = 2; i < arguments.length; i++)
+      aMsg.push(encodeURIComponent(arguments[i]));
+    aWin.postMessage(aMsg.join(" "), "*");
+  }
+  
+  function init() {
+    Dz.init();
+    window.onkeydown = Dz.onkeydown.bind(Dz);
+    window.onresize = Dz.onresize.bind(Dz);
+    window.onhashchange = Dz.onhashchange.bind(Dz);
+    window.onmessage = Dz.onmessage.bind(Dz);
+  }
+
+  window.onload = init;
+</script>
+
+
+<script> // Helpers
+  if (!Function.prototype.bind) {
+    Function.prototype.bind = function (oThis) {
+
+      // closest thing possible to the ECMAScript 5 internal IsCallable
+      // function 
+      if (typeof this !== "function")
+      throw new TypeError(
+        "Function.prototype.bind - what is trying to be fBound is not callable"
+      );
+
+      var aArgs = Array.prototype.slice.call(arguments, 1),
+          fToBind = this,
+          fNOP = function () {},
+          fBound = function () {
+            return fToBind.apply( this instanceof fNOP ? this : oThis || window,
+                   aArgs.concat(Array.prototype.slice.call(arguments)));
+          };
+
+      fNOP.prototype = this.prototype;
+      fBound.prototype = new fNOP();
+
+      return fBound;
+    };
+  }
+
+  var $ = (HTMLElement.prototype.$ = function(aQuery) {
+    return this.querySelector(aQuery);
+  }).bind(document);
+
+  var $$ = (HTMLElement.prototype.$$ = function(aQuery) {
+    return this.querySelectorAll(aQuery);
+  }).bind(document);
+
+  $$.forEach = function(nodeList, fun) {
+    Array.prototype.forEach.call(nodeList, fun);
+  }
+
+</script>
+<!-- vim: set fdm=marker: }}} -->
+</body>
+</html>

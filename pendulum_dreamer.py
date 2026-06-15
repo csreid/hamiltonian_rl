@@ -79,13 +79,14 @@ def load_phase2_model(
             hparams = doc.get("hparams", {})
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ph1 = hparams.get("phase1_hparams", {})
     model = HamiltonianFlowModel(
         latent_dim=latent_dim,
         control_dim=1,
-        separable=hparams.get("separable", True),
-        learn_structure=hparams.get("learn_structure", True),
-        dt=hparams.get("dt", dt),
-        damping=hparams.get("damping", 0.0),
+        separable=ph1.get("separable", hparams.get("separable", True)),
+        learn_structure=ph1.get("learn_structure", hparams.get("learn_structure", True)),
+        dt=ph1.get("dt", hparams.get("dt", dt)),
+        damping=ph1.get("damping", hparams.get("damping", 0.0)),
     ).to(device)
     sd = torch.load(pt_path, map_location=device, weights_only=True)
     model.load_state_dict(sd)

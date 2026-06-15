@@ -11,5 +11,9 @@ run script *args:
     PYTHONPATH=. uv run python {{script}} {{args}}
 
 [working-directory: 'notes']
-build-slides:
+build-update-slides:
     pandoc notes.md -t dzslides -s -H style.html --slide-level=2 -o notes.html
+
+[working-directory: 'notes']
+build-slides:
+    pandoc phgn_pixels.md -t dzslides -s -H style.html --slide-level=2 -o phgn_pixels.html
