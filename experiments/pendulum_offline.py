@@ -318,6 +318,8 @@ def _train_epoch_phase2(
     max_seed_k: int = 0,
     teacher_force_weight: float = 1.0,
     structural_reg_weight: float = 0.0,
+    h_noise_std: float = 0.0,
+    h_noise_scale: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Dynamics epoch: joint teacher-forced + closed-loop rollout.
 
@@ -337,6 +339,14 @@ def _train_epoch_phase2(
 
     Logdet regulariser is applied over all T+1 encoded timesteps rather than
     a single seed point, so its strength stays constant as seq_len grows.
+
+    If h_noise_std > 0, zero-mean Gaussian noise is added to the h values fed
+    into phi (both teacher-forced and closed-loop seeds), while the prediction
+    targets stay clean.  This is denoising-style augmentation: the model learns
+    to map jittered latents back onto the dynamics manifold, which improves
+    closed-loop stability where rollout error accumulates.  When h_noise_scale
+    (per-dim std of the data) is given, h_noise_std is a multiplier on each
+    dimension's spread; otherwise it is an absolute std applied uniformly.
     """
     dyn_model.train()
     total_dynamics = total_tf = total_cl = total_logdet_reg = 0.0
@@ -350,7 +360,16 @@ def _train_epoch_phase2(
         T_full = actions.shape[1]     # = T_seq - 1
 
         # --- Encode the full sequence through phi in one batched call ---
-        h_flat = h_all.reshape(B_size * T_seq, D)
+        # Augmentation: jitter the inputs to phi but keep h_all (the targets)
+        # clean, so the model learns to denoise toward the dynamics manifold.
+        # h_noise_scale (per-dim std) makes the std relative to each dimension's
+        # spread; without it the std is absolute and uniform across dims.
+        if h_noise_std > 0:
+            std = h_noise_std if h_noise_scale is None else h_noise_std * h_noise_scale
+            h_in = h_all + torch.randn_like(h_all) * std
+        else:
+            h_in = h_all
+        h_flat = h_in.reshape(B_size * T_seq, D)
         s_flat, log_det_flat = dyn_model.phi.forward_with_logdet(h_flat)
         q_all = s_flat[:, :q_dim].reshape(B_size, T_seq, q_dim)  # (B, T+1, q_dim)
         p_all = s_flat[:, q_dim:].reshape(B_size, T_seq, q_dim)
@@ -865,6 +884,10 @@ def phase1_cmd(**kwargs):
               help="Frobenius norm penalty on J and R (Phase 2, learn-structure only); prevents structural matrices from growing unbounded")
 @click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
               help="Weight on teacher-forced 1-step loss (set 0 to disable)")
+@click.option("--h-noise-std", type=float, default=0.0, show_default=True,
+              help="Zero-mean Gaussian noise added to h inputs (augmentation; targets "
+                   "stay clean), as a multiplier on each h-dim's spread across the cache. "
+                   "e.g. 0.05 = 5% of each dim's std. 0 disables.")
 @click.option("--max-seed-k", type=int, default=0, show_default=True,
               help="Max closed-loop seed timestep (0 = always start from h_1); "
                    "randomises seed in [1, max-seed-k] to match varying encoder context lengths")
@@ -967,6 +990,16 @@ def phase2_cmd(**kwargs):
     latent_dim = cache[0][0].shape[-1]
     print(f"Latent dim from cache: {latent_dim}")
 
+    # Per-dim std of h across the whole cache — used to scale augmentation noise
+    # so --h-noise-std acts as a multiplier on each dimension's spread.
+    h_noise_scale = None
+    if kwargs["h_noise_std"] > 0:
+        h_noise_scale = torch.cat([h for h, _ in cache], dim=0).std(dim=0).to(device)
+        print(
+            f"h noise: std={kwargs['h_noise_std']} × per-dim spread "
+            f"(mean dim std={h_noise_scale.mean().item():.4f})"
+        )
+
     latent_dataset = LatentDataset(cache)
     latent_loader = DataLoader(
         latent_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
@@ -1030,6 +1063,8 @@ def phase2_cmd(**kwargs):
             max_seed_k=kwargs["max_seed_k"],
             teacher_force_weight=kwargs["teacher_force_weight"],
             structural_reg_weight=kwargs["structural_reg_weight"],
+            h_noise_std=kwargs["h_noise_std"],
+            h_noise_scale=h_noise_scale,
         )
 
         alpha = kwargs["ema_alpha"]

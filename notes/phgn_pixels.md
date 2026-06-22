@@ -76,13 +76,17 @@ Both objectives share one $\Phi$ forward pass over the full sequence:
 
 **Teacher-forced** — one RK4 step from every $h_t$, batched:
 
-$$\mathcal{L}_\text{tf} = \text{MSE}\!\left(\Phi^{-1}\!\left(\text{RK4}(\Phi(h_t), u_t)\right),\; h_{t+1}\right)$$
+$$L_{tf} = | \Phi^{-1}(f(h_t, u_t)) - h_{t+1} |^2$$
 
-**Closed-loop** — autonomous rollout from seed $h_k$ for $\ell$ steps:
+**Closed-loop** -- autonomous rollout from seed $h_k$ for $L$ steps:
 
-$$\mathcal{L}_\text{cl} = \frac{1}{\ell}\sum_{i=1}^{\ell}\text{MSE}\!\left(\Phi^{-1}\!\left(\text{RK4}^i(\Phi(h_k), u)\right),\; h_{k+i}\right)$$
+$$L_{cl} = \frac{1}{L}\sum_{i} | \hat{h}_{k+i} - h_{k+i} |^2$$
 
-* $\ell$ starts small and advances via a **performance-gated curriculum**: only grow once $\mathcal{L}_\text{cl}$ is sufficiently low
+$$\hat{h}_{k+i} = \Phi^{-1}(f^i(\Phi(h_k), u))$$
+
+where $f$ denotes one RK4 step in phase space
+
+* $L$ starts small and advances via a **performance-gated curriculum**: only grow once $L_{cl}$ is sufficiently low
 
 ## Learned Structure: Split Learning Rates
 
@@ -91,17 +95,17 @@ $J$, $R$, $B$, $\mathcal{H}$, and $\Phi$ are all learned jointly, but with two s
 * $\mathcal{H}$ and $\Phi$ use a small LR (e.g. $10^{-4}$)
 * $J$, $R$, $B$ use a much larger LR (e.g. $10^{-2}$)
 
-**Why:** structural matrices are initialized near zero, so their gradient signal is negligible early in training — $\nabla\mathcal{H}$ is small, so $(J-R)\nabla\mathcal{H} \approx 0$ regardless of $J$ and $R$. Without a higher LR they never escape this regime and the dynamics reduce to $\dot{z} \approx Bu$.
+**Why:** structural matrices are initialized near zero, so their gradient signal is negligible early in training — $\nabla H$ is small, so $(J-R)\nabla H \simeq 0$ regardless of $J$ and $R$. Without a higher LR they never escape this regime and the dynamics reduce to $\dot{z} \simeq Bu$.
 
 ## Learned Structure: Frobenius Regularization
 
-$$\mathcal{L}_\text{struct} = \lambda_s \left(\|J\|_F^2 + \|R\|_F^2\right)$$
+$$L_{struct} = \lambda_s (\|J\|_F^2 + \|R\|_F^2)$$
 
 **Why:** without regularization, $J$ and $R$ grow to large values over long training runs. Large structural matrices amplify $\nabla\mathcal{H}$ in the dynamics step, producing large and chaotic phase-space trajectories on held-out data. The regularizer penalizes the optimizer for finding solutions that rely on extreme matrix values.
 
 ## Learned Structure: Logdet Regularizer
 
-$$\mathcal{L}_\text{logdet} = \lambda_\Phi \cdot \mathbb{E}\!\left[(\log|\det J_\Phi|)^2\right]$$
+$$L_{logdet} = \lambda_\Phi \cdot E[(\log|\det J_\Phi|)^2]$$
 
 **Why:** a normalizing flow can in principle collapse the entire latent space to a small region (large negative log-det) or expand it without bound (large positive log-det). Either pathology makes the inverse $\Phi^{-1}$ poorly conditioned. Penalizing the squared log-determinant keeps $\Phi$ near-volume-preserving, which stabilizes both the forward and inverse passes.
 
@@ -124,7 +128,7 @@ Given a short context of frames:
 
 ## Current Issue: Overfitting
 
-* Training losses (both $\mathcal{L}_\text{tf}$ and $\mathcal{L}_\text{cl}$) converge well
+* Training losses (both $L_{tf}$ and $L_{cl}$) converge well
 * Held-out dreamed rollouts look chaotic — dynamics don't generalize
 * Structural matrices ($J$, $R$) grow large and produce high-variance gradients in the dynamics step
 * Added Frobenius regularization on $J, R$ as a first fix; added train/val loss logging to confirm the gap

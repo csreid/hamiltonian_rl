@@ -19,7 +19,6 @@
       margin: 0 0.8em 0.2em -1.6em;
       vertical-align: middle;
     }
-    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
   </style>
 <style>
   html, .view body { background-color: black; counter-reset: slideidx; }
@@ -153,6 +152,9 @@
     background: #AAA;
   }
 </style>
+  <script
+  src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"
+  type="text/javascript"></script>
   <style>
     section {
       font-size: 16px;
@@ -211,18 +213,16 @@ interpretable <em>and</em> sample-efficient</li>
 <section id="port-hamiltonian-systems" class="slide level2">
 <h2>Port-Hamiltonian Systems</h2>
 <p>A port-Hamiltonian system evolves as:</p>
-<p><span
-class="math display"><em>ż</em> = (<em>J</em>−<em>R</em>)∇ℋ(<em>z</em>) + <em>B</em><em>u</em></span></p>
+<p><span class="math display">\[\dot{z} = (J - R)\nabla\mathcal{H}(z) +
+Bu\]</span></p>
 <ul>
-<li><span class="math inline"><em>J</em></span> — symplectic
-(energy-routing) matrix: <span
-class="math inline"><em>J</em> =  − <em>J</em><sup>⊤</sup></span></li>
-<li><span class="math inline"><em>R</em></span> — dissipation matrix:
-<span
-class="math inline"><em>R</em> = <em>R</em><sup>⊤</sup> ≽ 0</span></li>
-<li><span class="math inline">ℋ</span> — Hamiltonian (total energy)</li>
-<li><span class="math inline"><em>B</em></span> — control input
-matrix</li>
+<li><span class="math inline">\(J\)</span> — symplectic (energy-routing)
+matrix: <span class="math inline">\(J = -J^\top\)</span></li>
+<li><span class="math inline">\(R\)</span> — dissipation matrix: <span
+class="math inline">\(R = R^\top \succeq 0\)</span></li>
+<li><span class="math inline">\(\mathcal{H}\)</span> — Hamiltonian
+(total energy)</li>
+<li><span class="math inline">\(B\)</span> — control input matrix</li>
 </ul>
 <p>Encodes energy conservation, dissipation, and controllability in the
 <em>structure</em> of the ODE</p>
@@ -231,7 +231,7 @@ matrix</li>
 <h2>Why From Pixels?</h2>
 <ul>
 <li>Prior work (port-Hamiltonian Neural ODEs) assumes direct access to
-<span class="math inline">(<em>q</em>,<em>p</em>)</span></li>
+<span class="math inline">\((q, p)\)</span></li>
 <li>In practice, sensors give images, not joint angles and momenta</li>
 <li><strong>Challenge:</strong> discover a phase space <em>and</em>
 port-Hamiltonian structure from image sequences</li>
@@ -247,42 +247,35 @@ port-Hamiltonian structure from image sequences</li>
 <p>Two-phase training pipeline:</p>
 <ol type="1">
 <li><strong>Phase 1</strong> — learn a compact latent representation
-<span class="math inline"><em>h</em><sub><em>t</em></sub></span> from
-image sequences (recurrent autoencoder)</li>
+<span class="math inline">\(h_t\)</span> from image sequences (recurrent
+autoencoder)</li>
 <li><strong>Phase 2</strong> — learn a normalizing flow <span
-class="math inline"><em>Φ</em> : <em>h</em> → (<em>q</em>,<em>p</em>)</span>
-such that Hamiltonian dynamics hold in <span
-class="math inline">(<em>q</em>,<em>p</em>)</span> space</li>
+class="math inline">\(\Phi: h \to (q, p)\)</span> such that Hamiltonian
+dynamics hold in <span class="math inline">\((q, p)\)</span> space</li>
 </ol>
 <p>Inference: encode a few context frames <span
-class="math inline">→</span> map to phase space <span
-class="math inline">→</span> roll out dynamics <span
-class="math inline">→</span> invert back to pixels</p>
+class="math inline">\(\to\)</span> map to phase space <span
+class="math inline">\(\to\)</span> roll out dynamics <span
+class="math inline">\(\to\)</span> invert back to pixels</p>
 </section>
 <section id="phase-1-recurrent-autoencoder" class="slide level2">
 <h2>Phase 1: Recurrent Autoencoder</h2>
 <ul>
-<li>Causal LSTM over frame sequence <span
-class="math inline"><em>x</em><sub>0</sub>, …, <em>x</em><sub><em>T</em></sub></span>
-produces hidden state <span
-class="math inline"><em>h</em><sub><em>t</em></sub></span> at each
-step</li>
-<li><span class="math inline"><em>h</em><sub><em>t</em></sub></span> is
-projected to a latent <span
-class="math inline">(<em>q</em>,<em>p</em>)</span> pair via a learned
-MLP <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub></span></li>
+<li>Causal LSTM over frame sequence <span class="math inline">\(x_0,
+\dots, x_T\)</span> produces hidden state <span
+class="math inline">\(h_t\)</span> at each step</li>
+<li><span class="math inline">\(h_t\)</span> is projected to a latent
+<span class="math inline">\((q, p)\)</span> pair via a learned MLP <span
+class="math inline">\(f_\psi\)</span></li>
 <li>Trained on two pixel-space objectives:
 <ul>
 <li><strong>Reconstruction:</strong> decode <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub>(<em>h</em><sub><em>t</em></sub>)</span>
-back to <span
-class="math inline"><em>x</em><sub><em>t</em></sub></span></li>
+class="math inline">\(f_\psi(h_t)\)</span> back to <span
+class="math inline">\(x_t\)</span></li>
 <li><strong>Next-frame prediction:</strong> decode <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub>(<em>h</em><sub><em>t</em></sub>)</span>
-to <span class="math inline"><em>x</em><sub><em>t</em> + 1</sub></span>
-given action <span
-class="math inline"><em>u</em><sub><em>t</em></sub></span></li>
+class="math inline">\(f_\psi(h_t)\)</span> to <span
+class="math inline">\(x_{t+1}\)</span> given action <span
+class="math inline">\(u_t\)</span></li>
 </ul></li>
 <li>Also includes a KL regularizer (VAE-style) and a temporal metric
 regularizer</li>
@@ -291,134 +284,132 @@ regularizer</li>
 <section id="phase-1-temporal-metric-regularizer" class="slide level2">
 <h2>Phase 1: Temporal Metric Regularizer</h2>
 <ul>
-<li>Problem: <span
-class="math inline"><em>h</em><sub><em>t</em></sub></span>
-representations could be arbitrarily permuted in latent space</li>
-<li>Fix: penalize pairs <span
-class="math inline">(<em>h</em><sub><em>t</em><sub>1</sub></sub>,<em>h</em><sub><em>t</em><sub>2</sub></sub>)</span>
-that are <em>closer</em> in <span
-class="math inline"><em>h</em></span>-space than expected from <span
-class="math inline">|<em>t</em><sub>1</sub>−<em>t</em><sub>2</sub>|</span></li>
-<li>Forces <span
-class="math inline"><em>h</em><sub><em>t</em></sub></span> to be
-temporally ordered in latent space — smoother manifold for Phase 2</li>
+<li>Problem: <span class="math inline">\(h_t\)</span> representations
+could be arbitrarily permuted in latent space</li>
+<li>Fix: penalize pairs <span class="math inline">\((h_{t_1},
+h_{t_2})\)</span> that are <em>closer</em> in <span
+class="math inline">\(h\)</span>-space than expected from <span
+class="math inline">\(|t_1 - t_2|\)</span></li>
+<li>Forces <span class="math inline">\(h_t\)</span> to be temporally
+ordered in latent space — smoother manifold for Phase 2</li>
 </ul>
 </section>
 <section id="phase-2-why-a-normalizing-flow" class="slide level2">
 <h2>Phase 2: Why a Normalizing Flow?</h2>
-<p><span class="math inline"><em>h</em><sub><em>t</em></sub></span>
-already encodes the phase space implicitly:</p>
+<p><span class="math inline">\(h_t\)</span> already encodes the phase
+space implicitly:</p>
 <ul>
-<li>Reconstructing <span
-class="math inline"><em>x</em><sub><em>t</em></sub></span> requires
-position information (<span class="math inline"><em>q</em></span>)</li>
-<li>Predicting <span
-class="math inline"><em>x</em><sub><em>t</em> + 1</sub></span> requires
-velocity information (<span class="math inline"><em>p</em></span>)</li>
+<li>Reconstructing <span class="math inline">\(x_t\)</span> requires
+position information (<span class="math inline">\(q\)</span>)</li>
+<li>Predicting <span class="math inline">\(x_{t+1}\)</span> requires
+velocity information (<span class="math inline">\(p\)</span>)</li>
 </ul>
 <p>But this implicit phase space has no reason to respect
 port-Hamiltonian structure — it’s just whatever the LSTM found
 convenient.</p>
 <p><strong>Fix:</strong> learn a normalizing flow <span
-class="math inline"><em>Φ</em> : <em>h</em> → (<em>q</em>,<em>p</em>)</span></p>
+class="math inline">\(\Phi: h \to (q, p)\)</span></p>
 <ul>
 <li>A lossless change of coordinates from the LSTM’s arbitrary phase
 space to one that is <em>induced</em> to follow port-Hamiltonian
 dynamics</li>
-<li>Invertible by construction: <span
-class="math inline"><em>Φ</em><sup>−1</sup>(<em>q</em>,<em>p</em>) = <em>h</em></span>
-lets us decode back to pixels through the Phase 1 network</li>
+<li>Invertible by construction: <span class="math inline">\(\Phi^{-1}(q,
+p) = h\)</span> lets us decode back to pixels through the Phase 1
+network</li>
 </ul>
 </section>
 <section id="phase-2-training-objectives" class="slide level2">
 <h2>Phase 2: Training Objectives</h2>
-<p>Both objectives share one <span class="math inline"><em>Φ</em></span>
+<p>Both objectives share one <span class="math inline">\(\Phi\)</span>
 forward pass over the full sequence:</p>
 <p><strong>Teacher-forced</strong> — one RK4 step from every <span
-class="math inline"><em>h</em><sub><em>t</em></sub></span>, batched:</p>
-<p><span
-class="math display">ℒ<sub>tf</sub> = MSE (<em>Φ</em><sup>−1</sup> (RK4(<em>Φ</em>(<em>h</em><sub><em>t</em></sub>),<em>u</em><sub><em>t</em></sub>)), <em>h</em><sub><em>t</em> + 1</sub>)</span></p>
-<p><strong>Closed-loop</strong> — autonomous rollout from seed <span
-class="math inline"><em>h</em><sub><em>k</em></sub></span> for <span
-class="math inline">ℓ</span> steps:</p>
-<p><span class="math display">$$\mathcal{L}_\text{cl} =
-\frac{1}{\ell}\sum_{i=1}^{\ell}\text{MSE}\!\left(\Phi^{-1}\!\left(\text{RK4}^i(\Phi(h_k),
-u)\right),\; h_{k+i}\right)$$</span></p>
+class="math inline">\(h_t\)</span>, batched:</p>
+<p><span class="math display">\[L_{tf} = | \Phi^{-1}(f(h_t, u_t)) -
+h_{t+1} |^2\]</span></p>
+<p><strong>Closed-loop</strong> – autonomous rollout from seed <span
+class="math inline">\(h_k\)</span> for <span
+class="math inline">\(L\)</span> steps:</p>
+<p><span class="math display">\[L_{cl} = \frac{1}{L}\sum_{i} |
+\hat{h}_{k+i} - h_{k+i} |^2\]</span></p>
+<p><span class="math display">\[\hat{h}_{k+i} = \Phi^{-1}(f^i(\Phi(h_k),
+u))\]</span></p>
+<p>where <span class="math inline">\(f\)</span> denotes one RK4 step in
+phase space</p>
 <ul>
-<li><span class="math inline">ℓ</span> starts small and advances via a
-<strong>performance-gated curriculum</strong>: only grow once <span
-class="math inline">ℒ<sub>cl</sub></span> is sufficiently low</li>
+<li><span class="math inline">\(L\)</span> starts small and advances via
+a <strong>performance-gated curriculum</strong>: only grow once <span
+class="math inline">\(L_{cl}\)</span> is sufficiently low</li>
 </ul>
 </section>
 <section id="learned-structure-split-learning-rates"
 class="slide level2">
 <h2>Learned Structure: Split Learning Rates</h2>
-<p><span class="math inline"><em>J</em></span>, <span
-class="math inline"><em>R</em></span>, <span
-class="math inline"><em>B</em></span>, <span
-class="math inline">ℋ</span>, and <span
-class="math inline"><em>Φ</em></span> are all learned jointly, but with
+<p><span class="math inline">\(J\)</span>, <span
+class="math inline">\(R\)</span>, <span
+class="math inline">\(B\)</span>, <span
+class="math inline">\(\mathcal{H}\)</span>, and <span
+class="math inline">\(\Phi\)</span> are all learned jointly, but with
 two separate learning rates:</p>
 <ul>
-<li><span class="math inline">ℋ</span> and <span
-class="math inline"><em>Φ</em></span> use a small LR (e.g. <span
-class="math inline">10<sup>−4</sup></span>)</li>
-<li><span class="math inline"><em>J</em></span>, <span
-class="math inline"><em>R</em></span>, <span
-class="math inline"><em>B</em></span> use a much larger LR (e.g. <span
-class="math inline">10<sup>−2</sup></span>)</li>
+<li><span class="math inline">\(\mathcal{H}\)</span> and <span
+class="math inline">\(\Phi\)</span> use a small LR (e.g. <span
+class="math inline">\(10^{-4}\)</span>)</li>
+<li><span class="math inline">\(J\)</span>, <span
+class="math inline">\(R\)</span>, <span class="math inline">\(B\)</span>
+use a much larger LR (e.g. <span
+class="math inline">\(10^{-2}\)</span>)</li>
 </ul>
 <p><strong>Why:</strong> structural matrices are initialized near zero,
 so their gradient signal is negligible early in training — <span
-class="math inline">∇ℋ</span> is small, so <span
-class="math inline">(<em>J</em>−<em>R</em>)∇ℋ ≈ 0</span> regardless of
-<span class="math inline"><em>J</em></span> and <span
-class="math inline"><em>R</em></span>. Without a higher LR they never
-escape this regime and the dynamics reduce to <span
-class="math inline"><em>ż</em> ≈ <em>B</em><em>u</em></span>.</p>
+class="math inline">\(\nabla H\)</span> is small, so <span
+class="math inline">\((J-R)\nabla H \simeq 0\)</span> regardless of
+<span class="math inline">\(J\)</span> and <span
+class="math inline">\(R\)</span>. Without a higher LR they never escape
+this regime and the dynamics reduce to <span
+class="math inline">\(\dot{z} \simeq Bu\)</span>.</p>
 </section>
 <section id="learned-structure-frobenius-regularization"
 class="slide level2">
 <h2>Learned Structure: Frobenius Regularization</h2>
-<p><span
-class="math display">ℒ<sub>struct</sub> = <em>λ</em><sub><em>s</em></sub>(∥<em>J</em>∥<sub><em>F</em></sub><sup>2</sup>+∥<em>R</em>∥<sub><em>F</em></sub><sup>2</sup>)</span></p>
+<p><span class="math display">\[L_{struct} = \lambda_s (\|J\|_F^2 +
+\|R\|_F^2)\]</span></p>
 <p><strong>Why:</strong> without regularization, <span
-class="math inline"><em>J</em></span> and <span
-class="math inline"><em>R</em></span> grow to large values over long
-training runs. Large structural matrices amplify <span
-class="math inline">∇ℋ</span> in the dynamics step, producing large and
-chaotic phase-space trajectories on held-out data. The regularizer
-penalizes the optimizer for finding solutions that rely on extreme
-matrix values.</p>
+class="math inline">\(J\)</span> and <span
+class="math inline">\(R\)</span> grow to large values over long training
+runs. Large structural matrices amplify <span
+class="math inline">\(\nabla\mathcal{H}\)</span> in the dynamics step,
+producing large and chaotic phase-space trajectories on held-out data.
+The regularizer penalizes the optimizer for finding solutions that rely
+on extreme matrix values.</p>
 </section>
 <section id="learned-structure-logdet-regularizer" class="slide level2">
 <h2>Learned Structure: Logdet Regularizer</h2>
-<p><span
-class="math display">ℒ<sub>logdet</sub> = <em>λ</em><sub><em>Φ</em></sub> ⋅ 𝔼 [(log|det<em>J</em><sub><em>Φ</em></sub>|)<sup>2</sup>]</span></p>
+<p><span class="math display">\[L_{logdet} = \lambda_\Phi \cdot
+E[(\log|\det J_\Phi|)^2]\]</span></p>
 <p><strong>Why:</strong> a normalizing flow can in principle collapse
 the entire latent space to a small region (large negative log-det) or
 expand it without bound (large positive log-det). Either pathology makes
-the inverse <span class="math inline"><em>Φ</em><sup>−1</sup></span>
-poorly conditioned. Penalizing the squared log-determinant keeps <span
-class="math inline"><em>Φ</em></span> near-volume-preserving, which
+the inverse <span class="math inline">\(\Phi^{-1}\)</span> poorly
+conditioned. Penalizing the squared log-determinant keeps <span
+class="math inline">\(\Phi\)</span> near-volume-preserving, which
 stabilizes both the forward and inverse passes.</p>
 </section>
 <section id="inference" class="slide level2">
 <h2>Inference</h2>
 <p>Given a short context of frames:</p>
 <ol type="1">
-<li>Encode context with Phase 1 LSTM: <span
-class="math inline"><em>h</em><sub>0</sub>, …, <em>h</em><sub><em>k</em></sub></span></li>
-<li>Map to phase space: <span
-class="math inline">(<em>q</em><sub><em>k</em></sub>,<em>p</em><sub><em>k</em></sub>) = <em>Φ</em>(<em>h</em><sub><em>k</em></sub>)</span></li>
+<li>Encode context with Phase 1 LSTM: <span class="math inline">\(h_0,
+\dots, h_{k}\)</span></li>
+<li>Map to phase space: <span class="math inline">\((q_k, p_k) =
+\Phi(h_k)\)</span></li>
 <li>Roll out port-Hamiltonian dynamics for <span
-class="math inline"><em>T</em></span> steps: <span
-class="math inline">(<em>q</em><sub><em>k</em></sub>,<em>p</em><sub><em>k</em></sub>) → ⋯ → (<em>q</em><sub><em>k</em> + <em>T</em></sub>,<em>p</em><sub><em>k</em> + <em>T</em></sub>)</span></li>
-<li>Invert back: <span
-class="math inline"><em>h</em><sub><em>k</em> + <em>i</em></sub> = <em>Φ</em><sup>−1</sup>(<em>q</em><sub><em>k</em> + <em>i</em></sub>,<em>p</em><sub><em>k</em> + <em>i</em></sub>)</span></li>
+class="math inline">\(T\)</span> steps: <span
+class="math inline">\((q_k, p_k) \to \cdots \to (q_{k+T},
+p_{k+T})\)</span></li>
+<li>Invert back: <span class="math inline">\(h_{k+i} =
+\Phi^{-1}(q_{k+i}, p_{k+i})\)</span></li>
 <li>Decode to pixels via Phase 1 <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub></span> and
-decoder</li>
+class="math inline">\(f_\psi\)</span> and decoder</li>
 </ol>
 </section>
 
@@ -437,24 +428,23 @@ predictions</li>
 <section id="current-issue-overfitting" class="slide level2">
 <h2>Current Issue: Overfitting</h2>
 <ul>
-<li>Training losses (both <span
-class="math inline">ℒ<sub>tf</sub></span> and <span
-class="math inline">ℒ<sub>cl</sub></span>) converge well</li>
+<li>Training losses (both <span class="math inline">\(L_{tf}\)</span>
+and <span class="math inline">\(L_{cl}\)</span>) converge well</li>
 <li>Held-out dreamed rollouts look chaotic — dynamics don’t
 generalize</li>
-<li>Structural matrices (<span class="math inline"><em>J</em></span>,
-<span class="math inline"><em>R</em></span>) grow large and produce
-high-variance gradients in the dynamics step</li>
-<li>Added Frobenius regularization on <span
-class="math inline"><em>J</em>, <em>R</em></span> as a first fix; added
-train/val loss logging to confirm the gap</li>
+<li>Structural matrices (<span class="math inline">\(J\)</span>, <span
+class="math inline">\(R\)</span>) grow large and produce high-variance
+gradients in the dynamics step</li>
+<li>Added Frobenius regularization on <span class="math inline">\(J,
+R\)</span> as a first fix; added train/val loss logging to confirm the
+gap</li>
 <li>Structural matrices don’t look right: with dissipation set to zero
-in data collection, <span class="math inline"><em>R</em></span> should
+in data collection, <span class="math inline">\(R\)</span> should
 converge to zero, but instead persistently develops one large eigenvalue
 concentrated at a single latent dimension; <span
-class="math inline"><em>J</em></span> develops correspondingly large
-entries at the same coordinates, possibly attempting to cancel the
-spurious dissipation</li>
+class="math inline">\(J\)</span> develops correspondingly large entries
+at the same coordinates, possibly attempting to cancel the spurious
+dissipation</li>
 </ul>
 </section>
 <section id="next-steps" class="slide level2">
@@ -464,8 +454,7 @@ spurious dissipation</li>
 <li>Investigate root cause:
 <ul>
 <li>Phase 2 overfitting to the cached <span
-class="math inline"><em>h</em><sub><em>t</em></sub></span>
-representations?</li>
+class="math inline">\(h_t\)</span> representations?</li>
 </ul></li>
 </ul>
 </section>
