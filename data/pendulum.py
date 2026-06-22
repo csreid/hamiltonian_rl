@@ -53,6 +53,11 @@ class PendulumPixelEnv(gym.Wrapper):
         )
 
     def _obs(self) -> np.ndarray:
+        # Suppress gym's torque-arrow overlay: its direction/magnitude encodes
+        # the applied action, so a faithful autoencoder would bake the action
+        # into the latent h.  We want h to be pure physical state, with the
+        # action entering the Phase-2 dynamics only through the B matrix.
+        self.env.unwrapped.last_u = None  # type: ignore[union-attr]
         frame = self.env.render()  # (H, W, 3) uint8
         t = preprocess_frame(frame, self.img_size)
         return (t * 255).byte().numpy()

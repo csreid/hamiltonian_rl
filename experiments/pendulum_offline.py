@@ -465,8 +465,15 @@ def _eval_loss_phase2(
     dyn_model: HamiltonianFlowModel,
     val_trajs: list,
     device: torch.device,
-    seq_len: int,
 ) -> dict[str, float]:
+    """Validation losses for the dynamics model.
+
+    The closed-loop loss is evaluated over the *full* available horizon
+    (T_full - 1 steps) regardless of the training seq_len curriculum, so the
+    metric is comparable across epochs.  If it tracked the curriculum length
+    instead, every seq_len bump would lengthen the rollout and inject a
+    spurious step-wise increase into the curve.
+    """
     phase1_model.eval()
     dyn_model.eval()
     total_teacher_forced = total_closed_loop = 0.0
@@ -493,7 +500,7 @@ def _eval_loss_phase2(
         h_teacher_target = h_all[:, 1:].reshape(B * T_full, D)
         total_teacher_forced += F.mse_loss(h_teacher_pred, h_teacher_target).item()
 
-        n_rollout_steps = min(seq_len, T_full - 1)
+        n_rollout_steps = T_full - 1
         q, p = q_all[:, 1], p_all[:, 1]
         closed_loop_sum = 0.0
         for t in range(n_rollout_steps):
@@ -1136,7 +1143,6 @@ def phase2_cmd(**kwargs):
                             dyn_model=dyn_model,
                             val_trajs=val_trajs,
                             device=device,
-                            seq_len=seq_len,
                         )
                         for k, v in val_loss_metrics.items():
                             writer.add_scalar(f"{k}/{label}", v, epoch)
