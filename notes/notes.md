@@ -220,3 +220,18 @@ One large eigenvalue, 15 near zero — model correctly concentrates dissipation 
 * A normalizing flow is invertible by construction, so all information in $h$ survives the mapping to $(q, p)$
 * Crucially: the flow goes both ways --- we can map $h \to (q, p)$ for Hamiltonian rollouts *and* map $(q, p) \to h$ to feed back into the decoder
 * This should close the loop: Hamiltonian dynamics operate in a coherent phase space, and we can always invert back to the LSTM's representation for decoding
+
+# 6/22
+
+## Closed-Loop Val Loss Steps Up
+
+* TF val loss drops but closed-loop val loss steps **up** every so often
+* Artifact: val rolled out `seq_len` steps, and the curriculum keeps growing `seq_len` --- each bump adds a harder far-horizon step
+* Fix: eval closed-loop over the **full horizon**, independent of the curriculum
+
+## Action Leaks Into $h$
+
+* Cause: `Pendulum-v1` renders the torque as an arrow, so the autoencoder notes the action in $h$, but the action should only enter via $B$
+* Pollutes the dynamics: $\mathcal{H}$ ends up modeling apparent "intrinsic" forces that are really just actions
+* Fix: don't render the action
+* Currently running

@@ -268,8 +268,10 @@ class NormalizingFlow(nn.Module):
 class MLPHamiltonianNet(nn.Module):
     """H(q, p) implemented as an MLP.
 
-    Separable mode: H = T(q, p) + V(q), matching the physical structure
-    where kinetic energy depends on both q and p but potential only on q.
+    Separable mode: H = T(p) + V(q), matching the physical structure where
+    kinetic energy depends only on momentum and potential only on position.
+    This true separability is what makes an explicit symplectic (leapfrog)
+    step possible: ∂H/∂p depends only on p and ∂H/∂q only on q.
 
     Args:
         latent_dim: total phase-space dimension (q_dim = p_dim = latent_dim // 2)
@@ -283,7 +285,7 @@ class MLPHamiltonianNet(nn.Module):
 
         if separable:
             self.kinetic = nn.Sequential(
-                nn.Linear(latent_dim, 256),
+                nn.Linear(q_dim, 256),
                 nn.Softplus(),
                 nn.Linear(256, 256),
                 nn.Softplus(),
@@ -307,7 +309,7 @@ class MLPHamiltonianNet(nn.Module):
 
     def forward(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         if self.separable:
-            T = self.kinetic(torch.cat([q, p], dim=-1)).squeeze(-1)
+            T = self.kinetic(p).squeeze(-1)
             V = self.potential(q).squeeze(-1)
             return T + V
         return self.net(torch.cat([q, p], dim=-1)).squeeze(-1)
@@ -750,39 +752,54 @@ class HamiltonianFlowModel(nn.Module):
         learn_structure: bool = True,
         dt: float = 0.05,
         damping: float = 0.0,
+        integrator: str = "rk4",
     ):
         super().__init__()
+        if integrator not in ("rk4", "leapfrog"):
+            raise ValueError(f"integrator must be 'rk4' or 'leapfrog', got {integrator!r}")
+        if integrator == "leapfrog" and not separable:
+            raise ValueError(
+                "leapfrog requires a separable Hamiltonian H = T(p) + V(q); "
+                "pass separable=True or use integrator='rk4'."
+            )
         self.latent_dim = latent_dim
         self.dt = dt
         self.learn_structure = learn_structure
+        self.separable = separable
+        self.integrator = integrator
         q_dim = latent_dim // 2
 
         self.phi = NormalizingFlow(latent_dim)
         self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
 
+        # J is ALWAYS the canonical symplectic structure [[0, I], [-I, 0]].
+        # A learned constant J buys nothing over canonical here: the change of
+        # variables p' = C^-T p turns any block coupling C into canonical while
+        # keeping H separable, so C is absorbed by the kinetic net's first layer
+        # (and by phi).  Fixing J keeps leapfrog trivially valid and symplectic.
+        J_fixed = torch.zeros(latent_dim, latent_dim)
+        J_fixed[:q_dim, q_dim:] = torch.eye(q_dim)
+        J_fixed[q_dim:, :q_dim] = -torch.eye(q_dim)
+        self.register_buffer("J_fixed", J_fixed)
+
         if learn_structure:
-            self.A = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+            # Only dissipation R = LL^T and control B are learned now.
             self.L_param = nn.Parameter(torch.zeros(latent_dim, latent_dim))
-            nn.init.normal_(self.A, std=1e-2)
             nn.init.normal_(self.L_param, std=1e-2)
             self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
             nn.init.normal_(self.B, std=1e-2)
+            self._has_dissipation = True
         else:
-            J_fixed = torch.zeros(latent_dim, latent_dim)
-            J_fixed[:q_dim, q_dim:] = torch.eye(q_dim)
-            J_fixed[q_dim:, :q_dim] = -torch.eye(q_dim)
-            self.register_buffer("J_fixed", J_fixed)
             R_fixed = torch.zeros(latent_dim, latent_dim)
             R_fixed[q_dim:, q_dim:] = damping * torch.eye(q_dim)
             self.register_buffer("R_fixed", R_fixed)
             self.register_buffer("B_fixed", torch.ones(q_dim, control_dim))
+            self._has_dissipation = damping > 0
 
     # ── Structure matrix accessors ──────────────────────────────────────────
 
     def get_J(self) -> torch.Tensor:
-        if not self.learn_structure:
-            return self.J_fixed
-        return self.A - self.A.T
+        return self.J_fixed
 
     def get_L(self) -> torch.Tensor:
         L_lower = self.L_param.tril(-1)
@@ -839,9 +856,23 @@ class HamiltonianFlowModel(nn.Module):
         u: torch.Tensor,
         dt: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One RK4 step of dz/dt = (J − R) ∇H + B u."""
+        """One integration step of dz/dt = (J − R) ∇H + B u.
+
+        Dispatches on self.integrator: 'rk4' (classic 4-stage, works for any
+        structure) or 'leapfrog' (Strang split — symplectic Störmer-Verlet on
+        the conservative + control part, with the dissipative R substep folded
+        symmetrically around it; requires canonical J and separable H).
+        """
         if dt is None:
             dt = self.dt
+        if self.integrator == "leapfrog":
+            return self._leapfrog_step(q, p, u, dt)
+        return self._rk4_step(q, p, u, dt)
+
+    def _rk4_step(
+        self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Classic 4-stage explicit RK4 on the full field (J − R)∇H + Bu."""
         M = self.get_J_minus_R()
         dq1, dp1 = self._controlled_dynamics(q, p, u, M)
         dq2, dp2 = self._controlled_dynamics(q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u, M)
@@ -850,6 +881,55 @@ class HamiltonianFlowModel(nn.Module):
         q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
         p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
         return q_next, p_next
+
+    def _grad_H(
+        self, q: torch.Tensor, p: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(∂H/∂q, ∂H/∂p) at (q, p). Keeps the graph for backprop through steps.
+
+        With separable H = T(p) + V(q), ∂H/∂q = ∇V(q) and ∂H/∂p = ∇T(p), so the
+        returned halves are exactly the per-coordinate forces leapfrog needs.
+        """
+        half = self.latent_dim // 2
+        z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
+        H_val = self.hamiltonian(z_[:, :half], z_[:, half:]).sum()
+        g = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
+        return g[:, :half], g[:, half:]
+
+    def _dissipation_substep(
+        self, q: torch.Tensor, p: torch.Tensor, tau: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Explicit-Euler substep of the dissipative flow ż = −R ∇H over time tau."""
+        half = self.latent_dim // 2
+        gq, gp = self._grad_H(q, p)
+        RgH = torch.cat([gq, gp], dim=-1) @ self.get_R().T
+        return q - tau * RgH[:, :half], p - tau * RgH[:, half:]
+
+    def _leapfrog_step(
+        self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Strang split: D(dt/2) ∘ Leapfrog(dt) ∘ D(dt/2).
+
+        The symplectic core is canonical kick-drift-kick on ż = J∇H, with the
+        constant control force Bu folded into the two half-kicks (exact ZOH).
+        The dissipative flow ż = −R∇H is Strang-split symmetrically around it so
+        the composite stays 2nd-order and reduces to pure symplectic leapfrog
+        when R = 0.
+        """
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, dt / 2)
+
+        Bu = u @ self.get_B().T  # constant force on p (zero-order hold)
+        gq, _ = self._grad_H(q, p)                       # ∇V(q)
+        p = p - (dt / 2) * gq + (dt / 2) * Bu
+        _, gp = self._grad_H(q, p)                       # ∇T(p)
+        q = q + dt * gp
+        gq, _ = self._grad_H(q, p)                       # ∇V(q_next)
+        p = p - (dt / 2) * gq + (dt / 2) * Bu
+
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, dt / 2)
+        return q, p
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
 

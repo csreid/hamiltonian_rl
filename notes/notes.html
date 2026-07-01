@@ -600,6 +600,36 @@ coherent phase space, and we can always invert back to the LSTM’s
 representation for decoding</li>
 </ul>
 </section>
+
+<section id="section-5" class="title-slide slide level1">
+<h1>6/22</h1>
+
+</section>
+<section id="closed-loop-val-loss-steps-up" class="slide level2">
+<h2>Closed-Loop Val Loss Steps Up</h2>
+<ul>
+<li>TF val loss drops but closed-loop val loss steps <strong>up</strong>
+every so often</li>
+<li>Artifact: val rolled out <code>seq_len</code> steps, and the
+curriculum keeps growing <code>seq_len</code> — each bump adds a harder
+far-horizon step</li>
+<li>Fix: eval closed-loop over the <strong>full horizon</strong>,
+independent of the curriculum</li>
+</ul>
+</section>
+<section id="action-leaks-into-h" class="slide level2">
+<h2>Action Leaks Into <span class="math inline"><em>h</em></span></h2>
+<ul>
+<li>Cause: <code>Pendulum-v1</code> renders the torque as an arrow, so
+the autoencoder notes the action in <span
+class="math inline"><em>h</em></span>, but the action should only enter
+via <span class="math inline"><em>B</em></span></li>
+<li>Pollutes the dynamics: <span class="math inline">ℋ</span> ends up
+modeling apparent “intrinsic” forces that are really just actions</li>
+<li>Fix: don’t render the action</li>
+<li>Currently running</li>
+</ul>
+</section>
 <!-- {{{{ dzslides core
 #
 #

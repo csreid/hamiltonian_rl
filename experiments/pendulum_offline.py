@@ -883,6 +883,10 @@ def phase1_cmd(**kwargs):
 @click.option("--structural-lr", type=float, default=1e-2, show_default=True,
               help="Learning rate for J/R/B structure matrices")
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
+@click.option("--integrator", type=click.Choice(["rk4", "leapfrog"]), default="leapfrog",
+              show_default=True,
+              help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
+                   "separable H) or 'rk4' (classic 4-stage, works for any structure)")
 @click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
               help="Weight on log|det J_Phi|^2 regulariser; keeps flow near-volume-preserving")
 @click.option("--l1-weight", type=float, default=0.0, show_default=True,
@@ -1020,6 +1024,7 @@ def phase2_cmd(**kwargs):
         learn_structure=hp1["learn_structure"],
         dt=hp1["dt"],
         damping=hp1["damping"],
+        integrator=kwargs["integrator"],
     ).to(device)
     print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
 
@@ -1033,7 +1038,7 @@ def phase2_cmd(**kwargs):
                 "lr": kwargs["lr"],
             },
             {
-                "params": [dyn_model.A, dyn_model.L_param, dyn_model.B],
+                "params": [dyn_model.L_param, dyn_model.B],
                 "lr": kwargs["structural_lr"],
             },
         ])
