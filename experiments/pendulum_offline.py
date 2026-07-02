@@ -693,7 +693,8 @@ def cli():
 @click.option("--feat-dim", type=int, default=256, show_default=True)
 @click.option("--latent-dim", type=int, default=32, show_default=True)
 @click.option("--dt", type=float, default=0.05, show_default=True)
-@click.option("--no-separable", "separable", default=True, flag_value=False)
+@click.option("--separable/--no-separable", default=True, show_default=True,
+              help="Use a separable Hamiltonian H = T(p) + V(q); required for --integrator leapfrog")
 @click.option("--learn-structure/--no-learn-structure", default=True, show_default=True,
               help="Learn J/R/B matrices; --no-learn-structure fixes J to canonical symplectic, R=0, B=1")
 # training
