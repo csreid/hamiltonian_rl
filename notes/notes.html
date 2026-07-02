@@ -617,6 +617,22 @@ far-horizon step</li>
 independent of the curriculum</li>
 </ul>
 </section>
+<section id="denoising-augmentation" class="slide level2">
+<h2>Denoising Augmentation</h2>
+<ul>
+<li>Closed-loop rollouts accumulate error and drift off the dynamics
+manifold</li>
+<li>Fix: add Gaussian noise to the <span
+class="math inline"><em>h</em></span> fed into <span
+class="math inline"><em>Φ</em></span> during training; targets stay
+clean</li>
+<li>Model learns to map jittered latents back <strong>onto the
+manifold</strong></li>
+<li>Noise std is a multiplier on each <span
+class="math inline"><em>h</em></span>-dim’s spread, so it adapts to the
+latent scale</li>
+</ul>
+</section>
 <section id="action-leaks-into-h" class="slide level2">
 <h2>Action Leaks Into <span class="math inline"><em>h</em></span></h2>
 <ul>
@@ -628,6 +644,67 @@ via <span class="math inline"><em>B</em></span></li>
 modeling apparent “intrinsic” forces that are really just actions</li>
 <li>Fix: don’t render the action</li>
 <li>Currently running</li>
+</ul>
+</section>
+
+<section id="section-6" class="title-slide slide level1">
+<h1>7/1</h1>
+
+</section>
+<section id="fix-j-should-just-be-canonical" class="slide level2">
+<h2>Fix: <span class="math inline"><em>J</em></span> Should Just Be
+Canonical</h2>
+<ul>
+<li>We were learning <span
+class="math inline"><em>J</em> = <em>A</em> − <em>A</em><sup><em>T</em></sup></span>;
+but a learned <em>constant</em> <span
+class="math inline"><em>J</em></span> buys nothing over canonical
+<ul>
+<li>Any block coupling <span class="math inline"><em>C</em></span> is
+undone by the change of variables <span
+class="math inline"><em>p</em>′ = <em>C</em><sup>−<em>T</em></sup><em>p</em></span>,
+which the flow and the kinetic net’s first layer can absorb</li>
+</ul></li>
+<li>So: fix <span
+class="math inline"><em>J</em> = [[0,<em>I</em>],[−<em>I</em>,0]]</span>;
+only <span
+class="math inline"><em>R</em> = <em>L</em><em>L</em><sup><em>T</em></sup></span>
+and <span class="math inline"><em>B</em></span> are still learned</li>
+<li>One less thing to learn, and the conservative part is symplectic
+<strong>by construction</strong></li>
+</ul>
+</section>
+<section id="fix-true-separability" class="slide level2">
+<h2>Fix: True Separability</h2>
+<ul>
+<li>“Separable” mode was actually <span
+class="math inline">ℋ = <em>T</em>(<em>q</em>,<em>p</em>) + <em>V</em>(<em>q</em>)</span></li>
+<li>Now truly separable: <span
+class="math inline">ℋ = <em>T</em>(<em>p</em>) + <em>V</em>(<em>q</em>)</span></li>
+<li>Matches the pendulum’s physical structure, and <span
+class="math inline">∂ℋ/∂<em>p</em></span> depends only on <span
+class="math inline"><em>p</em></span>, <span
+class="math inline">∂ℋ/∂<em>q</em></span> only on <span
+class="math inline"><em>q</em></span></li>
+<li>That’s exactly what an explicit symplectic integrator needs…</li>
+</ul>
+</section>
+<section id="symplectic-integrator-leapfrog" class="slide level2">
+<h2>Symplectic Integrator (Leapfrog)</h2>
+<ul>
+<li>New option: <code>leapfrog</code> (now default) or
+<code>rk4</code></li>
+<li>Symplectic core: kick-drift-kick on <span
+class="math inline"><em>ż</em> = <em>J</em>∇ℋ</span>, with the control
+force <span class="math inline"><em>B</em><em>u</em></span> folded into
+the half-kicks</li>
+<li>Dissipation <span
+class="math inline"><em>ż</em> =  − <em>R</em>∇ℋ</span> is Strang-split
+symmetrically around it — still 2nd-order, reduces to pure leapfrog when
+<span class="math inline"><em>R</em> = 0</span></li>
+<li>Why: symplectic integration preserves phase-space structure over
+long horizons — no artificial energy drift from the integrator itself,
+which should help closed-loop rollout stability</li>
 </ul>
 </section>
 <!-- {{{{ dzslides core

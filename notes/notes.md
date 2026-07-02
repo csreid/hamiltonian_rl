@@ -235,3 +235,34 @@ One large eigenvalue, 15 near zero — model correctly concentrates dissipation 
 * Pollutes the dynamics: $\mathcal{H}$ ends up modeling apparent "intrinsic" forces that are really just actions
 * Fix: don't render the action
 * Currently running
+
+# 7/1
+
+## Denoising Augmentation
+
+* Closed-loop rollouts accumulate error and drift off the dynamics manifold
+* Fix: add Gaussian noise to the $h$ fed into $\Phi$ during training; targets stay clean
+* Model learns to map jittered latents back **onto the manifold**
+* Noise std is a multiplier on each $h$-dim's spread, so it adapts to the latent scale
+
+
+## Fix: $J$ Should Just Be Canonical
+
+* We were learning $J = A - A^T$; but a learned *constant* $J$ buys nothing over canonical
+  * Any block coupling $C$ is undone by the change of variables $p' = C^{-T}p$, which the flow and the kinetic net's first layer can absorb
+* So: fix $J = [[0, I], [-I, 0]]$; only $R = LL^T$ and $B$ are still learned
+* One less thing to learn, and the conservative part is symplectic **by construction**
+
+## Fix: True Separability
+
+* "Separable" mode was actually $\mathcal{H} = T(q, p) + V(q)$
+* Now truly separable: $\mathcal{H} = T(p) + V(q)$
+* Matches the pendulum's physical structure, and $\partial \mathcal{H} / \partial p$ depends only on $p$, $\partial \mathcal{H} / \partial q$ only on $q$
+* That's exactly what an explicit symplectic integrator needs...
+
+## Symplectic Integrator (Leapfrog)
+
+* New option: `leapfrog` (now default) or `rk4`
+* Symplectic core: kick-drift-kick on $\dot{z} = J \nabla \mathcal{H}$, with the control force $Bu$ folded into the half-kicks
+* Dissipation $\dot{z} = -R \nabla \mathcal{H}$ is Strang-split symmetrically around it --- still 2nd-order, reduces to pure leapfrog when $R = 0$
+* Why: symplectic integration preserves phase-space structure over long horizons --- no artificial energy drift from the integrator itself, which should help closed-loop rollout stability

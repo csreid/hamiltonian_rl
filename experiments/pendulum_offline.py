@@ -77,6 +77,40 @@ def _annotate_frame(frame: torch.Tensor, text: str) -> torch.Tensor:
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
 
 
+def _flatten_hparams(hparams: dict, prefix: str = "") -> dict:
+    """Flatten nested dicts and cast to TensorBoard-hparam-safe scalar types.
+
+    ``add_hparams`` only accepts int/float/str/bool values, so nested dicts
+    (e.g. phase2's embedded ``phase1_hparams``) are inlined with a prefixed
+    key, and anything else (lists, Paths, None, ...) is stringified.
+    """
+    flat = {}
+    for k, v in hparams.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            flat.update(_flatten_hparams(v, prefix=f"{key}."))
+        elif isinstance(v, (int, float, str, bool)):
+            flat[key] = v
+        else:
+            flat[key] = str(v)
+    return flat
+
+
+def _log_hparams_text(writer: SummaryWriter, hparams: dict, tag: str = "hparams") -> None:
+    """Dump the full (possibly nested) hparams dict as readable text at step 0."""
+    lines = [f"- **{k}**: {v}" for k, v in hparams.items()]
+    writer.add_text(tag, "\n".join(lines), 0)
+
+
+def _log_hparams_table(
+    writer: SummaryWriter,
+    hparams: dict,
+    final_metrics: dict[str, float],
+) -> None:
+    """Log flattened hparams + final metrics to the TB HParams tab for cross-run filtering."""
+    writer.add_hparams(_flatten_hparams(hparams), final_metrics, run_name=".")
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: autoencoder training
 # ---------------------------------------------------------------------------
@@ -762,6 +796,7 @@ def phase1_cmd(**kwargs):
     )
 
     hparams = {k: v for k, v in kwargs.items()}
+    _log_hparams_text(writer, hparams)
     best_loss = float("inf")
     ema_loss = None
     converge_streak = 0
@@ -853,6 +888,7 @@ def phase1_cmd(**kwargs):
 
     # Always save final checkpoint
     save_checkpoint(run_dir, epoch, model, hparams, metrics, stem="final")
+    _log_hparams_table(writer, hparams, metrics)
 
     # Precompute and save h_t cache
     print(f"\nPrecomputing h_t cache for {len(episodes)} episodes...")
@@ -1053,6 +1089,7 @@ def phase2_cmd(**kwargs):
             "separable", "learn_structure", "damping",
         )},
     }
+    _log_hparams_text(writer, hparams)
 
     full_seq_len = cache[0][1].shape[0] - 1  # max steps starting from h_1
     seq_len = kwargs["seq_len_start"]
@@ -1184,6 +1221,7 @@ def phase2_cmd(**kwargs):
             best_loss = metrics["phase2/dynamics"]
 
     save_checkpoint(run_dir, epoch, dyn_model, hparams, metrics, stem="final")
+    _log_hparams_table(writer, hparams, metrics)
 
     writer.close()
     print("\nDone. Run: tensorboard --logdir runs")
