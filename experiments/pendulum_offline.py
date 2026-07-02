@@ -798,6 +798,7 @@ def phase1_cmd(**kwargs):
 
     hparams = {k: v for k, v in kwargs.items()}
     _log_hparams_text(writer, hparams)
+    _log_hparams_table(writer, hparams, {})
     best_loss = float("inf")
     ema_loss = None
     converge_streak = 0
@@ -889,7 +890,6 @@ def phase1_cmd(**kwargs):
 
     # Always save final checkpoint
     save_checkpoint(run_dir, epoch, model, hparams, metrics, stem="final")
-    _log_hparams_table(writer, hparams, metrics)
 
     # Precompute and save h_t cache
     print(f"\nPrecomputing h_t cache for {len(episodes)} episodes...")
@@ -1091,6 +1091,7 @@ def phase2_cmd(**kwargs):
         )},
     }
     _log_hparams_text(writer, hparams)
+    _log_hparams_table(writer, hparams, {})
 
     full_seq_len = cache[0][1].shape[0] - 1  # max steps starting from h_1
     seq_len = kwargs["seq_len_start"]
@@ -1222,7 +1223,6 @@ def phase2_cmd(**kwargs):
             best_loss = metrics["phase2/dynamics"]
 
     save_checkpoint(run_dir, epoch, dyn_model, hparams, metrics, stem="final")
-    _log_hparams_table(writer, hparams, metrics)
 
     writer.close()
     print("\nDone. Run: tensorboard --logdir runs")
