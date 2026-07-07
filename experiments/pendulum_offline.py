@@ -278,12 +278,16 @@ def _log_latent_scatter_phase1(
         all_s.append(s_all)
         all_st.append(states.float())
 
-    s_cat = torch.cat(all_s, dim=0)
-    st_cat = torch.cat(all_st, dim=0)
-    mid = len(s_cat) // 2
-    A = torch.linalg.lstsq(s_cat[:mid], st_cat[:mid]).solution
-    st_pred = (s_cat[mid:] @ A).numpy()
-    st_true = st_cat[mid:].numpy()
+    # Hold out entire trajectories for validation rather than splitting each
+    # rollout in half — a temporal split would leak information (adjacent
+    # frames within a trajectory are highly correlated).
+    train_s = torch.cat(all_s[0::2], dim=0)
+    train_st = torch.cat(all_st[0::2], dim=0)
+    val_s = torch.cat(all_s[1::2], dim=0)
+    val_st = torch.cat(all_st[1::2], dim=0)
+    A = torch.linalg.lstsq(train_s, train_st).solution
+    st_pred = (val_s @ A).numpy()
+    st_true = val_st.numpy()
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     for i, name in enumerate(["cos(θ)", "sin(θ)", "θ̇ (rad/s)"]):
@@ -296,7 +300,7 @@ def _log_latent_scatter_phase1(
         ss_res = ((true_i - pred_i) ** 2).sum()
         ss_tot = ((true_i - true_i.mean()) ** 2).sum()
         axes[i].set_title(f"{name}  R²={1 - ss_res / (ss_tot + 1e-8):.3f}")
-    fig.suptitle(f"Latent → state regression, held-out half (epoch {epoch + 1})")
+    fig.suptitle(f"Latent → state regression, held-out trajectories (epoch {epoch + 1})")
     fig.tight_layout()
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
@@ -631,6 +635,82 @@ def _log_dreamed_video_phase2(
     ])
     side_by_side = torch.cat([gt_ann, dream_ann], dim=3).unsqueeze(0)
     writer.add_video(tag, (side_by_side.clamp(0, 1) * 255).byte(), epoch, fps=fps)
+
+
+@torch.no_grad()
+def _log_phase_space_regression_phase2(
+    phase1_model: ControlledDHGN_LSTM,
+    dyn_model: HamiltonianFlowModel,
+    val_trajs: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/phase_space_regression",
+) -> None:
+    """Probe whether closed-loop rolled-out (q, p) linearly encodes true state.
+
+    Mirrors `_log_latent_scatter_phase1`, but the (q, p) sequence being probed
+    comes from rolling the learned Hamiltonian dynamics forward in closed loop
+    (as in `_log_dreamed_video_phase2`) rather than one-step teacher-forced
+    encoding — closed loop is what dreaming/planning actually uses. Trajectories
+    are held out whole rather than split in time: rollout error compounds over
+    the horizon, so a temporal split would confound "does the regression
+    generalize" with "how far has this rollout drifted."
+    """
+    phase1_model.eval()
+    dyn_model.eval()
+
+    all_qp, all_st, all_idx = [], [], []
+    for frames, actions, states in val_trajs:
+        frames_b = frames.unsqueeze(0).to(device)
+        actions_b = actions.unsqueeze(0).to(device)
+        mu_all, _ = phase1_model.encoder.forward_all(frames_b)
+        T_full = actions_b.shape[1]
+
+        q, p = dyn_model.encode(mu_all[:, 1])
+        qp_steps = []
+        for t in range(T_full - 1):
+            u = actions_b[:, 1 + t: 2 + t].float()
+            q, p = dyn_model.controlled_step(q, p, u)
+            qp_steps.append(torch.cat([q, p], dim=-1).squeeze(0).cpu())
+
+        if not qp_steps:
+            continue
+        all_qp.append(torch.stack(qp_steps))
+        all_st.append(states[2:2 + len(qp_steps)].float())
+        all_idx.append(torch.arange(len(qp_steps), dtype=torch.float32))
+
+    if len(all_qp) < 2:
+        return
+
+    train_qp = torch.cat(all_qp[0::2], dim=0)
+    train_st = torch.cat(all_st[0::2], dim=0)
+    val_qp = torch.cat(all_qp[1::2], dim=0)
+    val_st = torch.cat(all_st[1::2], dim=0)
+    val_idx = torch.cat(all_idx[1::2], dim=0).numpy()
+
+    A = torch.linalg.lstsq(train_qp, train_st).solution
+    st_pred = (val_qp @ A).numpy()
+    st_true = val_st.numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    sc = None
+    for i, name in enumerate(["cos(θ)", "sin(θ)", "θ̇ (rad/s)"]):
+        true_i, pred_i = st_true[:, i], st_pred[:, i]
+        sc = axes[i].scatter(true_i, pred_i, c=val_idx, cmap="viridis", s=2, alpha=0.4)
+        lo, hi = min(true_i.min(), pred_i.min()), max(true_i.max(), pred_i.max())
+        axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
+        axes[i].set_xlabel(f"True {name}")
+        axes[i].set_ylabel(f"Predicted {name}")
+        ss_res = ((true_i - pred_i) ** 2).sum()
+        ss_tot = ((true_i - true_i.mean()) ** 2).sum()
+        axes[i].set_title(f"{name}  R²={1 - ss_res / (ss_tot + 1e-8):.3f}")
+    fig.colorbar(sc, ax=axes, label="rollout step", fraction=0.03, pad=0.02)
+    fig.suptitle(
+        f"Closed-loop (q,p) → state regression, held-out trajectories (epoch {epoch + 1})"
+    )
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -1190,6 +1270,15 @@ def phase2_cmd(**kwargs):
                         )
                         for k, v in val_loss_metrics.items():
                             writer.add_scalar(f"{k}/{label}", v, epoch)
+                        _log_phase_space_regression_phase2(
+                            phase1_model=phase1_model,
+                            dyn_model=dyn_model,
+                            val_trajs=val_trajs,
+                            device=device,
+                            writer=writer,
+                            epoch=epoch,
+                            tag=f"val/phase_space_regression/{label}",
+                        )
                         _log_dreamed_video_phase2(
                             phase1_model=phase1_model,
                             dyn_model=dyn_model,
