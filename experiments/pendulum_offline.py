@@ -63,10 +63,11 @@ from phgn_lstm import ControlledDHGN_LSTM, HamiltonianFlowModel
 def _log_latent_variance(
     qs: torch.Tensor,
     ps: torch.Tensor,
-) -> tuple[float, float]:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean per-dim variance of q and p, as 0-dim tensors (no host sync)."""
     q_dim = qs.shape[-1]
-    q_var = qs.detach().reshape(-1, q_dim).var(dim=0).mean().item()
-    p_var = ps.detach().reshape(-1, q_dim).var(dim=0).mean().item()
+    q_var = qs.detach().reshape(-1, q_dim).var(dim=0).mean()
+    p_var = ps.detach().reshape(-1, q_dim).var(dim=0).mean()
     return q_var, p_var
 
 
@@ -191,7 +192,7 @@ def _train_epoch_phase1(
             dist = torch.norm(h1 - h2, dim=-1)             # (B, T_seq)
             temporal_reg = F.relu(temporal_scale * dt - dist).mean()
             loss = loss + temporal_reg_weight * temporal_reg
-            total_temporal += temporal_reg.item()
+            total_temporal = total_temporal + temporal_reg.detach()
 
         optimizer.zero_grad()
         loss.backward()
@@ -199,18 +200,20 @@ def _train_epoch_phase1(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_recon += recon.item()
-        total_recon_next += recon_next.item()
-        total_kl += kl.item()
-        total_loss += loss.item()
+        # Accumulate as tensors — .item() per batch forces a GPU sync each time;
+        # a single sync at epoch end is enough.
+        total_recon = total_recon + recon.detach()
+        total_recon_next = total_recon_next + recon_next.detach()
+        total_kl = total_kl + kl.detach()
+        total_loss = total_loss + loss.detach()
 
     n = len(loader)
     return {
-        "phase1/loss": total_loss / n,
-        "phase1/recon": total_recon / n,
-        "phase1/recon_next": total_recon_next / n,
-        "phase1/kl": total_kl / n,
-        "phase1/temporal_reg": total_temporal / n,
+        "phase1/loss": float(total_loss) / n,
+        "phase1/recon": float(total_recon) / n,
+        "phase1/recon_next": float(total_recon_next) / n,
+        "phase1/kl": float(total_kl) / n,
+        "phase1/temporal_reg": float(total_temporal) / n,
     }
 
 
@@ -219,17 +222,25 @@ def _eval_loss_phase1(
     model: ControlledDHGN_LSTM,
     val_trajs: list,
     device: torch.device,
+    chunk_size: int = 4,
 ) -> dict[str, float]:
+    """Per-frame reconstruction loss, batched over trajectories.
+
+    Trajectories are processed chunk_size at a time (all val trajs share a
+    length, so they stack) — the decoder activations bound the chunk size.
+    """
     model.eval()
     q_dim = model.latent_dim // 2
+    frames_all = torch.stack([t[0] for t in val_trajs])  # (N, T+1, C, H, W)
     total_perframe = 0.0
-    for frames, actions, _ in val_trajs:
-        frames = frames.unsqueeze(0).to(device)
+    for i in range(0, len(frames_all), chunk_size):
+        frames = frames_all[i:i + chunk_size].to(device)  # (n, T+1, C, H, W)
+        n_chunk, T1 = frames.shape[:2]
         mu_all, _ = model.encoder.forward_all(frames)
-        s_all = model.f_psi(mu_all.squeeze(0))
-        z_dec = s_all[:, :q_dim]
-        pred = model.decoder(z_dec)
-        total_perframe += F.mse_loss(pred, frames.squeeze(0)).item()
+        s_all = model.f_psi(mu_all.reshape(n_chunk * T1, -1))
+        pred = model.decoder(s_all[:, :q_dim])
+        mse = F.mse_loss(pred, frames.reshape(n_chunk * T1, *frames.shape[2:]))
+        total_perframe += mse.item() * n_chunk
     return {"phase1/val_recon": total_perframe / len(val_trajs)}
 
 
@@ -306,6 +317,79 @@ def _log_latent_scatter_phase1(
     plt.close(fig)
 
 
+@torch.no_grad()
+def _log_h_state_regression_coeffs_phase1(
+    model: ControlledDHGN_LSTM,
+    val_trajs: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/h_state_regression_coeffs",
+) -> None:
+    """Bar charts of bidirectional linear-probe coefficients between raw h_t and state.
+
+    Unlike `_log_latent_scatter_phase1` (which probes s_all = f_psi(h_t)), this
+    probes h_t = mu_all directly — the exact quantity Phase 2 consumes from
+    h_cache.pt. `_log_latent_scatter_phase1`'s R² only shows whether state is
+    *recoverable* from h (h → state); it says nothing about whether h contains
+    additional non-Markovian content (history/burn-in transient, VAE noise
+    dims) that Phase 2's dynamics model has no way to predict, since Phase 2
+    must reproduce every dim of h. The state → h direction below is one probe
+    of the reverse: coefficients that don't line up with the h → state ones
+    flag h-dims whose variance is not well explained by state.
+
+    Both directions collapse to a (dim_h, 3) coefficient matrix, drawn as
+    dim_h groups of 3 bars (cos θ, sin θ, θ̇):
+      - h → state: row i of the forward lstsq solution — how much h_i
+        contributes to predicting each state component.
+      - state → h: the reverse lstsq solution (3, dim_h), transposed so row i
+        holds the three coefficients of the simple regression fit onto h_i
+        alone.
+    """
+    model.eval()
+    all_h, all_st = [], []
+    for frames, actions, states in val_trajs:
+        ctx = frames.unsqueeze(0).to(device)
+        mu_all, _ = model.encoder.forward_all(ctx)
+        all_h.append(mu_all.squeeze(0).cpu())
+        all_st.append(states.float())
+
+    h_pool = torch.cat(all_h, dim=0)
+    st_pool = torch.cat(all_st, dim=0)
+
+    # h → state: (dim_h, 3); row i = h_i's contribution to each state comp.
+    A = torch.linalg.lstsq(h_pool, st_pool).solution
+
+    # state → h: (3, dim_h) -> transpose to (dim_h, 3) so row i holds the
+    # three state coefficients of the regression fit onto h_i alone.
+    B_t = torch.linalg.lstsq(st_pool, h_pool).solution.T
+
+    dim_h = A.shape[0]
+    labels = ["cos(θ)", "sin(θ)", "θ̇"]
+    x = np.arange(dim_h)
+    width = 0.25
+
+    fig, axes = plt.subplots(2, 1, figsize=(max(8, dim_h * 0.35), 7))
+    for ax, mat, title in (
+        (axes[0], A.numpy(), "h → state  (row i: h_i's coefficient predicting each state comp)"),
+        (axes[1], B_t.numpy(), "state → h  (row i: state coefficients predicting h_i)"),
+    ):
+        for j, label in enumerate(labels):
+            ax.bar(x + (j - 1) * width, mat[:, j], width, label=label)
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.set_xlabel("h dimension")
+        ax.set_ylabel("coefficient")
+        ax.set_title(title)
+        ax.set_xticks(x)
+        if dim_h > 16:
+            ax.tick_params(axis="x", labelsize=6)
+        ax.legend(fontsize=8)
+    fig.suptitle(f"h ↔ state linear-probe coefficients, held-out trajectories (epoch {epoch + 1})")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Precompute h_t cache (between phases)
 # ---------------------------------------------------------------------------
@@ -328,14 +412,19 @@ def precompute_latents(
     model: ControlledDHGN_LSTM,
     episodes: list,
     device: torch.device,
+    chunk_size: int = 8,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Run encoder over all training episodes and cache h_t = mu_all."""
+    """Run encoder over all training episodes (chunked batches) and cache h_t = mu_all."""
     model.eval()
     cache = []
+    frames_all = torch.stack([e[0] for e in episodes])  # (N, T+1, C, H, W)
     with torch.no_grad():
-        for frames, actions, _ in tqdm(episodes, desc="Precomputing latents"):
-            mu_all, _ = model.encoder.forward_all(frames.unsqueeze(0).to(device))
-            cache.append((mu_all.squeeze(0).cpu(), actions))
+        for i in tqdm(range(0, len(episodes), chunk_size), desc="Precomputing latents"):
+            chunk = frames_all[i:i + chunk_size].to(device)
+            mu_all, _ = model.encoder.forward_all(chunk)
+            mu_cpu = mu_all.cpu()
+            for j in range(mu_cpu.shape[0]):
+                cache.append((mu_cpu[j], episodes[i + j][1]))
     return cache
 
 
@@ -412,7 +501,7 @@ def _train_epoch_phase2(
         q_all = s_flat[:, :q_dim].reshape(B_size, T_seq, q_dim)  # (B, T+1, q_dim)
         p_all = s_flat[:, q_dim:].reshape(B_size, T_seq, q_dim)
         log_det_all = log_det_flat.reshape(B_size, T_seq)         # (B, T+1)
-        logdet_metric = log_det_all.pow(2).mean().item()          # save before backward
+        logdet_metric = log_det_all.detach().pow(2).mean()        # save before backward
 
         logdet_reg = logdet_weight * log_det_all.pow(2).mean()
 
@@ -437,27 +526,31 @@ def _train_epoch_phase2(
 
         q, p = q_all[:, k], p_all[:, k]
         q_k_log, p_k_log = q.detach(), p.detach()  # save before graph is freed
-        qs_log, ps_log = [q_k_log], [p_k_log]
-        cl_loss = torch.zeros((), device=device)
+        qs_steps, ps_steps = [], []
         for t in range(T):
             q, p = dyn_model.controlled_step(q, p, actions[:, k + t:k + t + 1])
-            h_pred = dyn_model.decode(q, p)
-            cl_loss = cl_loss + F.mse_loss(h_pred, h_all[:, k + 1 + t])
-            qs_log.append(q.detach())
-            ps_log.append(p.detach())
-        cl_loss = cl_loss / T
+            qs_steps.append(q)
+            ps_steps.append(p)
+        # The decode never feeds back into the rollout, so all T states go
+        # through phi^{-1} in one batched call instead of T tiny ones.
+        q_traj = torch.stack(qs_steps, dim=1)  # (B, T, q_dim)
+        p_traj = torch.stack(ps_steps, dim=1)
+        h_cl_pred = dyn_model.decode(
+            q_traj.reshape(B_size * T, q_dim), p_traj.reshape(B_size * T, q_dim)
+        )
+        cl_loss = F.mse_loss(h_cl_pred, h_all[:, k + 1:k + 1 + T].reshape(B_size * T, D))
 
         loss = logdet_reg + teacher_force_weight * tf_loss + cl_loss
 
         if l1_weight > 0:
             l1_loss = sum(param.abs().sum() for param in dyn_model.hamiltonian.parameters())
             loss = loss + l1_weight * l1_loss
-            total_hamiltonian_l1 += l1_loss.item()
+            total_hamiltonian_l1 = total_hamiltonian_l1 + l1_loss.detach()
 
         if structural_reg_weight > 0 and dyn_model.learn_structure:
             struct_reg = dyn_model.get_J().pow(2).sum() + dyn_model.get_R().pow(2).sum()
             loss = loss + structural_reg_weight * struct_reg
-            total_struct_reg += struct_reg.item()
+            total_struct_reg = total_struct_reg + struct_reg.detach()
 
         optimizer.zero_grad()
         loss.backward()
@@ -470,31 +563,54 @@ def _train_epoch_phase2(
             z_eval = torch.cat([q_k_log, p_k_log], dim=-1).requires_grad_(True)
             H_eval = dyn_model.hamiltonian(z_eval[:, :q_dim], z_eval[:, q_dim:]).sum()
             grad_eval = torch.autograd.grad(H_eval, z_eval)[0]
-            total_grad_H_norm += grad_eval.norm(dim=-1).mean().item()
+            total_grad_H_norm = total_grad_H_norm + grad_eval.norm(dim=-1).mean().detach()
 
-        total_logdet_reg += logdet_metric
-        total_tf += tf_loss.item()
-        total_cl += cl_loss.item()
-        total_dynamics += loss.item()
+        # Accumulate as tensors — .item() per batch forces a GPU sync each time;
+        # a single sync at epoch end is enough.
+        total_logdet_reg = total_logdet_reg + logdet_metric
+        total_tf = total_tf + tf_loss.detach()
+        total_cl = total_cl + cl_loss.detach()
+        total_dynamics = total_dynamics + loss.detach()
         with torch.no_grad():
             q_var, p_var = _log_latent_variance(
-                torch.stack(qs_log, dim=1), torch.stack(ps_log, dim=1)
+                torch.cat([q_k_log.unsqueeze(1), q_traj], dim=1),
+                torch.cat([p_k_log.unsqueeze(1), p_traj], dim=1),
             )
-            total_q_var += q_var
-            total_p_var += p_var
+            total_q_var = total_q_var + q_var
+            total_p_var = total_p_var + p_var
 
     n = len(loader)
     return {
-        "phase2/dynamics": total_dynamics / n,
-        "phase2/tf_loss": total_tf / n,
-        "phase2/cl_loss": total_cl / n,
-        "phase2/logdet_reg": total_logdet_reg / n,
-        "phase2/q_var": total_q_var / n,
-        "phase2/p_var": total_p_var / n,
-        "phase2/hamiltonian_l1": total_hamiltonian_l1 / n,
-        "phase2/grad_H_norm": total_grad_H_norm / n,
-        "phase2/struct_reg": total_struct_reg / n,
+        "phase2/dynamics": float(total_dynamics) / n,
+        "phase2/tf_loss": float(total_tf) / n,
+        "phase2/cl_loss": float(total_cl) / n,
+        "phase2/logdet_reg": float(total_logdet_reg) / n,
+        "phase2/q_var": float(total_q_var) / n,
+        "phase2/p_var": float(total_p_var) / n,
+        "phase2/hamiltonian_l1": float(total_hamiltonian_l1) / n,
+        "phase2/grad_H_norm": float(total_grad_H_norm) / n,
+        "phase2/struct_reg": float(total_struct_reg) / n,
     }
+
+
+def _encode_val_h(
+    phase1_model: ControlledDHGN_LSTM,
+    val_trajs: list,
+    device: torch.device,
+    enc_chunk: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode all val trajectories to h in chunks: (N, T+1, D) h, (N, T) actions.
+
+    All val trajs share a length so they stack; chunking bounds the encoder's
+    activation memory while keeping the per-call batch large.
+    """
+    frames_all = torch.stack([t[0] for t in val_trajs])              # (N, T+1, C, H, W)
+    actions_all = torch.stack([t[1] for t in val_trajs]).to(device)  # (N, T)
+    h_chunks = []
+    for i in range(0, len(frames_all), enc_chunk):
+        mu_all, _ = phase1_model.encoder.forward_all(frames_all[i:i + enc_chunk].to(device))
+        h_chunks.append(mu_all)
+    return torch.cat(h_chunks, dim=0), actions_all.float()
 
 
 @torch.no_grad()
@@ -504,54 +620,57 @@ def _eval_loss_phase2(
     val_trajs: list,
     device: torch.device,
 ) -> dict[str, float]:
-    """Validation losses for the dynamics model.
+    """Validation losses for the dynamics model, batched over trajectories.
 
     The closed-loop loss is evaluated over the *full* available horizon
     (T_full - 1 steps) regardless of the training seq_len curriculum, so the
     metric is comparable across epochs.  If it tracked the curriculum length
     instead, every seq_len bump would lengthen the rollout and inject a
     spurious step-wise increase into the curve.
+
+    All trajectories roll out together (B = N) and every rollout state is
+    decoded in a single phi^{-1} call — the sequential bottleneck is only the
+    T dynamics steps, not T×N tiny kernel launches.
     """
     phase1_model.eval()
     dyn_model.eval()
-    total_teacher_forced = total_closed_loop = 0.0
     q_dim = dyn_model.latent_dim // 2
 
-    for frames, actions, _ in val_trajs:
-        frames_b = frames.unsqueeze(0).to(device)    # (1, T+1, C, H, W)
-        actions_b = actions.unsqueeze(0).to(device)  # (1, T)
-        mu_all, _ = phase1_model.encoder.forward_all(frames_b)
-        h_all = mu_all  # (1, T+1, latent_dim)
-        B, T_seq, D = h_all.shape
-        T_full = actions_b.shape[1]
+    h_all, actions_all = _encode_val_h(phase1_model, val_trajs, device)
+    N, T_seq, D = h_all.shape
+    T_full = actions_all.shape[1]
 
-        h_flat = h_all.reshape(B * T_seq, D)
-        q_flat, p_flat = dyn_model.encode(h_flat)
-        q_all = q_flat.reshape(B, T_seq, q_dim)
-        p_all = p_flat.reshape(B, T_seq, q_dim)
+    q_flat, p_flat = dyn_model.encode(h_all.reshape(N * T_seq, D))
+    q_all = q_flat.reshape(N, T_seq, q_dim)
+    p_all = p_flat.reshape(N, T_seq, q_dim)
 
-        q_teacher = q_all[:, :T_full].reshape(B * T_full, q_dim)
-        p_teacher = p_all[:, :T_full].reshape(B * T_full, q_dim)
-        actions_teacher = actions_b.float().reshape(B * T_full, 1)
-        q_next, p_next = dyn_model.controlled_step(q_teacher, p_teacher, actions_teacher)
-        h_teacher_pred = dyn_model.decode(q_next, p_next)
-        h_teacher_target = h_all[:, 1:].reshape(B * T_full, D)
-        total_teacher_forced += F.mse_loss(h_teacher_pred, h_teacher_target).item()
+    q_teacher = q_all[:, :T_full].reshape(N * T_full, q_dim)
+    p_teacher = p_all[:, :T_full].reshape(N * T_full, q_dim)
+    q_next, p_next = dyn_model.controlled_step(
+        q_teacher, p_teacher, actions_all.reshape(N * T_full, 1)
+    )
+    h_teacher_pred = dyn_model.decode(q_next, p_next)
+    h_teacher_target = h_all[:, 1:].reshape(N * T_full, D)
+    teacher_forced = F.mse_loss(h_teacher_pred, h_teacher_target).item()
 
-        n_rollout_steps = T_full - 1
+    n_rollout_steps = T_full - 1
+    closed_loop = 0.0
+    if n_rollout_steps > 0:
         q, p = q_all[:, 1], p_all[:, 1]
-        closed_loop_sum = 0.0
+        qs_steps, ps_steps = [], []
         for t in range(n_rollout_steps):
-            u = actions_b[:, 1 + t: 2 + t].float()
-            q, p = dyn_model.controlled_step(q, p, u)
-            h_pred = dyn_model.decode(q, p)
-            closed_loop_sum += F.mse_loss(h_pred, h_all[:, 2 + t]).item()
-        total_closed_loop += closed_loop_sum / n_rollout_steps if n_rollout_steps > 0 else 0.0
+            q, p = dyn_model.controlled_step(q, p, actions_all[:, 1 + t: 2 + t])
+            qs_steps.append(q)
+            ps_steps.append(p)
+        q_traj = torch.stack(qs_steps, dim=1).reshape(N * n_rollout_steps, q_dim)
+        p_traj = torch.stack(ps_steps, dim=1).reshape(N * n_rollout_steps, q_dim)
+        h_cl_pred = dyn_model.decode(q_traj, p_traj)
+        h_cl_target = h_all[:, 2:2 + n_rollout_steps].reshape(N * n_rollout_steps, D)
+        closed_loop = F.mse_loss(h_cl_pred, h_cl_target).item()
 
-    n = len(val_trajs)
     return {
-        "phase2/val_tf_loss": total_teacher_forced / n,
-        "phase2/val_cl_loss": total_closed_loop / n,
+        "phase2/val_tf_loss": teacher_forced,
+        "phase2/val_cl_loss": closed_loop,
     }
 
 
@@ -660,34 +779,30 @@ def _log_phase_space_regression_phase2(
     phase1_model.eval()
     dyn_model.eval()
 
-    all_qp, all_st, all_idx = [], [], []
-    for frames, actions, states in val_trajs:
-        frames_b = frames.unsqueeze(0).to(device)
-        actions_b = actions.unsqueeze(0).to(device)
-        mu_all, _ = phase1_model.encoder.forward_all(frames_b)
-        T_full = actions_b.shape[1]
-
-        q, p = dyn_model.encode(mu_all[:, 1])
-        qp_steps = []
-        for t in range(T_full - 1):
-            u = actions_b[:, 1 + t: 2 + t].float()
-            q, p = dyn_model.controlled_step(q, p, u)
-            qp_steps.append(torch.cat([q, p], dim=-1).squeeze(0).cpu())
-
-        if not qp_steps:
-            continue
-        all_qp.append(torch.stack(qp_steps))
-        all_st.append(states[2:2 + len(qp_steps)].float())
-        all_idx.append(torch.arange(len(qp_steps), dtype=torch.float32))
-
-    if len(all_qp) < 2:
+    h_all, actions_all = _encode_val_h(phase1_model, val_trajs, device)
+    N = h_all.shape[0]
+    T_full = actions_all.shape[1]
+    n_steps = T_full - 1
+    if n_steps <= 0 or N < 2:
         return
 
-    train_qp = torch.cat(all_qp[0::2], dim=0)
-    train_st = torch.cat(all_st[0::2], dim=0)
-    val_qp = torch.cat(all_qp[1::2], dim=0)
-    val_st = torch.cat(all_st[1::2], dim=0)
-    val_idx = torch.cat(all_idx[1::2], dim=0).numpy()
+    # Roll all trajectories forward together (B = N)
+    q, p = dyn_model.encode(h_all[:, 1])
+    qp_steps = []
+    for t in range(n_steps):
+        q, p = dyn_model.controlled_step(q, p, actions_all[:, 1 + t: 2 + t])
+        qp_steps.append(torch.cat([q, p], dim=-1))
+    all_qp = torch.stack(qp_steps, dim=1).cpu()                        # (N, n_steps, D)
+    all_st = torch.stack([t[2] for t in val_trajs]).float()[:, 2:2 + n_steps]  # (N, n_steps, 3)
+    D = all_qp.shape[-1]
+
+    train_qp = all_qp[0::2].reshape(-1, D)
+    train_st = all_st[0::2].reshape(-1, all_st.shape[-1])
+    val_qp = all_qp[1::2].reshape(-1, D)
+    val_st = all_st[1::2].reshape(-1, all_st.shape[-1])
+    val_idx = (
+        torch.arange(n_steps, dtype=torch.float32).repeat(all_qp[1::2].shape[0]).numpy()
+    )
 
     A = torch.linalg.lstsq(train_qp, train_st).solution
     st_pred = (val_qp @ A).numpy()
@@ -809,6 +924,7 @@ def phase1_cmd(**kwargs):
     assert kwargs["img_size"] % 8 == 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True  # autotune conv algos for our fixed shapes
     print(f"Device: {device}")
 
     writer = SummaryWriter(comment="_pendulum_offline_phase1")
@@ -949,11 +1065,17 @@ def phase1_cmd(**kwargs):
                     device=device, writer=writer, epoch=epoch,
                     tag=f"val/reconstruction_lstm/{label}",
                 )
-            if val_energy:
-                _log_latent_scatter_phase1(
-                    model=model, val_trajs=val_energy,
-                    device=device, writer=writer, epoch=epoch,
-                )
+                if len(val_trajs) >= 2:
+                    _log_latent_scatter_phase1(
+                        model=model, val_trajs=val_trajs,
+                        device=device, writer=writer, epoch=epoch,
+                        tag=f"val/latent_regression/{label}",
+                    )
+                    _log_h_state_regression_coeffs_phase1(
+                        model=model, val_trajs=val_trajs,
+                        device=device, writer=writer, epoch=epoch,
+                        tag=f"val/h_state_regression_coeffs/{label}",
+                    )
             _log_reconstruction_lstm_video(
                 model=model, val_traj=episodes[0],
                 device=device, writer=writer, epoch=epoch,
@@ -1041,6 +1163,7 @@ def phase1_cmd(**kwargs):
 def phase2_cmd(**kwargs):
     """Phase 2: train Hamiltonian flow dynamics on precomputed latents."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True  # autotune conv algos (val encoder)
     print(f"Device: {device}")
 
     run1 = Path(kwargs["phase1_run"])

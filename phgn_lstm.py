@@ -896,6 +896,20 @@ class HamiltonianFlowModel(nn.Module):
         g = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
         return g[:, :half], g[:, half:]
 
+    @torch.enable_grad()
+    def _grad_V(self, q: torch.Tensor) -> torch.Tensor:
+        """∇V(q) alone — skips the kinetic net entirely (separable H only)."""
+        q_ = q.clone().requires_grad_(True)
+        V_val = self.hamiltonian.potential(q_).sum()
+        return torch.autograd.grad(V_val, q_, create_graph=self.training)[0]
+
+    @torch.enable_grad()
+    def _grad_T(self, p: torch.Tensor) -> torch.Tensor:
+        """∇T(p) alone — skips the potential net entirely (separable H only)."""
+        p_ = p.clone().requires_grad_(True)
+        T_val = self.hamiltonian.kinetic(p_).sum()
+        return torch.autograd.grad(T_val, p_, create_graph=self.training)[0]
+
     def _dissipation_substep(
         self, q: torch.Tensor, p: torch.Tensor, tau: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -915,17 +929,18 @@ class HamiltonianFlowModel(nn.Module):
         The dissipative flow ż = −R∇H is Strang-split symmetrically around it so
         the composite stays 2nd-order and reduces to pure symplectic leapfrog
         when R = 0.
+
+        Each kick/drift needs only one half of ∇H, and separable H (required
+        for leapfrog) makes the halves independent, so _grad_V/_grad_T run just
+        the sub-network they need instead of the full Hamiltonian.
         """
         if self._has_dissipation:
             q, p = self._dissipation_substep(q, p, dt / 2)
 
         Bu = u @ self.get_B().T  # constant force on p (zero-order hold)
-        gq, _ = self._grad_H(q, p)                       # ∇V(q)
-        p = p - (dt / 2) * gq + (dt / 2) * Bu
-        _, gp = self._grad_H(q, p)                       # ∇T(p)
-        q = q + dt * gp
-        gq, _ = self._grad_H(q, p)                       # ∇V(q_next)
-        p = p - (dt / 2) * gq + (dt / 2) * Bu
+        p = p - (dt / 2) * self._grad_V(q) + (dt / 2) * Bu
+        q = q + dt * self._grad_T(p)
+        p = p - (dt / 2) * self._grad_V(q) + (dt / 2) * Bu
 
         if self._has_dissipation:
             q, p = self._dissipation_substep(q, p, dt / 2)
