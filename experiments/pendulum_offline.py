@@ -274,36 +274,57 @@ def _log_reconstruction_lstm_video(
 @torch.no_grad()
 def _log_latent_scatter_phase1(
     model: ControlledDHGN_LSTM,
-    val_trajs: list,
+    val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
     epoch: int,
     tag: str = "val/latent_regression",
 ) -> None:
+    """val_traj_sets: list of (val_trajs, policy_label) pairs.
+
+    A single linear probe is fit on the pooled train split (even-indexed
+    trajectories across all policies) and evaluated on the pooled val split
+    (odd-indexed), so all policies share one regression. Points are colored
+    by the policy that produced them.
+    """
     model.eval()
-    all_s, all_st = [], []
-    for frames, actions, states in val_trajs:
-        ctx = frames.unsqueeze(0).to(device)
-        mu_all, _ = model.encoder.forward_all(ctx)
-        s_all = model.f_psi(mu_all.squeeze(0)).cpu()
-        all_s.append(s_all)
-        all_st.append(states.float())
+    per_policy_s, per_policy_st = {}, {}
+    for val_trajs, label in val_traj_sets:
+        all_s, all_st = [], []
+        for frames, actions, states in val_trajs:
+            ctx = frames.unsqueeze(0).to(device)
+            mu_all, _ = model.encoder.forward_all(ctx)
+            s_all = model.f_psi(mu_all.squeeze(0)).cpu()
+            all_s.append(s_all)
+            all_st.append(states.float())
+        per_policy_s[label] = all_s
+        per_policy_st[label] = all_st
 
     # Hold out entire trajectories for validation rather than splitting each
     # rollout in half — a temporal split would leak information (adjacent
     # frames within a trajectory are highly correlated).
-    train_s = torch.cat(all_s[0::2], dim=0)
-    train_st = torch.cat(all_st[0::2], dim=0)
-    val_s = torch.cat(all_s[1::2], dim=0)
-    val_st = torch.cat(all_st[1::2], dim=0)
+    train_s = torch.cat([s for all_s in per_policy_s.values() for s in all_s[0::2]], dim=0)
+    train_st = torch.cat([st for all_st in per_policy_st.values() for st in all_st[0::2]], dim=0)
     A = torch.linalg.lstsq(train_s, train_st).solution
-    st_pred = (val_s @ A).numpy()
-    st_true = val_st.numpy()
 
+    val_pred, val_true = {}, {}
+    for label in per_policy_s:
+        val_s = torch.cat(per_policy_s[label][1::2], dim=0)
+        val_st = torch.cat(per_policy_st[label][1::2], dim=0)
+        val_pred[label] = (val_s @ A).numpy()
+        val_true[label] = val_st.numpy()
+
+    colors = plt.get_cmap("tab10").colors
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     for i, name in enumerate(["cos(θ)", "sin(θ)", "θ̇ (rad/s)"]):
-        true_i, pred_i = st_true[:, i], st_pred[:, i]
-        axes[i].scatter(true_i, pred_i, s=2, alpha=0.3)
+        all_true_i, all_pred_i = [], []
+        for j, label in enumerate(val_pred):
+            true_i, pred_i = val_true[label][:, i], val_pred[label][:, i]
+            axes[i].scatter(true_i, pred_i, s=2, alpha=0.3, color=colors[j % len(colors)], label=label)
+            all_true_i.append(true_i)
+            all_pred_i.append(pred_i)
+        true_i = np.concatenate(all_true_i)
+        pred_i = np.concatenate(all_pred_i)
         lo, hi = min(true_i.min(), pred_i.min()), max(true_i.max(), pred_i.max())
         axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
         axes[i].set_xlabel(f"True {name}")
@@ -311,6 +332,7 @@ def _log_latent_scatter_phase1(
         ss_res = ((true_i - pred_i) ** 2).sum()
         ss_tot = ((true_i - true_i.mean()) ** 2).sum()
         axes[i].set_title(f"{name}  R²={1 - ss_res / (ss_tot + 1e-8):.3f}")
+    axes[0].legend(markerscale=4, fontsize=8)
     fig.suptitle(f"Latent → state regression, held-out trajectories (epoch {epoch + 1})")
     fig.tight_layout()
     writer.add_figure(tag, fig, epoch)
@@ -1050,11 +1072,12 @@ def phase1_cmd(**kwargs):
             )
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
-            for val_trajs, label in (
+            policy_val_trajs = (
                 (val_energy, "energy_pump"),
                 (val_random, "random"),
                 (val_spin, "spin"),
-            ):
+            )
+            for val_trajs, label in policy_val_trajs:
                 if not val_trajs:
                     continue
                 val_metrics = _eval_loss_phase1(model, val_trajs, device)
@@ -1066,16 +1089,17 @@ def phase1_cmd(**kwargs):
                     tag=f"val/reconstruction_lstm/{label}",
                 )
                 if len(val_trajs) >= 2:
-                    _log_latent_scatter_phase1(
-                        model=model, val_trajs=val_trajs,
-                        device=device, writer=writer, epoch=epoch,
-                        tag=f"val/latent_regression/{label}",
-                    )
                     _log_h_state_regression_coeffs_phase1(
                         model=model, val_trajs=val_trajs,
                         device=device, writer=writer, epoch=epoch,
                         tag=f"val/h_state_regression_coeffs/{label}",
                     )
+            scatter_sets = [(vt, label) for vt, label in policy_val_trajs if len(vt) >= 2]
+            if scatter_sets:
+                _log_latent_scatter_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
             _log_reconstruction_lstm_video(
                 model=model, val_traj=episodes[0],
                 device=device, writer=writer, epoch=epoch,
