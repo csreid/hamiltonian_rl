@@ -570,7 +570,9 @@ def _train_epoch_phase2(
             total_hamiltonian_l1 = total_hamiltonian_l1 + l1_loss.detach()
 
         if structural_reg_weight > 0 and dyn_model.learn_structure:
-            struct_reg = dyn_model.get_J().pow(2).sum() + dyn_model.get_R().pow(2).sum()
+            # J is a fixed buffer in HamiltonianFlowModel — only R is learned,
+            # so penalizing ‖J‖² would just add a constant 2·q_dim to the loss.
+            struct_reg = dyn_model.get_R_pp().pow(2).sum()
             loss = loss + structural_reg_weight * struct_reg
             total_struct_reg = total_struct_reg + struct_reg.detach()
 
@@ -1159,7 +1161,7 @@ def phase1_cmd(**kwargs):
 @click.option("--l1-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on Hamiltonian network weights; encourages simpler dynamics")
 @click.option("--structural-reg-weight", type=float, default=0.0, show_default=True,
-              help="Frobenius norm penalty on J and R (Phase 2, learn-structure only); prevents structural matrices from growing unbounded")
+              help="Frobenius norm penalty on the learned dissipation R (Phase 2, learn-structure only); prevents it from growing unbounded")
 @click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
               help="Weight on teacher-forced 1-step loss (set 0 to disable)")
 @click.option("--h-noise-std", type=float, default=0.0, show_default=True,
