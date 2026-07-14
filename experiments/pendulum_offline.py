@@ -1150,6 +1150,10 @@ def phase1_cmd(**kwargs):
               show_default=True,
               help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
                    "separable H) or 'rk4' (classic 4-stage, works for any structure)")
+@click.option("--quadratic-t/--no-quadratic-t", default=True, show_default=True,
+              help="Kinetic energy as a PSD quadratic form T(p) = ½ pᵀM⁻¹p with learned "
+                   "constant mass (convex, T(0)=0, even in p) instead of a free MLP; "
+                   "requires separable H")
 @click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
               help="Weight on log|det J_Phi|^2 regulariser; keeps flow near-volume-preserving")
 @click.option("--l1-weight", type=float, default=0.0, show_default=True,
@@ -1289,6 +1293,7 @@ def phase2_cmd(**kwargs):
         dt=hp1["dt"],
         damping=hp1["damping"],
         integrator=kwargs["integrator"],
+        quadratic_t=kwargs["quadratic_t"],
     ).to(device)
     print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
 

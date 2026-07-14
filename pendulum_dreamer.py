@@ -87,6 +87,7 @@ def load_phase2_model(
         learn_structure=ph1.get("learn_structure", hparams.get("learn_structure", True)),
         dt=ph1.get("dt", hparams.get("dt", dt)),
         damping=ph1.get("damping", hparams.get("damping", 0.0)),
+        quadratic_t=hparams.get("quadratic_t", False),
     ).to(device)
     sd = torch.load(pt_path, map_location=device, weights_only=True)
     model.load_state_dict(sd)

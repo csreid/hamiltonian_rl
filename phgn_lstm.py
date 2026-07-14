@@ -265,6 +265,38 @@ class NormalizingFlow(nn.Module):
         return y
 
 
+class QuadraticKinetic(nn.Module):
+    """Physical kinetic energy T(p) = ½ pᵀ M⁻¹ p with a learned constant mass.
+
+    M⁻¹ = L Lᵀ where L is lower-triangular with softplus-positive diagonal, so
+    the inverse mass matrix is symmetric positive definite by construction.
+    Compared to a free MLP this enforces: convexity of T in p, T(0) = 0 and
+    ∇T(0) = 0 (a state at rest stays at rest), and T(p) = T(−p) (time-reversal
+    symmetry of the undamped flow).  Initialised to M⁻¹ = I, i.e. T = ½‖p‖².
+
+    Output is (B, 1) to match the MLP kinetic head interface.
+    """
+
+    def __init__(self, q_dim: int):
+        super().__init__()
+        self.mass_chol = nn.Parameter(torch.zeros(q_dim, q_dim))
+        with torch.no_grad():
+            # softplus(x) = 1 ⇔ x = log(e − 1): start at M⁻¹ = I
+            self.mass_chol.diagonal().fill_(math.log(math.e - 1))
+
+    def _L(self) -> torch.Tensor:
+        return self.mass_chol.tril(-1) + torch.diag(F.softplus(self.mass_chol.diagonal()))
+
+    def M_inv(self) -> torch.Tensor:
+        """Inverse mass matrix M⁻¹ = L Lᵀ (symmetric positive definite)."""
+        L = self._L()
+        return L @ L.T
+
+    def forward(self, p: torch.Tensor) -> torch.Tensor:
+        Lp = p @ self._L()  # rows are (Lᵀp)ᵀ, so ‖Lᵀp‖² = pᵀ L Lᵀ p
+        return 0.5 * Lp.pow(2).sum(dim=-1, keepdim=True)
+
+
 class MLPHamiltonianNet(nn.Module):
     """H(q, p) implemented as an MLP.
 
@@ -274,17 +306,24 @@ class MLPHamiltonianNet(nn.Module):
     step possible: ∂H/∂p depends only on p and ∂H/∂q only on q.
 
     Args:
-        latent_dim: total phase-space dimension (q_dim = p_dim = latent_dim // 2)
-        separable:  if True, use T + V decomposition
+        latent_dim:  total phase-space dimension (q_dim = p_dim = latent_dim // 2)
+        separable:   if True, use T + V decomposition
+        quadratic_t: if True (requires separable), T is a PSD quadratic form
+                     (QuadraticKinetic) instead of a free MLP
     """
 
-    def __init__(self, latent_dim: int, separable: bool = True):
+    def __init__(self, latent_dim: int, separable: bool = True, quadratic_t: bool = False):
         super().__init__()
+        if quadratic_t and not separable:
+            raise ValueError(
+                "quadratic_t requires a separable Hamiltonian H = T(p) + V(q); "
+                "pass separable=True or quadratic_t=False."
+            )
         self.separable = separable
         q_dim = latent_dim // 2
 
         if separable:
-            self.kinetic = nn.Sequential(
+            self.kinetic = QuadraticKinetic(q_dim) if quadratic_t else nn.Sequential(
                 nn.Linear(q_dim, 256),
                 nn.Softplus(),
                 nn.Linear(256, 256),
@@ -739,9 +778,11 @@ class HamiltonianFlowModel(nn.Module):
         latent_dim:      dimension of h_t (= ControlledDHGN_LSTM.latent_dim)
         control_dim:     dimension of control input u
         separable:       if True, use T + V Hamiltonian decomposition
-        learn_structure: if True, learn J/R/B; if False, use canonical J, R=0
+        learn_structure: if True, learn R/B; if False, R is fixed from damping
         dt:              integration step size
         damping:         diagonal dissipation for fixed R (only when not learn_structure)
+        quadratic_t:     if True (requires separable), kinetic energy is a PSD
+                         quadratic form T(p) = ½ pᵀM⁻¹p with learned constant mass
     """
 
     def __init__(
@@ -753,6 +794,7 @@ class HamiltonianFlowModel(nn.Module):
         dt: float = 0.05,
         damping: float = 0.0,
         integrator: str = "rk4",
+        quadratic_t: bool = False,
     ):
         super().__init__()
         if integrator not in ("rk4", "leapfrog"):
@@ -770,7 +812,9 @@ class HamiltonianFlowModel(nn.Module):
         q_dim = latent_dim // 2
 
         self.phi = NormalizingFlow(latent_dim)
-        self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
+        self.hamiltonian = MLPHamiltonianNet(
+            latent_dim, separable=separable, quadratic_t=quadratic_t
+        )
 
         # J is ALWAYS the canonical symplectic structure [[0, I], [-I, 0]].
         # A learned constant J buys nothing over canonical here: the change of
@@ -783,8 +827,12 @@ class HamiltonianFlowModel(nn.Module):
         self.register_buffer("J_fixed", J_fixed)
 
         if learn_structure:
-            # Only dissipation R = LL^T and control B are learned now.
-            self.L_param = nn.Parameter(torch.zeros(latent_dim, latent_dim))
+            # Only dissipation R and control B are learned now.  R is restricted
+            # to the momentum block, R = [[0, 0], [0, L Lᵀ]]: a nonzero qq-block
+            # would break the kinematic identity q̇ = ∂H/∂p — the very thing that
+            # makes q "position" — and physical (Rayleigh) damping acts only on
+            # momenta, mirroring the fixed-structure branch below.
+            self.L_param = nn.Parameter(torch.zeros(q_dim, q_dim))
             nn.init.normal_(self.L_param, std=1e-2)
             self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
             nn.init.normal_(self.B, std=1e-2)
@@ -802,15 +850,26 @@ class HamiltonianFlowModel(nn.Module):
         return self.J_fixed
 
     def get_L(self) -> torch.Tensor:
+        """(q_dim, q_dim) Cholesky factor of the momentum-block dissipation."""
         L_lower = self.L_param.tril(-1)
         diag_pos = F.softplus(self.L_param.diagonal())
         return L_lower + torch.diag(diag_pos)
 
+    def get_R_pp(self) -> torch.Tensor:
+        """(q_dim, q_dim) momentum-block of R — the only part that can be nonzero."""
+        q_dim = self.latent_dim // 2
+        if not self.learn_structure:
+            return self.R_fixed[q_dim:, q_dim:]
+        L = self.get_L()
+        return L @ L.T
+
     def get_R(self) -> torch.Tensor:
         if not self.learn_structure:
             return self.R_fixed
-        L = self.get_L()
-        return L @ L.T
+        q_dim = self.latent_dim // 2
+        R = self.J_fixed.new_zeros(self.latent_dim, self.latent_dim)
+        R[q_dim:, q_dim:] = self.get_R_pp()
+        return R
 
     def get_B(self) -> torch.Tensor:
         if not self.learn_structure:
@@ -913,11 +972,23 @@ class HamiltonianFlowModel(nn.Module):
     def _dissipation_substep(
         self, q: torch.Tensor, p: torch.Tensor, tau: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Explicit-Euler substep of the dissipative flow ż = −R ∇H over time tau."""
-        half = self.latent_dim // 2
-        gq, gp = self._grad_H(q, p)
-        RgH = torch.cat([gq, gp], dim=-1) @ self.get_R().T
-        return q - tau * RgH[:, :half], p - tau * RgH[:, half:]
+        """Substep of the dissipative flow ż = −R ∇H over (possibly negative) time tau.
+
+        R acts only on the momentum block, so q is untouched and ṗ = −R_pp ∂H/∂p.
+        Only called from the leapfrog path (separable H), so ∂H/∂p = ∇T(p).
+
+        With a quadratic kinetic energy the flow is linear, ṗ = −R_pp M⁻¹ p, and
+        is integrated EXACTLY via a matrix exponential — tau < 0 then gives the
+        exact anti-damping inverse, keeping the damped step exactly reversible.
+        (This also matches the env's exponential damping θ̇ *= exp(−c·dt).)
+        With an MLP kinetic the flow is nonlinear; falls back to explicit Euler,
+        whose tau < 0 step inverts the forward one only to O(tau²).
+        """
+        kin = self.hamiltonian.kinetic
+        if isinstance(kin, QuadraticKinetic):
+            A = self.get_R_pp() @ kin.M_inv()
+            return q, p @ torch.matrix_exp(-tau * A).T
+        return q, p - tau * self._grad_T(p) @ self.get_R_pp()  # R_pp symmetric
 
     def _leapfrog_step(
         self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
@@ -944,6 +1015,45 @@ class HamiltonianFlowModel(nn.Module):
 
         if self._has_dissipation:
             q, p = self._dissipation_substep(q, p, dt / 2)
+        return q, p
+
+    @torch.enable_grad()
+    def reverse_step(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        u: torch.Tensor,
+        dt: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inverse of controlled_step: recover (q_t, p_t) from (q_{t+1}, p_{t+1}) and u_t.
+
+        Leapfrog: exact inverse.  The symplectic core is ρ-reversible
+        (ρ: p ↦ −p, same u since forces depend only on q), so it inverts by
+        running kick-drift-kick with flipped signs; the dissipation substeps
+        invert with negative tau — exactly when T is quadratic (matrix-exp
+        flow), to O(dt²) with an MLP kinetic.  RK4: approximate inverse via a
+        −dt step (no exact inverse exists for an explicit RK step).
+        """
+        if dt is None:
+            dt = self.dt
+        if self.integrator == "leapfrog":
+            return self._leapfrog_step_inverse(q, p, u, dt)
+        return self._rk4_step(q, p, u, -dt)
+
+    def _leapfrog_step_inverse(
+        self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Exact inverse of _leapfrog_step: D(−dt/2) ∘ core⁻¹ ∘ D(−dt/2)."""
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, -dt / 2)
+
+        Bu = u @ self.get_B().T
+        p = p + (dt / 2) * self._grad_V(q) - (dt / 2) * Bu
+        q = q - dt * self._grad_T(p)
+        p = p + (dt / 2) * self._grad_V(q) - (dt / 2) * Bu
+
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, -dt / 2)
         return q, p
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
