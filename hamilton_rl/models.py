@@ -1,16 +1,24 @@
-"""Controlled port-Hamiltonian GN with LSTM encoder (PHGN-LSTM).
+"""Pendulum world-model components.
 
-Extends DHGN_LSTM with a control input port:
+Two independently trained halves plus a wrapper that stitches them:
 
-    dz/dt = (J − R) ∇H(z) + B u
+    LSTMAutoencoder       Phase 1 — pixels ↔ latent h_t
+        encoder             causal LSTM over per-frame CNN features → (mu, logvar)
+        f_psi               normalizing flow h → s (decoder input is s[:q_dim])
+        decoder             q → frame
+        next_frame_decoder  (h_t, a_t) → frame_{t+1} (auxiliary predictive head)
 
-Phase space is a flat latent_dim-dimensional vector (q and p each latent_dim//2).
-All Hamiltonian machinery uses MLPs rather than convolutions — the 4×4 spatial
-scaffolding was arbitrary and caused full receptive field collapse after 2 conv layers.
+    HamiltonianFlowModel  Phase 2 — port-Hamiltonian dynamics on precomputed h_t
+        phi                 normalizing flow h ↔ (q, p)
+        hamiltonian         H(q, p), optionally separable T(p) + V(q)
+        J/R/B               canonical symplectic J; learned or fixed dissipation
+                            and control matrices.  dz/dt = (J − R) ∇H(z) + B u
 
-Adds:
-    B  (q_dim × control_dim)    — learned input matrix
+    WorldModel            autoencoder + dynamics; owns the dreaming stitch and
+                          single-file checkpoint save/load.
 """
+
+from __future__ import annotations
 
 import math
 
@@ -18,8 +26,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
-from dhgn_lstm import DHGN_LSTM
 
 
 # ---------------------------------------------------------------------------
@@ -150,28 +156,8 @@ class FlexLSTMEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MLP modules replacing the conv-based HGN components
+# Normalizing flow (RealNVP-style affine coupling)
 # ---------------------------------------------------------------------------
-
-
-class MLPStateTransform(nn.Module):
-    """f_ψ: 3-layer MLP mapping sampled z → initial phase-space state s0.
-
-    (B, latent_dim) → (B, latent_dim)
-    """
-
-    def __init__(self, latent_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, latent_dim),
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
 
 
 class AffineCouplingLayer(nn.Module):
@@ -265,6 +251,11 @@ class NormalizingFlow(nn.Module):
         return y
 
 
+# ---------------------------------------------------------------------------
+# Hamiltonian nets
+# ---------------------------------------------------------------------------
+
+
 class QuadraticKinetic(nn.Module):
     """Physical kinetic energy T(p) = ½ pᵀ M⁻¹ p with a learned constant mass.
 
@@ -354,90 +345,8 @@ class MLPHamiltonianNet(nn.Module):
         return self.net(torch.cat([q, p], dim=-1)).squeeze(-1)
 
 
-class MLPStateDecoder(nn.Module):
-    """Maps (q, p) → observed state vector (B, obs_state_dim).
-
-    Used for supervised auxiliary loss when ground-truth state labels are
-    available (e.g. CartPole 4-vector).
-
-    Args:
-        latent_dim:    total phase-space dimension (q_dim + p_dim)
-        obs_state_dim: dimensionality of the target state vector
-    """
-
-    def __init__(self, latent_dim: int, obs_state_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, obs_state_dim),
-        )
-
-    def forward(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([q, p], dim=-1))
-
-
-class NextFrameDecoder(nn.Module):
-    """Predicts frame_{t+1} from (h_t, a_t).
-
-    Projects the concatenated latent + action to a spatial seed, then
-    progressively upsamples to the full image resolution — same architecture
-    as FlexDecoder but conditioned on the action taken.
-    """
-
-    def __init__(
-        self,
-        latent_dim: int = 32,
-        control_dim: int = 1,
-        pos_ch: int = 16,
-        img_ch: int = 3,
-        img_size: int = 64,
-    ):
-        super().__init__()
-        self.pos_ch = pos_ch
-        n_blocks = int(math.log2(img_size // 4))
-        assert 4 * (2**n_blocks) == img_size, f"img_size must be 4·2^k, got {img_size}"
-
-        in_dim = latent_dim + control_dim
-        self.expand = nn.Linear(in_dim, pos_ch * 4 * 4)
-        blocks = [_DecoderBlock(pos_ch)]
-        for _ in range(n_blocks - 1):
-            blocks.append(_DecoderBlock(64))
-        self.blocks = nn.ModuleList(blocks)
-        self.out_conv = nn.Conv2d(64, img_ch, 1)
-
-    def forward(self, h: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            h: (B, latent_dim)
-            a: (B, control_dim) or (B,) — action at time t
-        """
-        if a.dim() == 1:
-            a = a.unsqueeze(-1)
-        x = self.expand(torch.cat([h, a], dim=-1)).reshape(h.shape[0], self.pos_ch, 4, 4)
-        for block in self.blocks:
-            x = block(x)
-        return _leaky_hard_sigmoid(self.out_conv(x))
-
-
-class MLPCoordHead(nn.Module):
-    """Maps position q (B, q_dim) → pixel coords (B, 2) in [0, 1]."""
-
-    def __init__(self, q_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(q_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, q: torch.Tensor) -> torch.Tensor:
-        return self.net(q)
-
-
 # ---------------------------------------------------------------------------
-# Decoder: flat latent vector → image
+# Decoders: flat latent vector → image
 # ---------------------------------------------------------------------------
 
 
@@ -505,81 +414,90 @@ class FlexDecoder(nn.Module):
         return _leaky_hard_sigmoid(self.out_conv(x))
 
 
-# ---------------------------------------------------------------------------
-# ControlledDHGN_LSTM
-# ---------------------------------------------------------------------------
+class NextFrameDecoder(nn.Module):
+    """Predicts frame_{t+1} from (h_t, a_t).
 
-
-class ControlledDHGN_LSTM(DHGN_LSTM):
-    """Port-Hamiltonian world model with LSTM encoder, dissipation, and control.
-
-    Inherits J, R structure matrices and RK4 dissipative integrator from
-    DHGN_LSTM.  Replaces all conv-based components with MLPs operating on a
-    flat latent_dim-dimensional phase space:
-
-        q, p ∈ ℝ^(latent_dim/2)
-
-    The controlled ODE integrated with RK4 (zero-order hold on u):
-
-        dz/dt = (J − R) ∇H(z) + B u
-
-    Args:
-        pos_ch:      spatial channel depth for the decoder's 4×4 seed
-        img_ch:      image channels (3 for RGB)
-        dt:          default integration step size
-        feat_dim:    per-frame CNN embedding size and LSTM hidden size
-        img_size:    spatial resolution of input/output frames
-        latent_dim:  flat phase-space dimension (q and p each latent_dim//2)
-        control_dim: dimension of control input u
-        separable:   if True, use T + V Hamiltonian decomposition
+    Projects the concatenated latent + action to a spatial seed, then
+    progressively upsamples to the full image resolution — same architecture
+    as FlexDecoder but conditioned on the action taken.
     """
 
     def __init__(
         self,
-        pos_ch: int = 16,
-        img_ch: int = 3,
-        dt: float = 0.05,
-        feat_dim: int = 256,
-        img_size: int = 64,
         latent_dim: int = 32,
         control_dim: int = 1,
-        separable: bool = True,
-        obs_state_dim: int | None = None,
-        learn_structure: bool = True,
-        damping: float = 0.0,
+        pos_ch: int = 16,
+        img_ch: int = 3,
+        img_size: int = 64,
     ):
-        super().__init__(
-            pos_ch=pos_ch,
-            img_ch=img_ch,
-            dt=dt,
-            feat_dim=feat_dim,
-            separable=separable,
-        )
+        super().__init__()
+        self.pos_ch = pos_ch
+        n_blocks = int(math.log2(img_size // 4))
+        assert 4 * (2**n_blocks) == img_size, f"img_size must be 4·2^k, got {img_size}"
 
+        in_dim = latent_dim + control_dim
+        self.expand = nn.Linear(in_dim, pos_ch * 4 * 4)
+        blocks = [_DecoderBlock(pos_ch)]
+        for _ in range(n_blocks - 1):
+            blocks.append(_DecoderBlock(64))
+        self.blocks = nn.ModuleList(blocks)
+        self.out_conv = nn.Conv2d(64, img_ch, 1)
+
+    def forward(self, h: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: (B, latent_dim)
+            a: (B, control_dim) or (B,) — action at time t
+        """
+        if a.dim() == 1:
+            a = a.unsqueeze(-1)
+        x = self.expand(torch.cat([h, a], dim=-1)).reshape(h.shape[0], self.pos_ch, 4, 4)
+        for block in self.blocks:
+            x = block(x)
+        return _leaky_hard_sigmoid(self.out_conv(x))
+
+
+# ---------------------------------------------------------------------------
+# LSTMAutoencoder — Phase 1: reconstruction-only model
+# ---------------------------------------------------------------------------
+
+
+class LSTMAutoencoder(nn.Module):
+    """Phase 1 model: LSTM encoder + normalizing flow + CNN decoders. No dynamics.
+
+    The latent h_t produced by the encoder is what the Phase 2 dynamics model
+    (HamiltonianFlowModel) consumes.  Decoding goes h → f_psi(h)[:q_dim] → frame.
+
+    Args:
+        latent_dim:  flat latent dimension of h_t (decoder sees latent_dim // 2)
+        feat_dim:    per-frame CNN embedding size and LSTM hidden size
+        pos_ch:      spatial channel depth for the decoders' 4×4 seed
+        img_size:    spatial resolution of input/output frames
+        img_ch:      image channels (3 for RGB)
+        control_dim: dimension of the action fed to next_frame_decoder
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        feat_dim: int = 256,
+        pos_ch: int = 8,
+        img_size: int = 64,
+        img_ch: int = 3,
+        control_dim: int = 1,
+    ):
+        super().__init__()
         self.latent_dim = latent_dim
-        self.learn_structure = learn_structure
+        self.config = {
+            "latent_dim": latent_dim,
+            "feat_dim": feat_dim,
+            "pos_ch": pos_ch,
+            "img_size": img_size,
+            "img_ch": img_ch,
+            "control_dim": control_dim,
+        }
         q_dim = latent_dim // 2
 
-        # Override state_dim and structure matrices with flat latent_dim.
-        # (Parent created these sized to latent_ch * 4 * 4; reassignment
-        # via nn.Module.__setattr__ cleanly replaces them in _parameters.)
-        self.state_dim = latent_dim
-        if learn_structure:
-            self.A = nn.Parameter(torch.zeros(latent_dim, latent_dim))
-            self.L_param = nn.Parameter(torch.zeros(latent_dim, latent_dim))
-            nn.init.normal_(self.A, std=1e-2)
-            nn.init.normal_(self.L_param, std=1e-2)
-        else:
-            # Canonical symplectic J = [[0, I], [-I, 0]], R = 0, fixed.
-            J_fixed = torch.zeros(latent_dim, latent_dim)
-            J_fixed[:q_dim, q_dim:] = torch.eye(q_dim)
-            J_fixed[q_dim:, :q_dim] = -torch.eye(q_dim)
-            self.register_buffer("J_fixed", J_fixed)
-            R_fixed = torch.zeros(latent_dim, latent_dim)
-            R_fixed[q_dim:, q_dim:] = damping * torch.eye(q_dim)
-            self.register_buffer("R_fixed", R_fixed)
-
-        # Replace all conv-based modules with flat MLP equivalents.
         self.encoder = FlexLSTMEncoder(
             img_ch=img_ch,
             feat_dim=feat_dim,
@@ -587,7 +505,6 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
             img_size=img_size,
         )
         self.f_psi = NormalizingFlow(latent_dim)
-        self.hamiltonian = MLPHamiltonianNet(latent_dim, separable=separable)
         self.decoder = FlexDecoder(
             q_dim=q_dim, pos_ch=pos_ch, img_ch=img_ch, img_size=img_size
         )
@@ -595,170 +512,15 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
             latent_dim=latent_dim, control_dim=control_dim,
             pos_ch=pos_ch, img_ch=img_ch, img_size=img_size,
         )
-        self.coord_head = MLPCoordHead(q_dim)
 
-        self.control_dim = control_dim
-        if learn_structure:
-            self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
-            nn.init.normal_(self.B, std=1e-2)
-        else:
-            self.register_buffer("B_fixed", torch.ones(q_dim, control_dim))
+    @property
+    def q_dim(self) -> int:
+        return self.latent_dim // 2
 
-        self.state_decoder = (
-            MLPStateDecoder(latent_dim, obs_state_dim)
-            if obs_state_dim is not None
-            else None
-        )
-
-    # ── Structure matrix accessors (override parent to support fixed mode) ──
-
-    def get_J(self) -> torch.Tensor:
-        if not self.learn_structure:
-            return self.J_fixed
-        return self.A - self.A.T
-
-    def get_R(self) -> torch.Tensor:
-        if not self.learn_structure:
-            return self.R_fixed
-        L = self.get_L()
-        return L @ L.T
-
-    def get_B(self) -> torch.Tensor:
-        if not self.learn_structure:
-            return self.B_fixed
-        return self.B
-
-    # ── Dynamics (override parent to preserve gradient graph across rollout) ─
-
-    @torch.enable_grad()
-    def _dynamics(
-        self,
-        q: torch.Tensor,
-        p: torch.Tensor,
-        M: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """dz/dt = M ∇H(z). Does NOT detach q/p so gradients flow across steps."""
-        half = self.latent_dim // 2
-        z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
-        H_val = self.hamiltonian(z_[:, :half], z_[:, half:]).sum()
-        grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
-        dz = torch.einsum("ij,bj->bi", M, grad_H)
-        return dz[:, :half], dz[:, half:]
-
-    # ── Phase-space helpers ─────────────────────────────────────────────────
-
-    def _split(self, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        half = self.latent_dim // 2
-        return s[:, :half], s[:, half:]
-
-    # ── Forward (encode → initial state) ───────────────────────────────────
-
-    def forward(
-        self, imgs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Infer initial phase-space state from an image sequence.
-
-        Args:
-            imgs: (B, T, C, H, W)
-
-        Returns:
-            q0, p0: (B, latent_dim//2) each
-            kl:     (B,)
-            mu:     (B, latent_dim)
-            log_var:(B, latent_dim)
-        """
-        mu, log_var = self.encoder(imgs)
-        log_var = log_var.clamp(-10, 10)
-        z = mu + torch.randn_like(mu) * (0.5 * log_var).exp()
-        s0 = self.f_psi(z)
-        q0, p0 = self._split(s0)
-        kl = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())
-        kl = kl.sum(dim=1)  # (B,) — sum over latent_dim
-        return q0, p0, kl, mu, log_var
-
-    # ── Controlled dynamics ─────────────────────────────────────────────────
-
-    def _controlled_dynamics(
-        self,
-        q: torch.Tensor,
-        p: torch.Tensor,
-        u: torch.Tensor,
-        M: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """dz/dt = (J − R) ∇H + B u."""
-        dq, dp = self._dynamics(q, p, M)
-        Bu = u @ self.get_B().T  # (B, q_dim)
-        dp = dp + Bu
-        return dq, dp
-
-    @torch.enable_grad()
-    def controlled_step(
-        self,
-        q: torch.Tensor,
-        p: torch.Tensor,
-        u: torch.Tensor,
-        dt: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One RK4 step of dz/dt = (J − R) ∇H + B u (zero-order hold on u)."""
-        if dt is None:
-            dt = self.dt
-        M = self.get_J_minus_R()
-        dq1, dp1 = self._controlled_dynamics(q, p, u, M)
-        dq2, dp2 = self._controlled_dynamics(
-            q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u, M
-        )
-        dq3, dp3 = self._controlled_dynamics(
-            q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u, M
-        )
-        dq4, dp4 = self._controlled_dynamics(q + dt * dq3, p + dt * dp3, u, M)
-        q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
-        p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
-        return q_next, p_next
-
-    def rollout_controlled(
-        self,
-        q: torch.Tensor,
-        p: torch.Tensor,
-        us: torch.Tensor,
-        dt: float | None = None,
-        return_states: bool = False,
-    ):
-        """Roll out applying control sequence us (B, H, control_dim)."""
-        frames = [self.decoder(q)]
-        qs, ps = [q], [p]
-        for t in range(us.shape[1]):
-            q, p = self.controlled_step(q, p, us[:, t], dt=dt)
-            frames.append(self.decoder(q))
-            qs.append(q)
-            ps.append(p)
-        if return_states:
-            return frames, qs, ps
-        return frames
-
-    # ── Deterministic encoding for eval ────────────────────────────────────
-
-    def decode_state(
-        self, q: torch.Tensor, p: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Decode (q, p) to observed state via state_decoder, or None."""
-        if self.state_decoder is None:
-            return None
-        return self.state_decoder(q, p)
-
-    def encode_mean(
-        self, imgs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode using posterior mean — no reparameterisation noise.
-
-        Args:
-            imgs: (B, T, C, H, W)
-
-        Returns:
-            q, p: (B, latent_dim//2) each
-        """
-        mu, _ = self.encoder(imgs)
-        s0 = self.f_psi(mu)
-        return self._split(s0)
+    def decode_latent(self, h: torch.Tensor) -> torch.Tensor:
+        """h (B, latent_dim) → frame (B, C, H, W) via f_psi + decoder."""
+        s = self.f_psi(h)
+        return self.decoder(s[:, :self.q_dim])
 
 
 # ---------------------------------------------------------------------------
@@ -769,13 +531,13 @@ class ControlledDHGN_LSTM(DHGN_LSTM):
 class HamiltonianFlowModel(nn.Module):
     """Phase 2 model: learns Φ mapping precomputed h_t → (q, p) for Hamiltonian dynamics.
 
-    Completely separate from Phase 1 (ControlledDHGN_LSTM). Takes precomputed
+    Completely separate from Phase 1 (LSTMAutoencoder). Takes precomputed
     LSTM encoder outputs h_t as input — no encoder or decoder.
 
     The controlled ODE integrated with RK4: dz/dt = (J − R) ∇H(z) + B u
 
     Args:
-        latent_dim:      dimension of h_t (= ControlledDHGN_LSTM.latent_dim)
+        latent_dim:      dimension of h_t (= LSTMAutoencoder.latent_dim)
         control_dim:     dimension of control input u
         separable:       if True, use T + V Hamiltonian decomposition
         learn_structure: if True, learn R/B; if False, R is fixed from damping
@@ -809,6 +571,16 @@ class HamiltonianFlowModel(nn.Module):
         self.learn_structure = learn_structure
         self.separable = separable
         self.integrator = integrator
+        self.config = {
+            "latent_dim": latent_dim,
+            "control_dim": control_dim,
+            "separable": separable,
+            "learn_structure": learn_structure,
+            "dt": dt,
+            "damping": damping,
+            "integrator": integrator,
+            "quadratic_t": quadratic_t,
+        }
         q_dim = latent_dim // 2
 
         self.phi = NormalizingFlow(latent_dim)
@@ -1073,3 +845,101 @@ class HamiltonianFlowModel(nn.Module):
     def decode(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         """(q, p) → h_t via Φ⁻¹."""
         return self.phi.inverse(torch.cat([q, p], dim=-1))
+
+
+# ---------------------------------------------------------------------------
+# WorldModel — autoencoder + dynamics, one checkpoint
+# ---------------------------------------------------------------------------
+
+
+class WorldModel(nn.Module):
+    """LSTM autoencoder + port-Hamiltonian dynamics, saved/loaded as one file.
+
+    ``dynamics`` is None after Phase 1 only; a complete world model has both.
+    ``data_config`` records how the training data was collected (img_size,
+    max_steps, epsilon, energy_k, damping, ...) so downstream consumers can
+    reproduce matching episodes without out-of-band hyperparameters.
+    """
+
+    def __init__(
+        self,
+        autoencoder: LSTMAutoencoder,
+        dynamics: HamiltonianFlowModel | None = None,
+        data_config: dict | None = None,
+    ):
+        super().__init__()
+        self.autoencoder = autoencoder
+        self.dynamics = dynamics
+        self.data_config = dict(data_config or {})
+
+    @property
+    def latent_dim(self) -> int:
+        return self.autoencoder.latent_dim
+
+    @torch.no_grad()
+    def dream(
+        self,
+        frames: torch.Tensor,
+        actions: torch.Tensor,
+        n_context: int,
+        n_steps: int | None = None,
+    ) -> torch.Tensor:
+        """Encode n_context frames, roll out dynamics, decode back to pixels.
+
+        Pipeline per dreamed step k:
+            u = actions[n_context - 1 + k]
+            (q, p) = dynamics.controlled_step(q, p, u)
+            h_pred = dynamics.decode(q, p)              [phi^{-1}]
+            frame  = autoencoder.decode_latent(h_pred)  [f_psi → decoder]
+
+        Args:
+            frames:    (T+1, C, H, W) ground-truth frames (any device)
+            actions:   (T,) actions
+            n_context: frames fed to the LSTM encoder before dreaming
+            n_steps:   rollout length; clipped to the available actions
+                       (None = as far as the actions allow)
+
+        Returns:
+            (n, C, H, W) dreamed frames on CPU; n may be 0 if no actions remain.
+        """
+        if self.dynamics is None:
+            raise RuntimeError("WorldModel has no dynamics — Phase 2 has not been trained.")
+        device = next(self.autoencoder.parameters()).device
+
+        ctx = frames[:n_context].unsqueeze(0).to(device)     # (1, n_context, C, H, W)
+        mu_ctx, _ = self.autoencoder.encoder.forward_all(ctx)
+        h = mu_ctx[:, -1]                                     # (1, latent_dim)
+        q, p = self.dynamics.encode(h)
+
+        max_steps = len(actions) - (n_context - 1)
+        n = max_steps if n_steps is None else min(n_steps, max_steps)
+
+        dreamed = []
+        for k in range(max(n, 0)):
+            u = actions[n_context - 1 + k].view(1, 1).to(device=device, dtype=torch.float32)
+            q, p = self.dynamics.controlled_step(q, p, u)
+            h_pred = self.dynamics.decode(q, p)
+            dreamed.append(self.autoencoder.decode_latent(h_pred).squeeze(0).cpu())
+
+        if not dreamed:
+            C, H, W = frames.shape[1:]
+            return torch.empty(0, C, H, W)
+        return torch.stack(dreamed)
+
+    def save(
+        self,
+        run_dir,
+        stem: str,
+        hparams: dict,
+        metrics: dict,
+        epoch: int,
+    ) -> None:
+        from hamilton_rl.checkpoint import save_world_model
+
+        save_world_model(run_dir, stem, self, hparams, metrics, epoch)
+
+    @classmethod
+    def load(cls, path, device: torch.device | None = None) -> "WorldModel":
+        from hamilton_rl.checkpoint import load_world_model
+
+        return load_world_model(path, device)

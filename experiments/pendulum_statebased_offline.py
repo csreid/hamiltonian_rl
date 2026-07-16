@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from checkpoint_common import make_run_dir, save_checkpoint
+from hamilton_rl.checkpoint import make_run_dir, save_checkpoint
 from data.pendulum import (
     _G,
     collect_state_data,

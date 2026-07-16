@@ -1,10 +1,11 @@
 """Offline Pendulum world-model training — two-phase regimen.
 
 Phase 1 (phase1 subcommand):
-    Train the HGN autoencoder (encoder + f_psi + decoder) for reconstruction.
+    Train the LSTM autoencoder (encoder + f_psi + decoder) for reconstruction.
     Loss = MSE(decoder(f_psi(z)[:q_dim]), frame) + kl_weight * KL.
     After training, precomputes and saves h_t = encoder_mu(frame_t) for every
     frame of every training episode to h_cache.pt in the run directory.
+    Saves a unified world-model checkpoint with dynamics=None.
 
 Phase 2 (phase2 subcommand):
     Load precomputed h_t cache. Train a new HamiltonianFlowModel (Phi + H + J/R/B)
@@ -13,8 +14,10 @@ Phase 2 (phase2 subcommand):
         L_tf  = MSE(phi^{-1}(RK4(phi(h_t), u_t)),  h_{t+1})       [teacher-forced, all t]
         L_cl  = MSE(phi^{-1}(RK4^k(phi(h_seed), u)), h_{seed+k})  [closed-loop, seq_len steps]
 
-    Architecture params (latent_dim, img_size, etc.) are loaded automatically
-    from the Phase 1 checkpoint YAML — no need to re-specify them.
+    Architecture and data params (latent_dim, img_size, etc.) are loaded
+    automatically from the Phase 1 checkpoint — no need to re-specify them.
+    Saves a complete world-model checkpoint (autoencoder + dynamics): the one
+    file the dashboard needs.
 
 Inference (dreaming) after both phases:
     h_0  = encoder(frame_0..frame_{ctx-1})              [Phase 1 encoder]
@@ -38,13 +41,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from checkpoint_common import make_run_dir, save_checkpoint
 from data.pendulum import (
     PendulumDataset,
     collect_data,
@@ -52,7 +53,8 @@ from data.pendulum import (
     collect_spin_trajectories,
     collect_val_trajectories,
 )
-from phgn_lstm import ControlledDHGN_LSTM, HamiltonianFlowModel
+from hamilton_rl.checkpoint import load_world_model, make_run_dir
+from hamilton_rl.models import HamiltonianFlowModel, LSTMAutoencoder, WorldModel
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +84,7 @@ def _flatten_hparams(hparams: dict, prefix: str = "") -> dict:
     """Flatten nested dicts and cast to TensorBoard-hparam-safe scalar types.
 
     ``add_hparams`` only accepts int/float/str/bool values, so nested dicts
-    (e.g. phase2's embedded ``phase1_hparams``) are inlined with a prefixed
+    (e.g. phase2's embedded ``phase1_config``) are inlined with a prefixed
     key, and anything else (lists, Paths, None, ...) is stringified.
     """
     flat = {}
@@ -118,7 +120,7 @@ def _log_hparams_table(
 
 
 def _train_epoch_phase1(
-    model: ControlledDHGN_LSTM,
+    model: LSTMAutoencoder,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     kl_weight: float,
@@ -219,7 +221,7 @@ def _train_epoch_phase1(
 
 @torch.no_grad()
 def _eval_loss_phase1(
-    model: ControlledDHGN_LSTM,
+    model: LSTMAutoencoder,
     val_trajs: list,
     device: torch.device,
     chunk_size: int = 4,
@@ -246,7 +248,7 @@ def _eval_loss_phase1(
 
 @torch.no_grad()
 def _log_reconstruction_lstm_video(
-    model: ControlledDHGN_LSTM,
+    model: LSTMAutoencoder,
     val_traj: tuple,
     device: torch.device,
     writer: SummaryWriter,
@@ -273,7 +275,7 @@ def _log_reconstruction_lstm_video(
 
 @torch.no_grad()
 def _log_latent_scatter_phase1(
-    model: ControlledDHGN_LSTM,
+    model: LSTMAutoencoder,
     val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -341,7 +343,7 @@ def _log_latent_scatter_phase1(
 
 @torch.no_grad()
 def _log_h_state_regression_coeffs_phase1(
-    model: ControlledDHGN_LSTM,
+    model: LSTMAutoencoder,
     val_trajs: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -431,7 +433,7 @@ class LatentDataset(Dataset):
 
 
 def precompute_latents(
-    model: ControlledDHGN_LSTM,
+    model: LSTMAutoencoder,
     episodes: list,
     device: torch.device,
     chunk_size: int = 8,
@@ -618,7 +620,7 @@ def _train_epoch_phase2(
 
 
 def _encode_val_h(
-    phase1_model: ControlledDHGN_LSTM,
+    phase1_model: LSTMAutoencoder,
     val_trajs: list,
     device: torch.device,
     enc_chunk: int = 8,
@@ -639,8 +641,7 @@ def _encode_val_h(
 
 @torch.no_grad()
 def _eval_loss_phase2(
-    phase1_model: ControlledDHGN_LSTM,
-    dyn_model: HamiltonianFlowModel,
+    world_model: WorldModel,
     val_trajs: list,
     device: torch.device,
 ) -> dict[str, float]:
@@ -656,8 +657,8 @@ def _eval_loss_phase2(
     decoded in a single phi^{-1} call — the sequential bottleneck is only the
     T dynamics steps, not T×N tiny kernel launches.
     """
-    phase1_model.eval()
-    dyn_model.eval()
+    world_model.eval()
+    phase1_model, dyn_model = world_model.autoencoder, world_model.dynamics
     q_dim = dyn_model.latent_dim // 2
 
     h_all, actions_all = _encode_val_h(phase1_model, val_trajs, device)
@@ -723,10 +724,8 @@ def _log_structural_matrices_phase2(
 
 @torch.no_grad()
 def _log_dreamed_video_phase2(
-    phase1_model: ControlledDHGN_LSTM,
-    dyn_model: HamiltonianFlowModel,
+    world_model: WorldModel,
     val_traj: tuple,
-    device: torch.device,
     writer: SummaryWriter,
     epoch: int,
     seq_len: int,
@@ -740,35 +739,15 @@ def _log_dreamed_video_phase2(
     Rollout: seq_len Hamiltonian steps in phase space, decoded back to pixels
              via phi^{-1} → f_psi → decoder.
     """
-    phase1_model.eval()
-    dyn_model.eval()
+    world_model.eval()
     frames, actions, _ = val_traj
-    q_dim = phase1_model.latent_dim // 2
 
-    # Seed: encode context frames with Phase 1 LSTM encoder
-    ctx = frames[:context_frames].unsqueeze(0).to(device)   # (1, context_frames, C, H, W)
-    mu_ctx, _ = phase1_model.encoder.forward_all(ctx)        # (1, context_frames, latent_dim)
-    h = mu_ctx[:, -1]                                        # (1, latent_dim)
-
-    # Map to phase space via Phase 2 phi
-    q, p = dyn_model.encode(h)  # (1, q_dim) each
-
-    # Roll out Hamiltonian dynamics, decode each step
-    n_steps = min(seq_len, len(actions) - (context_frames - 1))
-    dreamed_frames = []
-    for k in range(n_steps):
-        u = actions[context_frames - 1 + k].view(1, 1).to(device)  # (1, 1)
-        q, p = dyn_model.controlled_step(q, p, u)
-        h_pred = dyn_model.decode(q, p)                         # (1, latent_dim)
-        s_pred = phase1_model.f_psi(h_pred)                     # (1, latent_dim)
-        frame_pred = phase1_model.decoder(s_pred[:, :q_dim])    # (1, C, H, W)
-        dreamed_frames.append(frame_pred.squeeze(0).cpu())
-
-    if not dreamed_frames:
+    dreamed = world_model.dream(frames, actions, n_context=context_frames, n_steps=seq_len)
+    n_steps = len(dreamed)
+    if n_steps == 0:
         return
 
-    dreamed = torch.stack(dreamed_frames)                # (n_steps, C, H, W)
-    gt = frames[context_frames:context_frames + n_steps] # (n_steps, C, H, W)
+    gt = frames[context_frames:context_frames + n_steps]  # (n_steps, C, H, W)
 
     gt_ann = torch.stack([
         _annotate_frame(gt[i], f"gt {context_frames + i}") for i in range(len(gt))
@@ -782,8 +761,7 @@ def _log_dreamed_video_phase2(
 
 @torch.no_grad()
 def _log_phase_space_regression_phase2(
-    phase1_model: ControlledDHGN_LSTM,
-    dyn_model: HamiltonianFlowModel,
+    world_model: WorldModel,
     val_trajs: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -800,8 +778,8 @@ def _log_phase_space_regression_phase2(
     the horizon, so a temporal split would confound "does the regression
     generalize" with "how far has this rollout drifted."
     """
-    phase1_model.eval()
-    dyn_model.eval()
+    world_model.eval()
+    phase1_model, dyn_model = world_model.autoencoder, world_model.dynamics
 
     h_all, actions_all = _encode_val_h(phase1_model, val_trajs, device)
     N = h_all.shape[0]
@@ -853,38 +831,6 @@ def _log_phase_space_regression_phase2(
 
 
 # ---------------------------------------------------------------------------
-# CLI helpers
-# ---------------------------------------------------------------------------
-
-
-def _load_phase1_hparams(run_dir: Path) -> dict:
-    """Load hparams from Phase 1 YAML (tries best.yaml, falls back to final.yaml)."""
-    for stem in ("best", "final"):
-        p = run_dir / f"{stem}.yaml"
-        if p.exists():
-            return yaml.safe_load(p.read_text())["hparams"]
-    raise click.UsageError(
-        f"No checkpoint YAML found in {run_dir}. "
-        "Expected best.yaml or final.yaml from a completed Phase 1 run."
-    )
-
-
-def _make_phase1_model(hp: dict, device: torch.device) -> ControlledDHGN_LSTM:
-    return ControlledDHGN_LSTM(
-        pos_ch=hp["pos_ch"],
-        img_ch=3,
-        dt=hp["dt"],
-        feat_dim=hp["feat_dim"],
-        latent_dim=hp["latent_dim"],
-        img_size=hp["img_size"],
-        control_dim=1,
-        separable=hp["separable"],
-        learn_structure=hp["learn_structure"],
-        damping=hp["damping"],
-    ).to(device)
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -911,11 +857,6 @@ def cli():
 @click.option("--pos-ch", type=int, default=8, show_default=True)
 @click.option("--feat-dim", type=int, default=256, show_default=True)
 @click.option("--latent-dim", type=int, default=32, show_default=True)
-@click.option("--dt", type=float, default=0.05, show_default=True)
-@click.option("--separable/--no-separable", default=True, show_default=True,
-              help="Use a separable Hamiltonian H = T(p) + V(q); required for --integrator leapfrog")
-@click.option("--learn-structure/--no-learn-structure", default=True, show_default=True,
-              help="Learn J/R/B matrices; --no-learn-structure fixes J to canonical symplectic, R=0, B=1")
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=8, show_default=True)
@@ -944,7 +885,7 @@ def cli():
               help="Steps per val episode (0 = 2x --max-steps)")
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
 def phase1_cmd(**kwargs):
-    """Phase 1: train HGN autoencoder (encoder + f_psi + decoder)."""
+    """Phase 1: train the LSTM autoencoder (encoder + f_psi + decoder)."""
     assert kwargs["img_size"] % 8 == 0
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -993,28 +934,23 @@ def phase1_cmd(**kwargs):
     )
     print(f"Dataset: {len(dataset)} episodes")
 
-    model = ControlledDHGN_LSTM(
-        pos_ch=kwargs["pos_ch"],
-        img_ch=3,
-        dt=kwargs["dt"],
-        feat_dim=kwargs["feat_dim"],
+    model = LSTMAutoencoder(
         latent_dim=kwargs["latent_dim"],
+        feat_dim=kwargs["feat_dim"],
+        pos_ch=kwargs["pos_ch"],
         img_size=kwargs["img_size"],
         control_dim=1,
-        separable=kwargs["separable"],
-        learn_structure=kwargs["learn_structure"],
-        damping=kwargs["damping"],
     ).to(device)
     print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Only train reconstruction components — Hamiltonian/structure unused in Phase 1
-    optimizer = torch.optim.Adam(
-        list(model.encoder.parameters())
-        + list(model.f_psi.parameters())
-        + list(model.decoder.parameters())
-        + list(model.next_frame_decoder.parameters()),
-        lr=kwargs["lr"],
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
+
+    # How the training episodes were collected — saved into the checkpoint so
+    # Phase 2 and the dashboard can reproduce matching episodes.
+    data_config = {k: kwargs[k] for k in (
+        "n_episodes", "img_size", "epsilon", "energy_k", "max_steps", "damping",
+    )}
+    world_model = WorldModel(model, dynamics=None, data_config=data_config)
 
     hparams = {k: v for k, v in kwargs.items()}
     _log_hparams_text(writer, hparams)
@@ -1113,11 +1049,11 @@ def phase1_cmd(**kwargs):
             and (epoch + 1) % kwargs["checkpoint_every"] == 0
             and metrics["phase1/loss"] < best_loss
         ):
-            save_checkpoint(run_dir, epoch, model, hparams, metrics, stem="best")
+            world_model.save(run_dir, "best", hparams, metrics, epoch)
             best_loss = metrics["phase1/loss"]
 
     # Always save final checkpoint
-    save_checkpoint(run_dir, epoch, model, hparams, metrics, stem="final")
+    world_model.save(run_dir, "final", hparams, metrics, epoch)
 
     # Precompute and save h_t cache
     print(f"\nPrecomputing h_t cache for {len(episodes)} episodes...")
@@ -1133,25 +1069,33 @@ def phase1_cmd(**kwargs):
 
 
 @cli.command("phase2")
-# input — architecture + data params are loaded from the Phase 1 YAML
+# input — architecture + data params are loaded from the Phase 1 checkpoint
 @click.option("--phase1-run", type=str, required=True,
-              help="Path to a Phase 1 run directory; loads best.yaml for arch/data params, "
-                   "best.pt for the model, and h_cache.pt for latents")
+              help="Path to a Phase 1 run directory; loads best.pt (arch/data config + "
+                   "autoencoder weights) and h_cache.pt for latents")
 @click.option("--phase1-checkpoint", type=str, default=None,
-              help="Override the Phase 1 model checkpoint (default: {phase1-run}/best.pt)")
+              help="Override the Phase 1 checkpoint (default: {phase1-run}/best.pt, "
+                   "falling back to final.pt)")
 @click.option("--h-cache", type=str, default=None,
               help="Override the h_t cache path (default: {phase1-run}/h_cache.pt)")
+# dynamics model
+@click.option("--dt", type=float, default=0.05, show_default=True,
+              help="Integration step size (should match the env frame interval)")
+@click.option("--separable/--no-separable", default=True, show_default=True,
+              help="Use a separable Hamiltonian H = T(p) + V(q); required for --integrator leapfrog")
+@click.option("--learn-structure/--no-learn-structure", default=True, show_default=True,
+              help="Learn R/B matrices; --no-learn-structure fixes R from the data damping, B=1")
+@click.option("--integrator", type=click.Choice(["rk4", "leapfrog"]), default="leapfrog",
+              show_default=True,
+              help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
+                   "separable H) or 'rk4' (classic 4-stage, works for any structure)")
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=8, show_default=True)
 @click.option("--lr", type=float, default=1e-4, show_default=True)
 @click.option("--structural-lr", type=float, default=1e-2, show_default=True,
-              help="Learning rate for J/R/B structure matrices")
+              help="Learning rate for the R/B structure matrices (only with --learn-structure)")
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
-@click.option("--integrator", type=click.Choice(["rk4", "leapfrog"]), default="leapfrog",
-              show_default=True,
-              help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
-                   "separable H) or 'rk4' (classic 4-stage, works for any structure)")
 @click.option("--quadratic-t/--no-quadratic-t", default=True, show_default=True,
               help="Kinetic energy as a PSD quadratic form T(p) = ½ pᵀM⁻¹p with learned "
                    "constant mass (convex, T(0)=0, even in p) instead of a free MLP; "
@@ -1197,74 +1141,71 @@ def phase2_cmd(**kwargs):
     print(f"Device: {device}")
 
     run1 = Path(kwargs["phase1_run"])
-    hp1 = _load_phase1_hparams(run1)
-    print("Loaded Phase 1 hparams: " + ", ".join(
-        f"{k}={hp1[k]}" for k in
-        ("latent_dim", "img_size", "feat_dim", "pos_ch", "dt", "separable", "learn_structure", "damping")
-    ))
-
-    phase1_ckpt = kwargs["phase1_checkpoint"] or str(run1 / "best.pt")
+    if kwargs["phase1_checkpoint"]:
+        phase1_ckpt = Path(kwargs["phase1_checkpoint"])
+    else:
+        phase1_ckpt = run1 / "best.pt"
+        if not phase1_ckpt.exists():
+            phase1_ckpt = run1 / "final.pt"
+    if not phase1_ckpt.exists():
+        raise click.UsageError(
+            f"No Phase 1 checkpoint found in {run1} (expected best.pt or final.pt)."
+        )
     h_cache_path = kwargs["h_cache"] or str(run1 / "h_cache.pt")
 
     writer = SummaryWriter(comment="_pendulum_offline_phase2")
     run_dir = make_run_dir("pendulum_offline_phase2")
 
-    # Load Phase 1 model (kept alive for dreaming video logs)
-    phase1_model = None
-    if Path(phase1_ckpt).exists():
-        print(f"Loading Phase 1 model from {phase1_ckpt}...")
-        phase1_model = _make_phase1_model(hp1, device)
-        phase1_model.load_state_dict(
-            torch.load(phase1_ckpt, map_location=device, weights_only=True)
-        )
-        phase1_model.eval()
-    else:
-        print(f"Warning: {phase1_ckpt} not found — dreaming video logs will be skipped.")
+    # Load the Phase 1 world model (autoencoder kept alive for dreaming video logs)
+    print(f"Loading Phase 1 checkpoint from {phase1_ckpt}...")
+    world_model = load_world_model(phase1_ckpt, device)
+    phase1_model = world_model.autoencoder
+    data_cfg = world_model.data_config
+    print("Phase 1 config: " + ", ".join(
+        f"{k}={v}" for k, v in {**phase1_model.config, **data_cfg}.items()
+    ))
 
     # Load h_cache
-    if Path(h_cache_path).exists():
-        print(f"Loading h_cache from {h_cache_path}...")
-        cache = torch.load(h_cache_path, weights_only=False)
-    elif phase1_model is not None:
+    if not Path(h_cache_path).exists():
         raise click.UsageError(
             f"h_cache not found at {h_cache_path}. "
             "Re-run Phase 1 to regenerate it, or pass --h-cache explicitly."
         )
-    else:
-        raise click.UsageError(
-            "--phase1-run must point to a directory containing h_cache.pt and best.pt."
-        )
+    print(f"Loading h_cache from {h_cache_path}...")
+    cache = torch.load(h_cache_path, weights_only=False)
 
-    # Collect val episodes (only if dreaming logs are enabled and Phase 1 model is available)
+    # Collect val episodes (only if dreaming logs are enabled)
     train_sample_trajs = []
     val_energy, val_random, val_spin = [], [], []
-    if kwargs["val_every"] > 0 and phase1_model is not None:
+    if kwargs["val_every"] > 0:
         n_val = kwargs["n_val_episodes"]
         if n_val < 0:
-            n_val = hp1.get("n_episodes", 200) // 2
-        val_steps = kwargs["val_max_steps"] or hp1.get("max_steps", 200) * 2
+            n_val = data_cfg.get("n_episodes", 200) // 2
+        val_steps = kwargs["val_max_steps"] or data_cfg.get("max_steps", 200) * 2
+        img_size = data_cfg.get("img_size", 64)
+        damping = data_cfg.get("damping", 0.0)
         print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
         val_energy = collect_val_trajectories(
-            n_episodes=n_val, img_size=hp1["img_size"],
-            max_steps=val_steps, energy_k=hp1.get("energy_k", 1.0),
-            damping=hp1.get("damping", 0.0),
+            n_episodes=n_val, img_size=img_size,
+            max_steps=val_steps, energy_k=data_cfg.get("energy_k", 1.0),
+            damping=damping,
         )
         val_random = collect_random_trajectories(
-            n_episodes=n_val, img_size=hp1["img_size"],
-            max_steps=val_steps, damping=hp1.get("damping", 0.0),
+            n_episodes=n_val, img_size=img_size,
+            max_steps=val_steps, damping=damping,
         )
         val_spin = collect_spin_trajectories(
-            n_episodes=n_val, img_size=hp1["img_size"],
-            max_steps=val_steps, damping=hp1.get("damping", 0.0),
+            n_episodes=n_val, img_size=img_size,
+            max_steps=val_steps, damping=damping,
         )
         print("Collecting 3 training-distribution episodes for video logging...")
         train_sample_trajs = collect_data(
             n_episodes=3,
-            img_size=hp1["img_size"],
-            epsilon=hp1.get("epsilon", 0.1),
-            energy_k=hp1.get("energy_k", 1.0),
-            max_steps=hp1.get("max_steps", 200),
-            damping=hp1.get("damping", 0.0),
+            img_size=img_size,
+            epsilon=data_cfg.get("epsilon", 0.1),
+            energy_k=data_cfg.get("energy_k", 1.0),
+            max_steps=data_cfg.get("max_steps", 200),
+            damping=damping,
         )
 
     # Infer latent_dim from cache (authoritative; overrides any stale default)
@@ -1290,16 +1231,17 @@ def phase2_cmd(**kwargs):
     dyn_model = HamiltonianFlowModel(
         latent_dim=latent_dim,
         control_dim=1,
-        separable=hp1["separable"],
-        learn_structure=hp1["learn_structure"],
-        dt=hp1["dt"],
-        damping=hp1["damping"],
+        separable=kwargs["separable"],
+        learn_structure=kwargs["learn_structure"],
+        dt=kwargs["dt"],
+        damping=data_cfg.get("damping", 0.0),
         integrator=kwargs["integrator"],
         quadratic_t=kwargs["quadratic_t"],
     ).to(device)
     print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
+    world_model.dynamics = dyn_model
 
-    if hp1["learn_structure"]:
+    if kwargs["learn_structure"]:
         optimizer = torch.optim.Adam([
             {
                 "params": (
@@ -1316,13 +1258,10 @@ def phase2_cmd(**kwargs):
     else:
         optimizer = torch.optim.Adam(dyn_model.parameters(), lr=kwargs["lr"])
 
-    # Store both phase2 CLI kwargs and the phase1 arch params that govern the run
+    # Store both phase2 CLI kwargs and the phase1 arch/data params that govern the run
     hparams = {
         **kwargs,
-        "phase1_hparams": {k: hp1[k] for k in (
-            "latent_dim", "pos_ch", "feat_dim", "img_size", "dt",
-            "separable", "learn_structure", "damping",
-        )},
+        "phase1_config": {**phase1_model.config, **data_cfg},
     }
     _log_hparams_text(writer, hparams)
     _log_hparams_table(writer, hparams, {})
@@ -1389,7 +1328,7 @@ def phase2_cmd(**kwargs):
             writer.add_scalar("phase2/seq_len", seq_len, epoch)
             writer.add_scalar("phase2/ema_loss", ema_loss, epoch)
             writer.add_scalar("phase2/ema_cl", ema_cl, epoch)
-            if hp1["learn_structure"]:
+            if kwargs["learn_structure"]:
                 writer.add_scalar(
                     "phase2/structure/B_norm",
                     dyn_model.get_B().norm().item(),
@@ -1409,63 +1348,56 @@ def phase2_cmd(**kwargs):
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
             _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
-            if phase1_model is not None:
-                for val_trajs, label in (
-                    (val_energy, "energy_pump"),
-                    (val_random, "random"),
-                    (val_spin, "spin"),
-                ):
-                    if val_trajs:
-                        val_loss_metrics = _eval_loss_phase2(
-                            phase1_model=phase1_model,
-                            dyn_model=dyn_model,
-                            val_trajs=val_trajs,
-                            device=device,
-                        )
-                        for k, v in val_loss_metrics.items():
-                            writer.add_scalar(f"{k}/{label}", v, epoch)
-                        _log_phase_space_regression_phase2(
-                            phase1_model=phase1_model,
-                            dyn_model=dyn_model,
-                            val_trajs=val_trajs,
-                            device=device,
-                            writer=writer,
-                            epoch=epoch,
-                            tag=f"val/phase_space_regression/{label}",
-                        )
-                        _log_dreamed_video_phase2(
-                            phase1_model=phase1_model,
-                            dyn_model=dyn_model,
-                            val_traj=val_trajs[0],
-                            device=device,
-                            writer=writer,
-                            epoch=epoch,
-                            seq_len=seq_len,
-                            context_frames=kwargs["val_context_frames"],
-                            tag=f"val/dreamed_phase2/{label}",
-                        )
-                for i, train_traj in enumerate(train_sample_trajs):
-                    _log_dreamed_video_phase2(
-                        phase1_model=phase1_model,
-                        dyn_model=dyn_model,
-                        val_traj=train_traj,
+            for val_trajs, label in (
+                (val_energy, "energy_pump"),
+                (val_random, "random"),
+                (val_spin, "spin"),
+            ):
+                if val_trajs:
+                    val_loss_metrics = _eval_loss_phase2(
+                        world_model=world_model,
+                        val_trajs=val_trajs,
                         device=device,
+                    )
+                    for k, v in val_loss_metrics.items():
+                        writer.add_scalar(f"{k}/{label}", v, epoch)
+                    _log_phase_space_regression_phase2(
+                        world_model=world_model,
+                        val_trajs=val_trajs,
+                        device=device,
+                        writer=writer,
+                        epoch=epoch,
+                        tag=f"val/phase_space_regression/{label}",
+                    )
+                    _log_dreamed_video_phase2(
+                        world_model=world_model,
+                        val_traj=val_trajs[0],
                         writer=writer,
                         epoch=epoch,
                         seq_len=seq_len,
                         context_frames=kwargs["val_context_frames"],
-                        tag=f"train/dreamed_phase2/sample_{i}",
+                        tag=f"val/dreamed_phase2/{label}",
                     )
+            for i, train_traj in enumerate(train_sample_trajs):
+                _log_dreamed_video_phase2(
+                    world_model=world_model,
+                    val_traj=train_traj,
+                    writer=writer,
+                    epoch=epoch,
+                    seq_len=seq_len,
+                    context_frames=kwargs["val_context_frames"],
+                    tag=f"train/dreamed_phase2/sample_{i}",
+                )
 
         if (
             kwargs["checkpoint_every"] > 0
             and (epoch + 1) % kwargs["checkpoint_every"] == 0
             and metrics["phase2/dynamics"] < best_loss
         ):
-            save_checkpoint(run_dir, epoch, dyn_model, hparams, metrics, stem="best")
+            world_model.save(run_dir, "best", hparams, metrics, epoch)
             best_loss = metrics["phase2/dynamics"]
 
-    save_checkpoint(run_dir, epoch, dyn_model, hparams, metrics, stem="final")
+    world_model.save(run_dir, "final", hparams, metrics, epoch)
 
     writer.close()
     print("\nDone. Run: tensorboard --logdir runs")
