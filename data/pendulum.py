@@ -301,6 +301,60 @@ def collect_spin_trajectories(
     )
 
 
+def _collect_zero_episodes(
+    n_episodes: int,
+    img_size: int,
+    max_steps: int,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Collect episodes with the action fixed at zero (uncontrolled dynamics)."""
+    env = PendulumPixelEnv(img_size=img_size, damping=damping)
+    episodes = []
+
+    try:
+        for _ in tqdm(range(n_episodes), desc="Val trajectories (zero action)"):
+            obs, _ = env.reset()
+            theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+            frames = [torch.from_numpy(obs).float() / 255.0]
+            actions = []
+            states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+
+            for _ in range(max_steps):
+                action = 0.0
+                obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+                theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
+                frames.append(torch.from_numpy(obs).float() / 255.0)
+                actions.append(action)
+                states.append(np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32))
+
+            episodes.append(
+                (
+                    torch.stack(frames),
+                    torch.tensor(actions, dtype=torch.float32),
+                    torch.from_numpy(np.stack(states)),  # (T+1, 3)
+                )
+            )
+    finally:
+        env.close()
+
+    return episodes
+
+
+def collect_zero_trajectories(
+    n_episodes: int,
+    img_size: int,
+    max_steps: int = 200,
+    damping: float = 0.0,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Collect episodes with action always zero (uncontrolled dynamics)."""
+    return _collect_zero_episodes(
+        n_episodes=n_episodes,
+        img_size=img_size,
+        max_steps=max_steps,
+        damping=damping,
+    )
+
+
 # ── State-only data collection (no pixel rendering) ──────────────────────────
 
 

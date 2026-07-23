@@ -29,6 +29,7 @@ from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
+    collect_zero_trajectories,
 )
 from hamilton_rl.models import WorldModel
 
@@ -48,6 +49,7 @@ _POLICY_LABELS = {
     "energy_pump": "Energy pump",
     "random": "Random",
     "spin": "Spin",
+    "zero": "Zero action (uncontrolled)",
 }
 
 
@@ -72,6 +74,8 @@ def collect_pendulum_episode(
         eps = collect_random_trajectories(**common)
     elif policy == "spin":
         eps = collect_spin_trajectories(**common)
+    elif policy == "zero":
+        eps = collect_zero_trajectories(**common)
     else:
         raise ValueError(f"Unknown policy: {policy!r}")
     return eps[0]
