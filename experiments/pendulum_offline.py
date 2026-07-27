@@ -52,6 +52,7 @@ from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
+    _energy
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
 from hamilton_rl.models import HamiltonianFlowModel, LSTMAutoencoder, WorldModel
@@ -113,6 +114,62 @@ def _log_hparams_table(
     """Log flattened hparams + final metrics to the TB HParams tab for cross-run filtering."""
     writer.add_hparams(_flatten_hparams(hparams), final_metrics, run_name=".")
 
+def _energy_sweep(
+    H,
+    min_vel=-10,
+    max_vel=10,
+    min_angle=-torch.pi,
+    max_angle=torch.pi,
+    resolution=20,
+):
+    """Compute and log an energy landscape across angle and angular velocity"""
+    theta_dot = torch.linspace(min_vel, max_vel, resolution)
+    theta = torch.linspace(min_angle, max_angle, resolution)
+
+    output = H(theta[:, None], theta_dot[None, :])
+
+    return output
+
+
+def _plot_energy_sweep(
+    H,
+    min_vel=-10,
+    max_vel=10,
+    min_angle=-torch.pi,
+    max_angle=torch.pi,
+    resolution=20,
+    ax: plt.Axes | None = None,
+) -> plt.Figure:
+    """Render the energy landscape from _energy_sweep as a heatmap (θ x-axis, θ̇ y-axis)."""
+    output = _energy_sweep(
+        H,
+        min_vel=min_vel,
+        max_vel=max_vel,
+        min_angle=min_angle,
+        max_angle=max_angle,
+        resolution=resolution,
+    )
+    # output[i, j] = H(theta[i], theta_dot[j]); imshow expects rows=y, cols=x, so transpose.
+    grid = output.detach().cpu().numpy().T
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5))
+    else:
+        fig = ax.figure
+
+    im = ax.imshow(
+        grid,
+        origin="lower",
+        aspect="auto",
+        extent=[min_angle, max_angle, min_vel, max_vel],
+        cmap="viridis",
+    )
+    ax.set_xlabel("θ (rad)")
+    ax.set_ylabel("θ̇ (rad/s)")
+    ax.set_title("Energy landscape")
+    fig.colorbar(im, ax=ax, label="H(θ, θ̇)")
+
+    return fig
 
 # ---------------------------------------------------------------------------
 # Phase 1: autoencoder training
