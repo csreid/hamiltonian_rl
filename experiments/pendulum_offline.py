@@ -351,6 +351,7 @@ def _train_epoch_phase1(
     device: torch.device,
     temporal_reg_weight: float = 0.0,
     temporal_scale: float = 0.01,
+    sparsity_weight: float = 0.0,
     max_context_len: int = 0,
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
@@ -360,7 +361,7 @@ def _train_epoch_phase1(
       - h_t → next frame      (predictive signal; h_t has seen only 0..t)
     """
     model.train()
-    total_recon = total_recon_next = total_kl = total_temporal = total_loss = 0.0
+    total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_loss = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
@@ -403,6 +404,16 @@ def _train_epoch_phase1(
 
         loss = recon + recon_next + kl_weight * kl
 
+        # Sparsity regulariser: L1 on the latent mean pushes irrelevant
+        # dimensions to exactly 0 (unlike the KL term, which only pulls
+        # every dimension toward the unit prior). A sparse h also encourages
+        # markovian-ness for phase-2 dynamics learning by discouraging the
+        # encoder from spreading state across dimensions that aren't needed.
+        if sparsity_weight > 0:
+            sparsity = mu_all.abs().sum(dim=-1).mean()
+            loss = loss + sparsity_weight * sparsity
+            total_sparsity = total_sparsity + sparsity.detach()
+
         # Temporal metric regulariser: random pairs should be at least
         # temporal_scale * |t1 - t2| apart in h-space.  One-sided so we only
         # penalise being too close, not too far.
@@ -438,6 +449,7 @@ def _train_epoch_phase1(
         "phase1/recon_next": float(total_recon_next) / n,
         "phase1/kl": float(total_kl) / n,
         "phase1/temporal_reg": float(total_temporal) / n,
+        "phase1/sparsity": float(total_sparsity) / n,
     }
 
 
@@ -1093,6 +1105,8 @@ def cli():
               help="Temporal metric regulariser weight (0 to disable)")
 @click.option("--temporal-scale", type=float, default=0.01, show_default=True,
               help="Expected h-space distance per timestep")
+@click.option("--sparsity-weight", type=float, default=0.0, show_default=True,
+              help="L1 penalty on latent mean, pushes irrelevant dims to 0 (0 to disable)")
 @click.option("--ema-alpha", type=float, default=0.99, show_default=True)
 @click.option("--convergence-patience", type=int, default=0, show_default=True,
               help="Epochs of stable EMA before stopping; 0 disables")
@@ -1193,6 +1207,7 @@ def phase1_cmd(**kwargs):
             device=device,
             temporal_reg_weight=kwargs["temporal_reg_weight"],
             temporal_scale=kwargs["temporal_scale"],
+            sparsity_weight=kwargs["sparsity_weight"],
             max_context_len=kwargs["max_context_len"],
         )
 
