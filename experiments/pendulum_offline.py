@@ -196,20 +196,27 @@ def _collect_qp_samples(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Roll out real trajectories and encode them through the full model.
 
-    Random-action trajectories give broad state-space coverage. Encoding the
-    real frame sequence (rather than synthetic per-point clips) lets the
-    causal LSTM infer velocity from actual motion, exactly as at train time.
+    Mixes three policies for state-space coverage: random torque (broad but,
+    per earlier plots, tends to trace a near-1D energy band), spin-maximising
+    (drives high |theta_dot| regardless of angle), and energy-pumping
+    (drives toward upright with the classic swing-up energy-shaping law) —
+    together these decorrelate position and velocity better than any one
+    alone. Encoding the real frame sequence (rather than synthetic per-point
+    clips) lets the causal LSTM infer velocity from actual motion, exactly
+    as at train time.
 
     Returns:
-        q, p: each (N, q_dim) learned latents, N = n_episodes * (max_steps + 1)
+        q, p: each (N, q_dim) learned latents, N = 3 * n_episodes * (max_steps + 1)
         H_true: (N,) ground-truth pendulum energy at each sampled timestep
     """
     if device is None:
         device = next(model.autoencoder.parameters()).device
     img_size = model.data_config.get("img_size", 64)
 
-    episodes = collect_random_trajectories(
-        n_episodes=n_episodes, img_size=img_size, max_steps=max_steps
+    episodes = (
+        collect_random_trajectories(n_episodes=n_episodes, img_size=img_size, max_steps=max_steps)
+        + collect_spin_trajectories(n_episodes=n_episodes, img_size=img_size, max_steps=max_steps)
+        + collect_val_trajectories(n_episodes=n_episodes, img_size=img_size, max_steps=max_steps)
     )
 
     qs, ps, energies = [], [], []
