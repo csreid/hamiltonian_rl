@@ -52,7 +52,8 @@ from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
-    _energy
+    _energy,
+    _G,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
 from hamilton_rl.models import HamiltonianFlowModel, LSTMAutoencoder, WorldModel
@@ -168,6 +169,151 @@ def _plot_energy_sweep(
     ax.set_ylabel("θ̇ (rad/s)")
     ax.set_title("Energy landscape")
     fig.colorbar(im, ax=ax, label="H(θ, θ̇)")
+
+    return fig
+
+
+def _pca_top_direction(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Top principal component of (N, D) via SVD.
+
+    Returns (mean, unit direction, projection (N,), explained-variance ratio).
+    """
+    mean = X.mean(dim=0)
+    Xc = X - mean
+    _, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+    direction = Vh[0]
+    projection = Xc @ direction
+    explained = (S[0] ** 2 / (S ** 2).sum()).item()
+    return mean, direction, projection, explained
+
+
+@torch.no_grad()
+def _collect_qp_samples(
+    model: WorldModel,
+    n_episodes: int = 5,
+    max_steps: int = 200,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Roll out real trajectories and encode them through the full model.
+
+    Random-action trajectories give broad state-space coverage. Encoding the
+    real frame sequence (rather than synthetic per-point clips) lets the
+    causal LSTM infer velocity from actual motion, exactly as at train time.
+
+    Returns:
+        q, p: each (N, q_dim) learned latents, N = n_episodes * (max_steps + 1)
+        H_true: (N,) ground-truth pendulum energy at each sampled timestep
+    """
+    if device is None:
+        device = next(model.autoencoder.parameters()).device
+    img_size = model.data_config.get("img_size", 64)
+
+    episodes = collect_random_trajectories(
+        n_episodes=n_episodes, img_size=img_size, max_steps=max_steps
+    )
+
+    qs, ps, energies = [], [], []
+    for frames, _actions, states in episodes:
+        mu_all, _ = model.autoencoder.encoder.forward_all(frames.unsqueeze(0).to(device))
+        h = mu_all.squeeze(0)  # (T+1, latent_dim)
+        q, p = model.dynamics.encode(h)
+        qs.append(q.cpu())
+        ps.append(p.cpu())
+
+        theta = torch.atan2(states[:, 1], states[:, 0])
+        theta_dot = states[:, 2]
+        energies.append(0.5 * theta_dot**2 + _G * (1.0 + torch.cos(theta)))
+
+    return torch.cat(qs), torch.cat(ps), torch.cat(energies)
+
+
+@torch.no_grad()
+def _learned_energy_landscape(
+    model: WorldModel,
+    q: torch.Tensor,
+    p: torch.Tensor,
+    resolution: int = 40,
+) -> dict:
+    """PCA-reduce q, p to their top component each and sweep learned H over that 2D slice.
+
+    Grid point (alpha, beta) maps back to the full latent as
+    q_mean + alpha * q_dir (other q dims held at their sample mean), and
+    likewise for p — so the sweep only covers the affine plane through the
+    observed data. Outside [min, max] of the observed projections it's
+    extrapolation into latent space the model never saw.
+    """
+    device = next(model.autoencoder.parameters()).device
+    q_mean, q_dir, q_proj, q_explained = _pca_top_direction(q)
+    p_mean, p_dir, p_proj, p_explained = _pca_top_direction(p)
+
+    alpha = torch.linspace(q_proj.min().item(), q_proj.max().item(), resolution)
+    beta = torch.linspace(p_proj.min().item(), p_proj.max().item(), resolution)
+
+    q_full = (q_mean[None, :] + alpha[:, None] * q_dir[None, :]).to(device)  # (res, q_dim)
+    p_full = (p_mean[None, :] + beta[:, None] * p_dir[None, :]).to(device)   # (res, q_dim)
+
+    q_rep = q_full.unsqueeze(1).expand(-1, resolution, -1).reshape(-1, q_full.shape[-1])
+    p_rep = p_full.unsqueeze(0).expand(resolution, -1, -1).reshape(-1, p_full.shape[-1])
+    pred = model.dynamics.hamiltonian(q_rep, p_rep).reshape(resolution, resolution).cpu()
+
+    return {
+        "alpha": alpha,
+        "beta": beta,
+        "pred": pred,
+        "q_proj": q_proj,
+        "p_proj": p_proj,
+        "q_explained": q_explained,
+        "p_explained": p_explained,
+    }
+
+
+def _plot_learned_energy_landscape(
+    model: WorldModel,
+    n_episodes: int = 5,
+    max_steps: int = 200,
+    resolution: int = 40,
+    device: torch.device | None = None,
+) -> plt.Figure:
+    """Sanity-check the learned Hamiltonian's shape against the true pendulum energy.
+
+    q and p are learned latents (q_dim = p_dim = latent_dim // 2), not
+    literally (θ, θ̇), and H is only constrained through its gradient, so the
+    two panels can only be expected to agree in *shape* — up to an unknown
+    affine offset/scale (or even an axis flip) — not in absolute value.
+
+    Left panel:  learned H swept over the top-PC slice of (q, p), with the
+                 actual sampled points overlaid.
+    Right panel: those same sampled points, colored by their true energy.
+    """
+    q, p, H_true = _collect_qp_samples(model, n_episodes=n_episodes, max_steps=max_steps, device=device)
+    land = _learned_energy_landscape(model, q, p, resolution=resolution)
+
+    fig, (ax_pred, ax_true) = plt.subplots(1, 2, figsize=(11, 5))
+
+    im = ax_pred.imshow(
+        land["pred"].numpy().T,
+        origin="lower",
+        aspect="auto",
+        extent=[
+            land["alpha"][0].item(), land["alpha"][-1].item(),
+            land["beta"][0].item(), land["beta"][-1].item(),
+        ],
+        cmap="viridis",
+    )
+    ax_pred.scatter(land["q_proj"], land["p_proj"], c="white", s=4, alpha=0.3, linewidths=0)
+    ax_pred.set_xlabel(f"q PC1 ({land['q_explained']:.0%} var)")
+    ax_pred.set_ylabel(f"p PC1 ({land['p_explained']:.0%} var)")
+    ax_pred.set_title("Learned H (PCA slice)")
+    fig.colorbar(im, ax=ax_pred, label="learned H")
+
+    sc = ax_true.scatter(land["q_proj"], land["p_proj"], c=H_true, cmap="viridis", s=8)
+    ax_true.set_xlabel(f"q PC1 ({land['q_explained']:.0%} var)")
+    ax_true.set_ylabel(f"p PC1 ({land['p_explained']:.0%} var)")
+    ax_true.set_title("True energy at same points")
+    fig.colorbar(sc, ax=ax_true, label="true H")
+
+    fig.suptitle("Learned vs. true energy landscape (PCA sanity check)")
+    fig.tight_layout()
 
     return fig
 
