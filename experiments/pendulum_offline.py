@@ -173,18 +173,19 @@ def _plot_energy_sweep(
     return fig
 
 
-def _pca_top_direction(X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
-    """Top principal component of (N, D) via SVD.
+def _pca_top_k(X: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Top-k principal components of (N, D) via SVD.
 
-    Returns (mean, unit direction, projection (N,), explained-variance ratio).
+    Returns (mean (D,), directions (k, D) unit/orthogonal, projections (N, k),
+    explained-variance ratios (k,)).
     """
     mean = X.mean(dim=0)
     Xc = X - mean
     _, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
-    direction = Vh[0]
-    projection = Xc @ direction
-    explained = (S[0] ** 2 / (S ** 2).sum()).item()
-    return mean, direction, projection, explained
+    directions = Vh[:k]
+    projections = Xc @ directions.T
+    explained = S[:k] ** 2 / (S**2).sum()
+    return mean, directions, projections, explained
 
 
 @torch.no_grad()
@@ -241,36 +242,46 @@ def _learned_energy_landscape(
     p: torch.Tensor,
     resolution: int = 40,
 ) -> dict:
-    """PCA-reduce q, p to their top component each and sweep learned H over that 2D slice.
+    """PCA the full (q, p) latent jointly and sweep learned H over its top-2 slice.
+
+    q and p individually turn out to be nearly collinear in practice (the
+    flow leaks information between blocks — see conversation), so PCA-ing
+    them separately just rediscovers the same axis twice. Doing PCA on the
+    concatenated z = [q, p] and taking its top 2 components instead finds
+    whatever 2 directions actually carry the most variance, regardless of
+    which block they fall in.
 
     Grid point (alpha, beta) maps back to the full latent as
-    q_mean + alpha * q_dir (other q dims held at their sample mean), and
-    likewise for p — so the sweep only covers the affine plane through the
-    observed data. Outside [min, max] of the observed projections it's
-    extrapolation into latent space the model never saw.
+    z_mean + alpha * dir0 + beta * dir1 (all other PCs held at their sample
+    mean), then split back into (q, p) halves for the Hamiltonian. Outside
+    [min, max] of the observed projections it's extrapolation into latent
+    space the model never saw.
     """
     device = next(model.autoencoder.parameters()).device
-    q_mean, q_dir, q_proj, q_explained = _pca_top_direction(q)
-    p_mean, p_dir, p_proj, p_explained = _pca_top_direction(p)
+    q_dim = q.shape[-1]
+    z = torch.cat([q, p], dim=-1)
+    z_mean, directions, proj, explained = _pca_top_k(z, k=2)
+    dir0, dir1 = directions[0], directions[1]
 
-    alpha = torch.linspace(q_proj.min().item(), q_proj.max().item(), resolution)
-    beta = torch.linspace(p_proj.min().item(), p_proj.max().item(), resolution)
+    alpha = torch.linspace(proj[:, 0].min().item(), proj[:, 0].max().item(), resolution)
+    beta = torch.linspace(proj[:, 1].min().item(), proj[:, 1].max().item(), resolution)
 
-    q_full = (q_mean[None, :] + alpha[:, None] * q_dir[None, :]).to(device)  # (res, q_dim)
-    p_full = (p_mean[None, :] + beta[:, None] * p_dir[None, :]).to(device)   # (res, q_dim)
+    grid_a, grid_b = torch.meshgrid(alpha, beta, indexing="ij")  # each (res, res)
+    z_grid = (
+        z_mean[None, None, :]
+        + grid_a[:, :, None] * dir0[None, None, :]
+        + grid_b[:, :, None] * dir1[None, None, :]
+    ).reshape(-1, z_mean.shape[-1]).to(device)  # (res*res, latent_dim)
 
-    q_rep = q_full.unsqueeze(1).expand(-1, resolution, -1).reshape(-1, q_full.shape[-1])
-    p_rep = p_full.unsqueeze(0).expand(resolution, -1, -1).reshape(-1, p_full.shape[-1])
-    pred = model.dynamics.hamiltonian(q_rep, p_rep).reshape(resolution, resolution).cpu()
+    q_grid, p_grid = z_grid[:, :q_dim], z_grid[:, q_dim:]
+    pred = model.dynamics.hamiltonian(q_grid, p_grid).reshape(resolution, resolution).cpu()
 
     return {
         "alpha": alpha,
         "beta": beta,
         "pred": pred,
-        "q_proj": q_proj,
-        "p_proj": p_proj,
-        "q_explained": q_explained,
-        "p_explained": p_explained,
+        "proj": proj,
+        "explained": explained,
     }
 
 
@@ -288,12 +299,13 @@ def _plot_learned_energy_landscape(
     two panels can only be expected to agree in *shape* — up to an unknown
     affine offset/scale (or even an axis flip) — not in absolute value.
 
-    Left panel:  learned H swept over the top-PC slice of (q, p), with the
-                 actual sampled points overlaid.
+    Left panel:  learned H swept over the top-2-PC slice of the joint
+                 [q, p] latent, with the actual sampled points overlaid.
     Right panel: those same sampled points, colored by their true energy.
     """
     q, p, H_true = _collect_qp_samples(model, n_episodes=n_episodes, max_steps=max_steps, device=device)
     land = _learned_energy_landscape(model, q, p, resolution=resolution)
+    proj = land["proj"]
 
     fig, (ax_pred, ax_true) = plt.subplots(1, 2, figsize=(11, 5))
 
@@ -307,15 +319,15 @@ def _plot_learned_energy_landscape(
         ],
         cmap="viridis",
     )
-    ax_pred.scatter(land["q_proj"], land["p_proj"], c="white", s=4, alpha=0.3, linewidths=0)
-    ax_pred.set_xlabel(f"q PC1 ({land['q_explained']:.0%} var)")
-    ax_pred.set_ylabel(f"p PC1 ({land['p_explained']:.0%} var)")
+    ax_pred.scatter(proj[:, 0], proj[:, 1], c="white", s=4, alpha=0.3, linewidths=0)
+    ax_pred.set_xlabel(f"[q,p] PC1 ({land['explained'][0]:.0%} var)")
+    ax_pred.set_ylabel(f"[q,p] PC2 ({land['explained'][1]:.0%} var)")
     ax_pred.set_title("Learned H (PCA slice)")
     fig.colorbar(im, ax=ax_pred, label="learned H")
 
-    sc = ax_true.scatter(land["q_proj"], land["p_proj"], c=H_true, cmap="viridis", s=8)
-    ax_true.set_xlabel(f"q PC1 ({land['q_explained']:.0%} var)")
-    ax_true.set_ylabel(f"p PC1 ({land['p_explained']:.0%} var)")
+    sc = ax_true.scatter(proj[:, 0], proj[:, 1], c=H_true, cmap="viridis", s=8)
+    ax_true.set_xlabel(f"[q,p] PC1 ({land['explained'][0]:.0%} var)")
+    ax_true.set_ylabel(f"[q,p] PC2 ({land['explained'][1]:.0%} var)")
     ax_true.set_title("True energy at same points")
     fig.colorbar(sc, ax=ax_true, label="true H")
 
