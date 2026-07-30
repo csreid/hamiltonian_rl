@@ -173,6 +173,32 @@ def _plot_energy_sweep(
     return fig
 
 
+def _plot_phase_space_coverage(
+    episodes: list,
+    ax: plt.Axes | None = None,
+) -> plt.Figure:
+    """Scatter every sampled (θ, θ̇) transition in ``episodes`` to eyeball state-space coverage."""
+    thetas, theta_dots = [], []
+    for _, _, states in episodes:
+        thetas.append(torch.atan2(states[:, 1], states[:, 0]))
+        theta_dots.append(states[:, 2])
+    theta_all = torch.cat(thetas).numpy()
+    theta_dot_all = torch.cat(theta_dots).numpy()
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5))
+    else:
+        fig = ax.figure
+
+    ax.scatter(theta_all, theta_dot_all, s=2, alpha=0.08, linewidths=0, color="tab:blue")
+    ax.set_xlabel("θ (rad)")
+    ax.set_ylabel("θ̇ (rad/s)")
+    ax.set_title(f"Training data phase-space coverage (N={len(theta_all):,})")
+    fig.tight_layout()
+
+    return fig
+
+
 def _pca_top_k(X: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Top-k principal components of (N, D) via SVD.
 
@@ -319,13 +345,13 @@ def _plot_learned_energy_landscape(
         ],
         cmap="viridis",
     )
-    ax_pred.scatter(proj[:, 0], proj[:, 1], c="white", s=4, alpha=0.3, linewidths=0)
+    ax_pred.scatter(proj[:, 0], proj[:, 1], c="white", s=4, alpha=0.12, linewidths=0)
     ax_pred.set_xlabel(f"[q,p] PC1 ({land['explained'][0]:.0%} var)")
     ax_pred.set_ylabel(f"[q,p] PC2 ({land['explained'][1]:.0%} var)")
     ax_pred.set_title("Learned H (PCA slice)")
     fig.colorbar(im, ax=ax_pred, label="learned H")
 
-    sc = ax_true.scatter(proj[:, 0], proj[:, 1], c=H_true, cmap="viridis", s=8)
+    sc = ax_true.scatter(proj[:, 0], proj[:, 1], c=H_true, cmap="viridis", s=8, alpha=0.3, linewidths=0)
     ax_true.set_xlabel(f"[q,p] PC1 ({land['explained'][0]:.0%} var)")
     ax_true.set_ylabel(f"[q,p] PC2 ({land['explained'][1]:.0%} var)")
     ax_true.set_title("True energy at same points")
@@ -556,7 +582,7 @@ def _log_latent_scatter_phase1(
         all_true_i, all_pred_i = [], []
         for j, label in enumerate(val_pred):
             true_i, pred_i = val_true[label][:, i], val_pred[label][:, i]
-            axes[i].scatter(true_i, pred_i, s=2, alpha=0.3, color=colors[j % len(colors)], label=label)
+            axes[i].scatter(true_i, pred_i, s=2, alpha=0.12, color=colors[j % len(colors)], label=label, linewidths=0)
             all_true_i.append(true_i)
             all_pred_i.append(pred_i)
         true_i = np.concatenate(all_true_i)
@@ -1048,7 +1074,7 @@ def _log_phase_space_regression_phase2(
     sc = None
     for i, name in enumerate(["cos(θ)", "sin(θ)", "θ̇ (rad/s)"]):
         true_i, pred_i = st_true[:, i], st_pred[:, i]
-        sc = axes[i].scatter(true_i, pred_i, c=val_idx, cmap="viridis", s=2, alpha=0.4)
+        sc = axes[i].scatter(true_i, pred_i, c=val_idx, cmap="viridis", s=2, alpha=0.15, linewidths=0)
         lo, hi = min(true_i.min(), pred_i.min()), max(true_i.max(), pred_i.max())
         axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
         axes[i].set_xlabel(f"True {name}")
@@ -1137,14 +1163,37 @@ def phase1_cmd(**kwargs):
     n_val = n_val_episodes if kwargs["val_every"] > 0 else 0
     val_steps = kwargs["val_max_steps"] or kwargs["max_steps"] * 2
 
-    print(f"\nCollecting {kwargs['n_episodes']} train episodes...")
-    episodes = collect_data(
-        n_episodes=kwargs["n_episodes"],
-        img_size=kwargs["img_size"],
-        epsilon=kwargs["epsilon"],
-        energy_k=kwargs["energy_k"],
-        max_steps=kwargs["max_steps"],
-        damping=kwargs["damping"],
+    # Mix three collection policies for training, same as the val split below —
+    # an epsilon-random/energy-pumping controller alone traces a near-1D energy
+    # band and under-covers the phase space (see _collect_qp_samples).
+    n_energy = kwargs["n_episodes"] // 3
+    n_random = kwargs["n_episodes"] // 3
+    n_spin = kwargs["n_episodes"] - n_energy - n_random
+    print(
+        f"\nCollecting {kwargs['n_episodes']} train episodes "
+        f"({n_energy} energy-pump, {n_random} random, {n_spin} spin)..."
+    )
+    episodes = (
+        collect_data(
+            n_episodes=n_energy,
+            img_size=kwargs["img_size"],
+            epsilon=kwargs["epsilon"],
+            energy_k=kwargs["energy_k"],
+            max_steps=kwargs["max_steps"],
+            damping=kwargs["damping"],
+        )
+        + collect_random_trajectories(
+            n_episodes=n_random,
+            img_size=kwargs["img_size"],
+            max_steps=kwargs["max_steps"],
+            damping=kwargs["damping"],
+        )
+        + collect_spin_trajectories(
+            n_episodes=n_spin,
+            img_size=kwargs["img_size"],
+            max_steps=kwargs["max_steps"],
+            damping=kwargs["damping"],
+        )
     )
 
     val_energy, val_random, val_spin = [], [], []
@@ -1162,6 +1211,10 @@ def phase1_cmd(**kwargs):
             n_episodes=n_val, img_size=kwargs["img_size"],
             max_steps=val_steps, damping=kwargs["damping"],
         )
+
+    coverage_fig = _plot_phase_space_coverage(episodes)
+    writer.add_figure("data/phase_space_coverage", coverage_fig, 0)
+    plt.close(coverage_fig)
 
     dataset = PendulumDataset(episodes)
     loader = DataLoader(
