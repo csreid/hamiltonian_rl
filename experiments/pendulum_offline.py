@@ -728,6 +728,7 @@ def _train_epoch_phase2(
     l1_weight: float = 0.0,
     max_seed_k: int = 0,
     teacher_force_weight: float = 1.0,
+    closed_loop_weight: float = 1.0,
     structural_reg_weight: float = 0.0,
     h_noise_std: float = 0.0,
     h_noise_scale: torch.Tensor | None = None,
@@ -824,7 +825,7 @@ def _train_epoch_phase2(
         )
         cl_loss = F.mse_loss(h_cl_pred, h_all[:, k + 1:k + 1 + T].reshape(B_size * T, D))
 
-        loss = logdet_reg + teacher_force_weight * tf_loss + cl_loss
+        loss = logdet_reg + teacher_force_weight * tf_loss + closed_loop_weight * cl_loss
 
         if l1_weight > 0:
             l1_loss = sum(param.abs().sum() for param in dyn_model.hamiltonian.parameters())
@@ -1398,6 +1399,8 @@ def phase1_cmd(**kwargs):
               help="Frobenius norm penalty on the learned dissipation R (Phase 2, learn-structure only); prevents it from growing unbounded")
 @click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
               help="Weight on teacher-forced 1-step loss (set 0 to disable)")
+@click.option("--closed-loop-weight", type=float, default=1.0, show_default=True,
+              help="Weight on closed-loop rollout loss (set 0 to disable)")
 @click.option("--h-noise-std", type=float, default=0.0, show_default=True,
               help="Zero-mean Gaussian noise added to h inputs (augmentation; targets "
                    "stay clean), as a multiplier on each h-dim's spread across the cache. "
@@ -1576,6 +1579,7 @@ def phase2_cmd(**kwargs):
             l1_weight=kwargs["l1_weight"],
             max_seed_k=kwargs["max_seed_k"],
             teacher_force_weight=kwargs["teacher_force_weight"],
+            closed_loop_weight=kwargs["closed_loop_weight"],
             structural_reg_weight=kwargs["structural_reg_weight"],
             h_noise_std=kwargs["h_noise_std"],
             h_noise_scale=h_noise_scale,
