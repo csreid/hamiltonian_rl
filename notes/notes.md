@@ -266,3 +266,32 @@ One large eigenvalue, 15 near zero — model correctly concentrates dissipation 
 * Symplectic core: kick-drift-kick on $\dot{z} = J \nabla \mathcal{H}$, with the control force $Bu$ folded into the half-kicks
 * Dissipation $\dot{z} = -R \nabla \mathcal{H}$ is Strang-split symmetrically around it --- still 2nd-order, reduces to pure leapfrog when $R = 0$
 * Why: symplectic integration preserves phase-space structure over long horizons --- no artificial energy drift from the integrator itself, which should help closed-loop rollout stability
+
+# 8/3
+
+## Problem: Phase Space Coverage
+
+* Suspected remaining problem was phase space coverage --- state and action need not be totally independent to still learn something useful (low-epsilon energy-pumping policy does fine)
+* Fix: sample data collection from a wider array of control policies instead of one
+* Added phase space coverage logging to tensorboard so coverage is visible, not just assumed
+
+## Rework: Cache Training Data, Not Latents
+
+* Previously cached $h$ encodings from phase 1 and reused them directly in phase 2 --- restricted phase 2 to always training on the first frames of each trajectory
+* Fix: cache the actual training data in phase 1, recompute latents in phase 2
+* Lets phase 2 sample arbitrary `seq_len` windows instead of just the start of the sequence
+* Bonus: caching raw data (not just latents) means phase space coverage can be analyzed after the fact
+
+## Problem: Closed-Loop Loss Causes Snapping
+
+* In some rollouts the dreamed pendulum drifts from ground truth, then "snaps back"
+* Diagnosis: equal weighting of every closed-loop step is wrong --- errors necessarily accumulate over a rollout, so early and late steps shouldn't count the same
+* Concretely: on spin trajectories, the dreamed pendulum stalls until the true pendulum catches up, then resumes --- looks like the dynamics don't know what to do at the stall point, but the loss is pulling toward where the pendulum "should" be many steps later
+* First pass: just disable the closed-loop loss entirely to isolate the effect
+  * Result: one-step loss isn't good enough
+* Longer-term idea: extend teacher forcing beyond next-step (e.g. 10-step) rather than all-or-nothing, and discount loss for later timesteps
+
+## Fix: Discount the Closed-Loop Loss
+
+* Root cause of the snap/reverse behavior: with all timesteps weighted equally, once the true pendulum passes antipodal to the dreamed one, the optimizer prefers slowing/reversing the dreamed pendulum to wait rather than accelerating to catch up
+* Fix: added $\gamma$ as a discount factor over rollout horizon, so later-stage antipodal states are downweighted rather than penalized fully

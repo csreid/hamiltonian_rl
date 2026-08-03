@@ -1,0 +1,27 @@
+.reveal .slides section {
+  text-align: left;
+}
+
+.reveal h1, .reveal h2 {
+  font-size: 1.4em;
+  margin-bottom: 0.5em;
+}
+
+.reveal h3 {
+  font-size: 1.1em;
+}
+
+.reveal p, .reveal li {
+  font-size: 0.75em;
+}
+
+.reveal img {
+  height: 400px;
+  width: auto;
+  display: block;
+  margin: 20px auto;
+  image-rendering: pixelated;
+  border: none;
+  box-shadow: none;
+  background: none;
+}

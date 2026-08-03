@@ -1,10 +1,19 @@
 <!DOCTYPE html>
+<html>
 <head>
   <meta charset="utf-8">
   <meta name="generator" content="pandoc">
   <meta name="author" content="Cameron">
   <title>Updates &amp; Notes</title>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, minimal-ui">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reset.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.css">
   <style>
+    .reveal .sourceCode {  /* see #7635 */
+      overflow: visible;
+    }
     code{white-space: pre-wrap;}
     span.smallcaps{font-variant: small-caps;}
     div.columns{display: flex; gap: min(4vw, 1.5em);}
@@ -19,180 +28,20 @@
       margin: 0 0.8em 0.2em -1.6em;
       vertical-align: middle;
     }
-    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
   </style>
-<style>
-  html, .view body { background-color: black; counter-reset: slideidx; }
-  body, .view section { background-color: white; border-radius: 12px }
-  /* A section is a slide. It's size is 800x600, and this will never change */
-  section, .view head > title {
-      font-family: 'DejaVu Sans Condensed', 'Liberation Sans', 'Nimbus Sans L', arial, serif;
-      font-size: 30px;
-  }
-
-  .view section:after {
-    counter-increment: slideidx;
-    content: counter(slideidx, decimal-leading-zero);
-    position: absolute; bottom: -80px; right: 100px;
-    color: white;
-  }
-
-  .view head > title {
-    color: white;
-    text-align: center;
-    margin: 1em 0 1em 0;
-  }
-
-  h1, h2 {
-    margin-top: 200px;
-    text-align: center;
-    font-size: 80px;
-  }
-  h3 {
-    margin: 100px 0 50px 100px;
-  }
-
-  ul {
-      margin: 50px 200px;
-  }
-  li > ul {
-      margin: 15px 50px;
-  }
-
-  p {
-    margin: 75px;
-    font-size: 50px;
-  }
-
-  blockquote {
-    height: 100%;
-    background-color: black;
-    color: white;
-    font-size: 60px;
-    padding: 50px;
-  }
-  blockquote:before {
-    content: open-quote;
-  }
-  blockquote:after {
-    content: close-quote;
-  }
-
-  /* Figures are displayed full-page, with the caption
-     on top of the image/video */
-  figure {
-    background-color: black;
-    width: 100%;
-    height: 100%;
-  }
-  figure > * {
-    position: absolute;
-  }
-  figure > img, figure > video {
-    width: 100%; height: 100%;
-  }
-  figcaption {
-    margin: 70px;
-    font-size: 50px;
-  }
-
-  footer {
-    position: absolute;
-    bottom: 0;
-    width: 100%;
-    padding: 40px;
-    text-align: right;
-    background-color: #F3F4F8;
-    border-top: 1px solid #CCC;
-  }
-
-  /* Transition effect */
-  /* Feel free to change the transition effect for original
-     animations. See here:
-     https://developer.mozilla.org/en/CSS/CSS_transitions
-     How to use CSS3 Transitions: */
-  section {
-    -moz-transition: left 400ms linear 0s;
-    -webkit-transition: left 400ms linear 0s;
-    -ms-transition: left 400ms linear 0s;
-    transition: left 400ms linear 0s;
-  }
-  .view section {
-    -moz-transition: none;
-    -webkit-transition: none;
-    -ms-transition: none;
-    transition: none;
-  }
-
-  .view section[aria-selected] {
-    border: 5px red solid;
-  }
-
-  /* Before */
-  section { left: -150%; }
-  /* Now */
-  section[aria-selected] { left: 0; }
-  /* After */
-  section[aria-selected] ~ section { left: +150%; }
-
-  /* Incremental elements */
-
-  /* By default, visible */
-  .incremental > * { opacity: 1; }
-
-  /* The current item */
-  .incremental > *[aria-selected] { opacity: 1; }
-
-  /* The items to-be-selected */
-  .incremental > *[aria-selected] ~ * { opacity: 0; }
-
-  /* The progressbar, at the bottom of the slides, show the global
-     progress of the presentation. */
-  #progress-bar {
-    height: 2px;
-    background: #AAA;
-  }
-</style>
-  <style>
-    section {
-      font-size: 16px;
-    }
-    h1, h2 {
-      margin-top: 20px;
-      margin-left: 20px;
-      text-align: left;
-      font-size: 32px;
-    }
-    h3 {
-      margin: 10px 0 20px 40px;
-      font-size: 24px;
-    }
-    ul {
-      margin: 20px 60px;
-    }
-    p {
-      margin: 20px 40px;
-      font-size: 16px;
-    }
-    ol {
-      margin: 20px 60px;
-    }
-    img {
-      height: 400px;
-      width: auto;
-      display: block;
-      margin: 0 auto;
-      image-rendering: pixelated;
-    }
-  </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/theme/moon.css" id="theme">
+  <link rel="stylesheet" href="reveal-style.css"/>
 </head>
 <body>
-<section class="title">
+  <div class="reveal">
+    <div class="slides">
+
+<section id="title-slide">
   <h1 class="title">Updates &amp; Notes</h1>
-  <footer>
-    <span class="author">Cameron</span> · 
-  </footer>
+  <p class="author">Cameron</p>
 </section>
+
+<section>
 <section id="structuredphysically-grounded-generative-networks"
 class="title-slide slide level1">
 <h1>Structured/Physically-Grounded Generative Networks</h1>
@@ -209,18 +58,18 @@ data-cites="toth2019hamiltonian">[@toth2019hamiltonian]</span></li>
 <section id="hgn" class="slide level2">
 <h2>HGN</h2>
 <ul>
-<li>Input: images <span
-class="math inline"> ∈ ℝ<sup>3 × <em>h</em> × <em>w</em></sup></span></li>
-<li>Map to phase space <span
-class="math inline">(<em>p</em>,<em>q</em>) ∈ ℝ<sup><em>n</em></sup></span></li>
+<li>Input: images <span class="math inline">\(\in \mathbb{R}^{3 \times h
+\times w}\)</span></li>
+<li>Map to phase space <span class="math inline">\((p,q) \in
+\mathbb{R}^n\)</span></li>
 <li>Learn the Hamiltonian <span
-class="math inline">ℋ(<em>p</em>,<em>q</em>)</span>
+class="math inline">\(\mathcal{H}(p,q)\)</span>
 <ul>
-<li>Perhaps specifically as <span
-class="math inline">ℋ(<em>p</em>,<em>q</em>) = <em>T</em>(<em>p</em>,<em>q</em>) + <em>V</em>(<em>q</em>)</span></li>
+<li>Perhaps specifically as <span class="math inline">\(\mathcal{H}(p,q)
+= T(p,q) + V(q)\)</span></li>
 </ul></li>
-<li>Simulate forward by integrating <span class="math inline">ℋ</span>
-forward</li>
+<li>Simulate forward by integrating <span
+class="math inline">\(\mathcal{H}\)</span> forward</li>
 </ul>
 </section>
 <section id="hgn-1" class="slide level2">
@@ -235,8 +84,8 @@ results</a>
 <li>(Some generalization issues)</li>
 </ul></li>
 </ul>
-</section>
-
+</section></section>
+<section>
 <section id="port-hamiltonian-neural-ode-for-robots"
 class="title-slide slide level1">
 <h1>Port-Hamiltonian Neural ODE for Robots</h1>
@@ -245,25 +94,23 @@ class="title-slide slide level1">
 <section id="dynamics" class="slide level2">
 <h2>Dynamics</h2>
 <ul>
-<li>Input is ~<span class="math inline">(<em>p</em>,<em>q</em>)</span>
-directly (computed from ground-truth position/velocity/etc data)</li>
+<li>Input is ~<span class="math inline">\((p,q)\)</span> directly
+(computed from ground-truth position/velocity/etc data)</li>
 <li>Learn a momentum:</li>
 </ul>
-<p><span class="math display">$$
+<p><span class="math display">\[
 \dot{p} = \text{ad}*(p) - D \cdot M^{-1} p - \frac{\partial V}{\partial
 q} + B \cdot u
-$$</span></p>
+\]</span></p>
 <ul>
 <li>And position:</li>
 </ul>
-<p><span
-class="math display"><em>q̇</em> = <em>M</em><sup>−1</sup><em>p</em></span></p>
+<p><span class="math display">\[\dot{q} = M^{-1}p\]</span></p>
 <ul>
-<li><span class="math inline"><em>M</em><sup>−1</sup></span>, <span
-class="math inline"><em>D</em></span>, <span
-class="math inline"><em>V</em></span>, <span
-class="math inline"><em>B</em></span> are all learned as neural
-networks</li>
+<li><span class="math inline">\(M^{-1}\)</span>, <span
+class="math inline">\(D\)</span>, <span
+class="math inline">\(V\)</span>, <span class="math inline">\(B\)</span>
+are all learned as neural networks</li>
 </ul>
 </section>
 <section id="notes" class="slide level2">
@@ -271,11 +118,10 @@ networks</li>
 <ul>
 <li>Extends to dissipation and control input</li>
 <li>Assumes highly informative/low-dimensional state input to compute
-initial <span class="math inline"><em>q</em>, <em>p</em></span>
-directly.</li>
+initial <span class="math inline">\(q, p\)</span> directly.</li>
 </ul>
-</section>
-
+</section></section>
+<section>
 <section id="plan" class="title-slide slide level1">
 <h1>Plan</h1>
 
@@ -299,19 +145,19 @@ data-cites="duong2024port">[@duong2024port]</span></li>
 <li>PH with Racecar (or similar)</li>
 <li>PH with our car</li>
 </ol>
-</section>
-
+</section></section>
+<section>
 <section id="section" class="title-slide slide level1">
 <h1>3/16</h1>
 
 </section>
 <section id="damped-sho" class="slide level2">
 <h2>Damped SHO</h2>
-<p><img src="images/damped.gif" /></p>
+<p><img data-src="images/damped.gif" /></p>
 </section>
 <section id="damped-sho-1" class="slide level2">
 <h2>Damped SHO</h2>
-<p><img src="images/corr.png" /></p>
+<p><img data-src="images/corr.png" /></p>
 </section>
 <section id="issues" class="slide level2">
 <h2>Issues</h2>
@@ -325,8 +171,7 @@ space</li>
 </ul></li>
 <li>Ideally, we maintain a good estimate of position in phase space from
 images; relevant history is summarized in <span
-class="math inline"><em>h</em><sub><em>t</em></sub></span> from the
-RNN</li>
+class="math inline">\(h_t\)</span> from the RNN</li>
 </ul>
 </section>
 <section id="in-progress" class="slide level2">
@@ -345,8 +190,8 @@ performance</li>
 </ul></li>
 <li>Better recurrent architecture?</li>
 </ul>
-</section>
-
+</section></section>
+<section>
 <section id="section-1" class="title-slide slide level1">
 <h1>3/30</h1>
 
@@ -363,15 +208,12 @@ performance</li>
 <h2>Port Hamiltonian Design</h2>
 <ol type="1">
 <li>Process some sequence of transitions with LSTM</li>
-<li>Choose <span
-class="math inline"><em>h</em><sub><em>k</em></sub></span> (where <span
-class="math inline"><em>k</em></span> is some warmup context
-length)</li>
-<li>Map <span class="math inline"><em>h</em><sub><em>k</em></sub></span>
-to <span
-class="math inline">(<em>q</em>,<em>p</em>)<sub><em>k</em></sub></span></li>
-<li>Integrate Hamiltonian forward to get <span
-class="math inline">(<em>q</em>,<em>p</em>)<sub><em>k</em>…<em>t</em></sub></span></li>
+<li>Choose <span class="math inline">\(h_k\)</span> (where <span
+class="math inline">\(k\)</span> is some warmup context length)</li>
+<li>Map <span class="math inline">\(h_k\)</span> to <span
+class="math inline">\((q, p)_k\)</span></li>
+<li>Integrate Hamiltonian forward to get <span class="math inline">\((q,
+p)_{k \dots t}\)</span></li>
 <li>Supervise decoding LSTM state to this sequence</li>
 </ol>
 </section>
@@ -387,9 +229,9 @@ class="math inline">(<em>q</em>,<em>p</em>)<sub><em>k</em>…<em>t</em></sub></s
 </section>
 <section id="collapse" class="slide level2">
 <h2>Collapse</h2>
-<p><img src="images/collapse.png" /></p>
-</section>
-
+<p><img data-src="images/collapse.png" /></p>
+</section></section>
+<section>
 <section id="section-2" class="title-slide slide level1">
 <h1>4/13</h1>
 
@@ -410,7 +252,7 @@ reconstruction from pixels</strong>
 <h2>Architecture</h2>
 <ol type="1">
 <li>Bidirectional LSTM over the <strong>full trajectory</strong> <span
-class="math inline"> → (<em>q</em><sub>0</sub>,<em>p</em><sub>0</sub>)</span></li>
+class="math inline">\(\rightarrow (q_0, p_0)\)</span></li>
 <li>Integrate Hamiltonian dynamics forward with
 <strong>RK4</strong></li>
 <li>Decode phase-space trajectory back to pixels</li>
@@ -418,7 +260,7 @@ class="math inline"> → (<em>q</em><sub>0</sub>,<em>p</em><sub>0</sub>)</sp
 </section>
 <section id="results" class="slide level2">
 <h2>Results</h2>
-<p><img src="images/pendulum_recon.gif" /></p>
+<p><img data-src="images/pendulum_recon.gif" /></p>
 <p>GT (left) vs. reconstruction (right)</p>
 </section>
 <section id="why-pendulum" class="slide level2">
@@ -426,18 +268,18 @@ class="math inline"> → (<em>q</em><sub>0</sub>,<em>p</em><sub>0</sub>)</sp
 <ul>
 <li>Trying to eliminate as many variables as possible</li>
 <li>Pendulum has a <strong>separable Hamiltonian</strong>: <span
-class="math inline">ℋ(<em>q</em>,<em>p</em>) = <em>T</em>(<em>p</em>) + <em>V</em>(<em>q</em>)</span>
+class="math inline">\(\mathcal{H}(q,p) = T(p) + V(q)\)</span>
 <ul>
 <li>Stronger inductive bias than CartPole</li>
-<li><span class="math inline"><em>T</em></span> and <span
-class="math inline"><em>V</em></span> can be learned independently</li>
+<li><span class="math inline">\(T\)</span> and <span
+class="math inline">\(V\)</span> can be learned independently</li>
 </ul></li>
 <li>CartPole is non-separable — removing that complexity first</li>
 </ul>
 </section>
 <section id="dissipation-structure" class="slide level2">
 <h2>Dissipation Structure</h2>
-<p><img src="images/R_eigenvalues.png" /></p>
+<p><img data-src="images/R_eigenvalues.png" /></p>
 <p>One large eigenvalue, 15 near zero — model correctly concentrates
 dissipation in one mode</p>
 </section>
@@ -447,14 +289,15 @@ dissipation in one mode</p>
 <li>Results might be <strong>too good</strong> — want to check longer
 Hamiltonian rollouts to ensure it generalizes</li>
 </ul>
-</section>
-
+</section></section>
+<section>
 <section id="section-3" class="title-slide slide level1">
 <h1>4/27</h1>
 
 </section>
 <section id="shift-pixels-rightarrow-phase-space" class="slide level2">
-<h2>Shift: Pixels <span class="math inline">→</span> Phase Space</h2>
+<h2>Shift: Pixels <span class="math inline">\(\rightarrow\)</span> Phase
+Space</h2>
 <ul>
 <li>Goal: confirm the port-Hamiltonian dynamics model can actually learn
 before adding pixel encoding back</li>
@@ -466,24 +309,24 @@ class="slide level2">
 <h2>Problem: Structural Matrices Not Learning</h2>
 <ul>
 <li>Analytic rollouts were ~static</li>
-<li>Suspected: <span class="math inline"><em>b</em></span> initialized
-near zero with a small lr <span class="math inline">→</span> contributes
-nothing to the Hamiltonian <span class="math inline">→</span> no
-gradient signal</li>
+<li>Suspected: <span class="math inline">\(b\)</span> initialized near
+zero with a small lr <span class="math inline">\(\rightarrow\)</span>
+contributes nothing to the Hamiltonian <span
+class="math inline">\(\rightarrow\)</span> no gradient signal</li>
 <li>Tested by fixing them to the ground truth, <span
-class="math inline"><em>b</em> = 3</span>, <span
-class="math inline"><em>J</em> = [[0,1],[−1,0]]</span>, <span
-class="math inline"><em>R</em> = [[0,0],[0,<em>d</em>]]</span> (where
-<span class="math inline"><em>d</em></span> is configurable damping
-factor) and training just <span class="math inline">ℋ</span>
+class="math inline">\(b = 3\)</span>, <span class="math inline">\(J =
+[[0, 1],[-1, 0]]\)</span>, <span class="math inline">\(R = [[0, 0], [0,
+d]]\)</span> (where <span class="math inline">\(d\)</span> is
+configurable damping factor) and training just <span
+class="math inline">\(\mathcal{H}\)</span>
 <ul>
 <li>model learned well, confirmed diagnosis</li>
 </ul></li>
 <li>Fix: <strong>split learning rates</strong> — small LR for <span
-class="math inline">ℋ</span>, much larger LR for structural matrices
-(<span class="math inline"><em>J</em></span>, <span
-class="math inline"><em>R</em></span>, <span
-class="math inline"><em>B</em></span>)</li>
+class="math inline">\(\mathcal{H}\)</span>, much larger LR for
+structural matrices (<span class="math inline">\(J\)</span>, <span
+class="math inline">\(R\)</span>, <span
+class="math inline">\(B\)</span>)</li>
 <li>Re-enabled joint learning of all structural matrices</li>
 </ul>
 </section>
@@ -492,7 +335,8 @@ class="slide level2">
 <h2>Problem: Model Can’t Learn Long Sequences</h2>
 <ul>
 <li>With structural matrices learning, model handled short rollouts fine
-but collapsed beyond <span class="math inline"> ∼ 25</span> steps</li>
+but collapsed beyond <span class="math inline">\(\sim 25\)</span>
+steps</li>
 <li>Suspected: gradients dominated by noise from a bad long rollout
 early in training</li>
 <li>Added <strong>curriculum learning</strong>: start with short
@@ -520,8 +364,8 @@ gradients re: long-term dependencies are incorrect</li>
 <li>Predicted rollouts look really good</li>
 <li>Back to pixel space?</li>
 </ul>
-</section>
-
+</section></section>
+<section>
 <section id="section-4" class="title-slide slide level1">
 <h1>5/4</h1>
 
@@ -539,13 +383,13 @@ phase space; dynamics happen in phase space as before</li>
 class="slide level2">
 <h2>Problem: Hamiltonian Drift from LSTM (May 1)</h2>
 <ul>
-<li>The LSTM encoder produces a <span
-class="math inline"><em>q</em></span> from the image sequence, but
-Hamiltonian rollouts were drifting away from it</li>
+<li>The LSTM encoder produces a <span class="math inline">\(q\)</span>
+from the image sequence, but Hamiltonian rollouts were drifting away
+from it</li>
 <li>Fix: added a <strong>dynamic/LSTM alignment penalty</strong> — an
 extra loss term penalizing the encoder when the Hamiltonian dynamics
-rollout diverges from the <span class="math inline"><em>q</em></span>
-the LSTM learned</li>
+rollout diverges from the <span class="math inline">\(q\)</span> the
+LSTM learned</li>
 <li>Idea: force the Hamiltonian to stay “on-manifold” with respect to
 what the encoder actually sees</li>
 </ul>
@@ -564,43 +408,38 @@ the entire sequence</li>
 </section>
 <section id="core-problem-f_psi-loses-information-may-3"
 class="slide level2">
-<h2>Core Problem: <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub></span> Loses
+<h2>Core Problem: <span class="math inline">\(f_\psi\)</span> Loses
 Information (May 3)</h2>
 <ul>
 <li>Diagnosis: the LSTM hidden state <span
-class="math inline"><em>h</em><sub><em>t</em></sub></span> captures the
-environment really well — but the mapping <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub> : <em>h</em> → (<em>q</em>,<em>p</em>)</span>
-is a plain MLP and is lossy</li>
+class="math inline">\(h_t\)</span> captures the environment really well
+— but the mapping <span class="math inline">\(f_\psi: h \to (q,
+p)\)</span> is a plain MLP and is lossy</li>
 <li>When the Hamiltonian is then rolled out, it produces phase-space
 coordinates the decoder can’t reconstruct from, because <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub></span> threw away
-information</li>
+class="math inline">\(f_\psi\)</span> threw away information</li>
 </ul>
 </section>
 <section id="proposed-fix-normalizing-flow-for-h-to-q-p"
 class="slide level2">
-<h2>Proposed Fix: Normalizing Flow for <span
-class="math inline"><em>h</em> → (<em>q</em>,<em>p</em>)</span></h2>
+<h2>Proposed Fix: Normalizing Flow for <span class="math inline">\(h \to
+(q, p)\)</span></h2>
 <ul>
-<li>Replace <span
-class="math inline"><em>f</em><sub><em>ψ</em></sub></span> with a
+<li>Replace <span class="math inline">\(f_\psi\)</span> with a
 <strong>normalizing flow</strong></li>
 <li>A normalizing flow is invertible by construction, so all information
-in <span class="math inline"><em>h</em></span> survives the mapping to
-<span class="math inline">(<em>q</em>,<em>p</em>)</span></li>
+in <span class="math inline">\(h\)</span> survives the mapping to <span
+class="math inline">\((q, p)\)</span></li>
 <li>Crucially: the flow goes both ways — we can map <span
-class="math inline"><em>h</em> → (<em>q</em>,<em>p</em>)</span> for
-Hamiltonian rollouts <em>and</em> map <span
-class="math inline">(<em>q</em>,<em>p</em>) → <em>h</em></span> to feed
-back into the decoder</li>
+class="math inline">\(h \to (q, p)\)</span> for Hamiltonian rollouts
+<em>and</em> map <span class="math inline">\((q, p) \to h\)</span> to
+feed back into the decoder</li>
 <li>This should close the loop: Hamiltonian dynamics operate in a
 coherent phase space, and we can always invert back to the LSTM’s
 representation for decoding</li>
 </ul>
-</section>
-
+</section></section>
+<section>
 <section id="section-5" class="title-slide slide level1">
 <h1>6/22</h1>
 
@@ -617,59 +456,57 @@ far-horizon step</li>
 independent of the curriculum</li>
 </ul>
 </section>
+<section id="action-leaks-into-h" class="slide level2">
+<h2>Action Leaks Into <span class="math inline">\(h\)</span></h2>
+<ul>
+<li>Cause: <code>Pendulum-v1</code> renders the torque as an arrow, so
+the autoencoder notes the action in <span
+class="math inline">\(h\)</span>, but the action should only enter via
+<span class="math inline">\(B\)</span></li>
+<li>Pollutes the dynamics: <span
+class="math inline">\(\mathcal{H}\)</span> ends up modeling apparent
+“intrinsic” forces that are really just actions</li>
+<li>Fix: don’t render the action</li>
+<li>Currently running</li>
+</ul>
+</section></section>
+<section>
+<section id="section-6" class="title-slide slide level1">
+<h1>7/1</h1>
+
+</section>
 <section id="denoising-augmentation" class="slide level2">
 <h2>Denoising Augmentation</h2>
 <ul>
 <li>Closed-loop rollouts accumulate error and drift off the dynamics
 manifold</li>
 <li>Fix: add Gaussian noise to the <span
-class="math inline"><em>h</em></span> fed into <span
-class="math inline"><em>Φ</em></span> during training; targets stay
+class="math inline">\(h\)</span> fed into <span
+class="math inline">\(\Phi\)</span> during training; targets stay
 clean</li>
 <li>Model learns to map jittered latents back <strong>onto the
 manifold</strong></li>
 <li>Noise std is a multiplier on each <span
-class="math inline"><em>h</em></span>-dim’s spread, so it adapts to the
+class="math inline">\(h\)</span>-dim’s spread, so it adapts to the
 latent scale</li>
 </ul>
 </section>
-<section id="action-leaks-into-h" class="slide level2">
-<h2>Action Leaks Into <span class="math inline"><em>h</em></span></h2>
-<ul>
-<li>Cause: <code>Pendulum-v1</code> renders the torque as an arrow, so
-the autoencoder notes the action in <span
-class="math inline"><em>h</em></span>, but the action should only enter
-via <span class="math inline"><em>B</em></span></li>
-<li>Pollutes the dynamics: <span class="math inline">ℋ</span> ends up
-modeling apparent “intrinsic” forces that are really just actions</li>
-<li>Fix: don’t render the action</li>
-<li>Currently running</li>
-</ul>
-</section>
-
-<section id="section-6" class="title-slide slide level1">
-<h1>7/1</h1>
-
-</section>
 <section id="fix-j-should-just-be-canonical" class="slide level2">
-<h2>Fix: <span class="math inline"><em>J</em></span> Should Just Be
+<h2>Fix: <span class="math inline">\(J\)</span> Should Just Be
 Canonical</h2>
 <ul>
-<li>We were learning <span
-class="math inline"><em>J</em> = <em>A</em> − <em>A</em><sup><em>T</em></sup></span>;
-but a learned <em>constant</em> <span
-class="math inline"><em>J</em></span> buys nothing over canonical
+<li>We were learning <span class="math inline">\(J = A - A^T\)</span>;
+but a learned <em>constant</em> <span class="math inline">\(J\)</span>
+buys nothing over canonical
 <ul>
-<li>Any block coupling <span class="math inline"><em>C</em></span> is
-undone by the change of variables <span
-class="math inline"><em>p</em>′ = <em>C</em><sup>−<em>T</em></sup><em>p</em></span>,
-which the flow and the kinetic net’s first layer can absorb</li>
+<li>Any block coupling <span class="math inline">\(C\)</span> is undone
+by the change of variables <span class="math inline">\(p&#39; =
+C^{-T}p\)</span>, which the flow and the kinetic net’s first layer can
+absorb</li>
 </ul></li>
-<li>So: fix <span
-class="math inline"><em>J</em> = [[0,<em>I</em>],[−<em>I</em>,0]]</span>;
-only <span
-class="math inline"><em>R</em> = <em>L</em><em>L</em><sup><em>T</em></sup></span>
-and <span class="math inline"><em>B</em></span> are still learned</li>
+<li>So: fix <span class="math inline">\(J = [[0, I], [-I, 0]]\)</span>;
+only <span class="math inline">\(R = LL^T\)</span> and <span
+class="math inline">\(B\)</span> are still learned</li>
 <li>One less thing to learn, and the conservative part is symplectic
 <strong>by construction</strong></li>
 </ul>
@@ -678,14 +515,14 @@ and <span class="math inline"><em>B</em></span> are still learned</li>
 <h2>Fix: True Separability</h2>
 <ul>
 <li>“Separable” mode was actually <span
-class="math inline">ℋ = <em>T</em>(<em>q</em>,<em>p</em>) + <em>V</em>(<em>q</em>)</span></li>
-<li>Now truly separable: <span
-class="math inline">ℋ = <em>T</em>(<em>p</em>) + <em>V</em>(<em>q</em>)</span></li>
+class="math inline">\(\mathcal{H} = T(q, p) + V(q)\)</span></li>
+<li>Now truly separable: <span class="math inline">\(\mathcal{H} = T(p)
++ V(q)\)</span></li>
 <li>Matches the pendulum’s physical structure, and <span
-class="math inline">∂ℋ/∂<em>p</em></span> depends only on <span
-class="math inline"><em>p</em></span>, <span
-class="math inline">∂ℋ/∂<em>q</em></span> only on <span
-class="math inline"><em>q</em></span></li>
+class="math inline">\(\partial \mathcal{H} / \partial p\)</span> depends
+only on <span class="math inline">\(p\)</span>, <span
+class="math inline">\(\partial \mathcal{H} / \partial q\)</span> only on
+<span class="math inline">\(q\)</span></li>
 <li>That’s exactly what an explicit symplectic integrator needs…</li>
 </ul>
 </section>
@@ -695,493 +532,266 @@ class="math inline"><em>q</em></span></li>
 <li>New option: <code>leapfrog</code> (now default) or
 <code>rk4</code></li>
 <li>Symplectic core: kick-drift-kick on <span
-class="math inline"><em>ż</em> = <em>J</em>∇ℋ</span>, with the control
-force <span class="math inline"><em>B</em><em>u</em></span> folded into
-the half-kicks</li>
-<li>Dissipation <span
-class="math inline"><em>ż</em> =  − <em>R</em>∇ℋ</span> is Strang-split
-symmetrically around it — still 2nd-order, reduces to pure leapfrog when
-<span class="math inline"><em>R</em> = 0</span></li>
+class="math inline">\(\dot{z} = J \nabla \mathcal{H}\)</span>, with the
+control force <span class="math inline">\(Bu\)</span> folded into the
+half-kicks</li>
+<li>Dissipation <span class="math inline">\(\dot{z} = -R \nabla
+\mathcal{H}\)</span> is Strang-split symmetrically around it — still
+2nd-order, reduces to pure leapfrog when <span class="math inline">\(R =
+0\)</span></li>
 <li>Why: symplectic integration preserves phase-space structure over
 long horizons — no artificial energy drift from the integrator itself,
 which should help closed-loop rollout stability</li>
 </ul>
+</section></section>
+<section>
+<section id="section-7" class="title-slide slide level1">
+<h1>8/3</h1>
+
 </section>
-<!-- {{{{ dzslides core
-#
-#
-#     __  __  __       .  __   ___  __
-#    |  \  / /__` |    | |  \ |__  /__`
-#    |__/ /_ .__/ |___ | |__/ |___ .__/ core :€
-#
-#
-# The following block of code is not supposed to be edited.
-# But if you want to change the behavior of these slides,
-# feel free to hack it!
-#
--->
+<section id="problem-phase-space-coverage" class="slide level2">
+<h2>Problem: Phase Space Coverage</h2>
+<ul>
+<li>Suspected remaining problem was phase space coverage — state and
+action need not be totally independent to still learn something useful
+(low-epsilon energy-pumping policy does fine)</li>
+<li>Fix: sample data collection from a wider array of control policies
+instead of one</li>
+<li>Added phase space coverage logging to tensorboard so coverage is
+visible, not just assumed</li>
+</ul>
+</section>
+<section id="rework-cache-training-data-not-latents"
+class="slide level2">
+<h2>Rework: Cache Training Data, Not Latents</h2>
+<ul>
+<li>Previously cached <span class="math inline">\(h\)</span> encodings
+from phase 1 and reused them directly in phase 2 — restricted phase 2 to
+always training on the first frames of each trajectory</li>
+<li>Fix: cache the actual training data in phase 1, recompute latents in
+phase 2</li>
+<li>Lets phase 2 sample arbitrary <code>seq_len</code> windows instead
+of just the start of the sequence</li>
+<li>Bonus: caching raw data (not just latents) means phase space
+coverage can be analyzed after the fact</li>
+</ul>
+</section>
+<section id="problem-closed-loop-loss-causes-snapping"
+class="slide level2">
+<h2>Problem: Closed-Loop Loss Causes Snapping</h2>
+<ul>
+<li>In some rollouts the dreamed pendulum drifts from ground truth, then
+“snaps back”</li>
+<li>Diagnosis: equal weighting of every closed-loop step is wrong —
+errors necessarily accumulate over a rollout, so early and late steps
+shouldn’t count the same</li>
+<li>Concretely: on spin trajectories, the dreamed pendulum stalls until
+the true pendulum catches up, then resumes — looks like the dynamics
+don’t know what to do at the stall point, but the loss is pulling toward
+where the pendulum “should” be many steps later</li>
+<li>First pass: just disable the closed-loop loss entirely to isolate
+the effect
+<ul>
+<li>Result: one-step loss isn’t good enough</li>
+</ul></li>
+<li>Longer-term idea: extend teacher forcing beyond next-step
+(e.g. 10-step) rather than all-or-nothing, and discount loss for later
+timesteps</li>
+</ul>
+</section>
+<section id="fix-discount-the-closed-loop-loss" class="slide level2">
+<h2>Fix: Discount the Closed-Loop Loss</h2>
+<ul>
+<li>Root cause of the snap/reverse behavior: with all timesteps weighted
+equally, once the true pendulum passes antipodal to the dreamed one, the
+optimizer prefers slowing/reversing the dreamed pendulum to wait rather
+than accelerating to catch up</li>
+<li>Fix: added <span class="math inline">\(\gamma\)</span> as a discount
+factor over rollout horizon, so later-stage antipodal states are
+downweighted rather than penalized fully</li>
+</ul>
+</section></section>
+    </div>
+  </div>
 
-<div id="progress-bar"></div>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.js"></script>
 
-<!-- Default Style -->
-<style>
-  * { margin: 0; padding: 0; -moz-box-sizing: border-box; -webkit-box-sizing: border-box; box-sizing: border-box; }
-  [role="note"] { display: none; }
-  body {
-    width: 800px; height: 600px;
-    margin-left: -400px; margin-top: -300px;
-    position: absolute; top: 50%; left: 50%;
-    overflow: hidden;
-    display: none;
-  }
-  .view body {
-    position: static;
-    margin: 0; padding: 0;
-    width: 100%; height: 100%;
-    display: inline-block;
-    overflow: visible; overflow-x: hidden;
-    /* undo Dz.onresize */
-    transform: none !important;
-    -moz-transform: none !important;
-    -webkit-transform: none !important;
-    -o-transform: none !important;
-    -ms-transform: none !important;
-  }
-  .view head, .view head > title { display: block }
-  section {
-    position: absolute;
-    pointer-events: none;
-    width: 100%; height: 100%;
-  }
-  .view section {
-    pointer-events: auto;
-    position: static;
-    width: 800px; height: 600px;
-    margin: -150px -200px;
-    float: left;
+  <!-- reveal.js plugins -->
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/search/search.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/zoom/zoom.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/math/math.js"></script>
 
-    transform: scale(.4);
-    -moz-transform: scale(.4);
-    -webkit-transform: scale(.4);
-    -o-transform: scale(.4);
-    -ms-transform: scale(.4);
-  }
-  .view section > * { pointer-events: none; }
-  section[aria-selected] { pointer-events: auto; }
-  html { overflow: hidden; }
-  html.view { overflow: visible; }
-  body.loaded { display: block; }
-  .incremental {visibility: hidden; }
-  .incremental[active] {visibility: visible; }
-  #progress-bar{
-    bottom: 0;
-    position: absolute;
-    -moz-transition: width 400ms linear 0s;
-    -webkit-transition: width 400ms linear 0s;
-    -ms-transition: width 400ms linear 0s;
-    transition: width 400ms linear 0s;
-  }
-  .view #progress-bar {
-    display: none;
-  }
-</style>
+  <script>
 
-<script>
-  var Dz = {
-    remoteWindows: [],
-    idx: -1,
-    step: 0,
-    html: null,
-    slides: null,
-    progressBar : null,
-    params: {
-      autoplay: "1"
-    }
-  };
+      // Full list of configuration options available at:
+      // https://revealjs.com/config/
+      Reveal.initialize({
+        // Display controls in the bottom right corner
+        controls: true,
 
-  Dz.init = function() {
-    document.body.className = "loaded";
-    this.slides = Array.prototype.slice.call($$("body > section"));
-    this.progressBar = $("#progress-bar");
-    this.html = document.body.parentNode;
-    this.setupParams();
-    this.onhashchange();
-    this.setupTouchEvents();
-    this.onresize();
-    this.setupView();
-  }
+        // Help the user learn the controls by providing hints, for example by
+        // bouncing the down arrow when they first encounter a vertical slide
+        controlsTutorial: true,
 
-  Dz.setupParams = function() {
-    var p = window.location.search.substr(1).split('&');
-    p.forEach(function(e, i, a) {
-      var keyVal = e.split('=');
-      Dz.params[keyVal[0]] = decodeURIComponent(keyVal[1]);
-    });
-  // Specific params handling
-    if (!+this.params.autoplay)
-      $$.forEach($$("video"), function(v){ v.controls = true });
-  }
+        // Determines where controls appear, "edges" or "bottom-right"
+        controlsLayout: 'bottom-right',
 
-  Dz.onkeydown = function(aEvent) {
-    // Don't intercept keyboard shortcuts
-    if (aEvent.altKey
-      || aEvent.ctrlKey
-      || aEvent.metaKey
-      || aEvent.shiftKey) {
-      return;
-    }
-    if ( aEvent.keyCode == 37 // left arrow
-      || aEvent.keyCode == 38 // up arrow
-      || aEvent.keyCode == 33 // page up
-    ) {
-      aEvent.preventDefault();
-      this.back();
-    }
-    if ( aEvent.keyCode == 39 // right arrow
-      || aEvent.keyCode == 40 // down arrow
-      || aEvent.keyCode == 34 // page down
-    ) {
-      aEvent.preventDefault();
-      this.forward();
-    }
-    if (aEvent.keyCode == 35) { // end
-      aEvent.preventDefault();
-      this.goEnd();
-    }
-    if (aEvent.keyCode == 36) { // home
-      aEvent.preventDefault();
-      this.goStart();
-    }
-    if (aEvent.keyCode == 32) { // space
-      aEvent.preventDefault();
-      this.toggleContent();
-    }
-    if (aEvent.keyCode == 70) { // f
-      aEvent.preventDefault();
-      this.goFullscreen();
-    }
-    if (aEvent.keyCode == 79) { // o
-      aEvent.preventDefault();
-      this.toggleView();
-    }
-  }
+        // Visibility rule for backwards navigation arrows; "faded", "hidden"
+        // or "visible"
+        controlsBackArrows: 'faded',
 
-  /* Touch Events */
+        // Display a presentation progress bar
+        progress: true,
 
-  Dz.setupTouchEvents = function() {
-    var orgX, newX;
-    var tracking = false;
+        // Display the page number of the current slide
+        slideNumber: false,
 
-    var db = document.body;
-    db.addEventListener("touchstart", start.bind(this), false);
-    db.addEventListener("touchmove", move.bind(this), false);
+        // 'all', 'print', or 'speaker'
+        showSlideNumber: 'all',
 
-    function start(aEvent) {
-      aEvent.preventDefault();
-      tracking = true;
-      orgX = aEvent.changedTouches[0].pageX;
-    }
+        // Add the current slide number to the URL hash so that reloading the
+        // page/copying the URL will return you to the same slide
+        hash: true,
 
-    function move(aEvent) {
-      if (!tracking) return;
-      newX = aEvent.changedTouches[0].pageX;
-      if (orgX - newX > 100) {
-        tracking = false;
-        this.forward();
-      } else {
-        if (orgX - newX < -100) {
-          tracking = false;
-          this.back();
-        }
-      }
-    }
-  }
+        // Start with 1 for the hash rather than 0
+        hashOneBasedIndex: false,
 
-  Dz.setupView = function() {
-    document.body.addEventListener("click", function ( e ) {
-      if (!Dz.html.classList.contains("view")) return;
-      if (!e.target || e.target.nodeName != "SECTION") return;
+        // Flags if we should monitor the hash and change slides accordingly
+        respondToHashChanges: true,
 
-      Dz.html.classList.remove("view");
-      Dz.setCursor(Dz.slides.indexOf(e.target) + 1);
-    }, false);
-  }
+        // Push each slide change to the browser history
+        history: false,
 
-  /* Adapt the size of the slides to the window */
+        // Enable keyboard shortcuts for navigation
+        keyboard: true,
 
-  Dz.onresize = function() {
-    var db = document.body;
-    var sx = db.clientWidth / window.innerWidth;
-    var sy = db.clientHeight / window.innerHeight;
-    var transform = "scale(" + (1/Math.max(sx, sy)) + ")";
+        // Enable the slide overview mode
+        overview: true,
 
-    db.style.MozTransform = transform;
-    db.style.WebkitTransform = transform;
-    db.style.OTransform = transform;
-    db.style.msTransform = transform;
-    db.style.transform = transform;
-  }
+        // Disables the default reveal.js slide layout (scaling and centering)
+        // so that you can use custom CSS layout
+        disableLayout: false,
 
+        // Vertical centering of slides
+        center: true,
 
-  Dz.getNotes = function(aIdx) {
-    var s = $("section:nth-of-type(" + aIdx + ")");
-    var d = s.$("[role='note']");
-    return d ? d.innerHTML : "";
-  }
+        // Enables touch navigation on devices with touch input
+        touch: true,
 
-  Dz.onmessage = function(aEvent) {
-    var argv = aEvent.data.split(" "), argc = argv.length;
-    argv.forEach(function(e, i, a) { a[i] = decodeURIComponent(e) });
-    var win = aEvent.source;
-    if (argv[0] === "REGISTER" && argc === 1) {
-      this.remoteWindows.push(win);
-      this.postMsg(win, "REGISTERED", document.title, this.slides.length);
-      this.postMsg(win, "CURSOR", this.idx + "." + this.step);
-      return;
-    }
-    if (argv[0] === "BACK" && argc === 1)
-      this.back();
-    if (argv[0] === "FORWARD" && argc === 1)
-      this.forward();
-    if (argv[0] === "START" && argc === 1)
-      this.goStart();
-    if (argv[0] === "END" && argc === 1)
-      this.goEnd();
-    if (argv[0] === "TOGGLE_CONTENT" && argc === 1)
-      this.toggleContent();
-    if (argv[0] === "SET_CURSOR" && argc === 2)
-      window.location.hash = "#" + argv[1];
-    if (argv[0] === "GET_CURSOR" && argc === 1)
-      this.postMsg(win, "CURSOR", this.idx + "." + this.step);
-    if (argv[0] === "GET_NOTES" && argc === 1)
-      this.postMsg(win, "NOTES", this.getNotes(this.idx));
-  }
+        // Loop the presentation
+        loop: false,
 
-  Dz.toggleContent = function() {
-    // If a Video is present in this new slide, play it.
-    // If a Video is present in the previous slide, stop it.
-    var s = $("section[aria-selected]");
-    if (s) {
-      var video = s.$("video");
-      if (video) {
-        if (video.ended || video.paused) {
-          video.play();
-        } else {
-          video.pause();
-        }
-      }
-    }
-  }
+        // Change the presentation direction to be RTL
+        rtl: false,
 
-  Dz.setCursor = function(aIdx, aStep) {
-    // If the user change the slide number in the URL bar, jump
-    // to this slide.
-    aStep = (aStep != 0 && typeof aStep !== "undefined") ? "." + aStep : ".0";
-    window.location.hash = "#" + aIdx + aStep;
-  }
+        // see https://revealjs.com/vertical-slides/#navigation-mode
+        navigationMode: 'default',
 
-  Dz.onhashchange = function() {
-    var cursor = window.location.hash.split("#"),
-        newidx = 1,
-        newstep = 0;
-    if (cursor.length == 2) {
-      newidx = ~~cursor[1].split(".")[0];
-      newstep = ~~cursor[1].split(".")[1];
-      if (newstep > Dz.slides[newidx - 1].$$('.incremental > *').length) {
-        newstep = 0;
-        newidx++;
-      }
-    }
-    this.setProgress(newidx, newstep);
-    if (newidx != this.idx) {
-      this.setSlide(newidx);
-    }
-    if (newstep != this.step) {
-      this.setIncremental(newstep);
-    }
-    for (var i = 0; i < this.remoteWindows.length; i++) {
-      this.postMsg(this.remoteWindows[i], "CURSOR", this.idx + "." + this.step);
-    }
-  }
+        // Randomizes the order of slides each time the presentation loads
+        shuffle: false,
 
-  Dz.back = function() {
-    if (this.idx == 1 && this.step == 0) {
-      return;
-    }
-    if (this.step == 0) {
-      this.setCursor(this.idx - 1,
-                     this.slides[this.idx - 2].$$('.incremental > *').length);
-    } else {
-      this.setCursor(this.idx, this.step - 1);
-    }
-  }
+        // Turns fragments on and off globally
+        fragments: true,
 
-  Dz.forward = function() {
-    if (this.idx >= this.slides.length &&
-        this.step >= this.slides[this.idx - 1].$$('.incremental > *').length) {
-        return;
-    }
-    if (this.step >= this.slides[this.idx - 1].$$('.incremental > *').length) {
-      this.setCursor(this.idx + 1, 0);
-    } else {
-      this.setCursor(this.idx, this.step + 1);
-    }
-  }
+        // Flags whether to include the current fragment in the URL,
+        // so that reloading brings you to the same fragment position
+        fragmentInURL: true,
 
-  Dz.goStart = function() {
-    this.setCursor(1, 0);
-  }
+        // Flags if the presentation is running in an embedded mode,
+        // i.e. contained within a limited portion of the screen
+        embedded: false,
 
-  Dz.goEnd = function() {
-    var lastIdx = this.slides.length;
-    var lastStep = this.slides[lastIdx - 1].$$('.incremental > *').length;
-    this.setCursor(lastIdx, lastStep);
-  }
+        // Flags if we should show a help overlay when the questionmark
+        // key is pressed
+        help: true,
 
-  Dz.toggleView = function() {
-    this.html.classList.toggle("view");
+        // Flags if it should be possible to pause the presentation (blackout)
+        pause: true,
 
-    if (this.html.classList.contains("view")) {
-      $("section[aria-selected]").scrollIntoView(true);
-    }
-  }
+        // Flags if speaker notes should be visible to all viewers
+        showNotes: false,
 
-  Dz.setSlide = function(aIdx) {
-    this.idx = aIdx;
-    var old = $("section[aria-selected]");
-    var next = $("section:nth-of-type("+ this.idx +")");
-    if (old) {
-      old.removeAttribute("aria-selected");
-      var video = old.$("video");
-      if (video) {
-        video.pause();
-      }
-    }
-    if (next) {
-      next.setAttribute("aria-selected", "true");
-      if (this.html.classList.contains("view")) {
-        next.scrollIntoView();
-      }
-      var video = next.$("video");
-      if (video && !!+this.params.autoplay) {
-        video.play();
-      }
-    } else {
-      // That should not happen
-      this.idx = -1;
-      // console.warn("Slide doesn't exist.");
-    }
-  }
+        // Global override for autoplaying embedded media (null/true/false)
+        autoPlayMedia: null,
 
-  Dz.setIncremental = function(aStep) {
-    this.step = aStep;
-    var old = this.slides[this.idx - 1].$('.incremental > *[aria-selected]');
-    if (old) {
-      old.removeAttribute('aria-selected');
-    }
-    var incrementals = $$('.incremental');
-    if (this.step <= 0) {
-      $$.forEach(incrementals, function(aNode) {
-        aNode.removeAttribute('active');
+        // Global override for preloading lazy-loaded iframes (null/true/false)
+        preloadIframes: null,
+
+        // Number of milliseconds between automatically proceeding to the
+        // next slide, disabled when set to 0, this value can be overwritten
+        // by using a data-autoslide attribute on your slides
+        autoSlide: 0,
+
+        // Stop auto-sliding after user input
+        autoSlideStoppable: true,
+
+        // Use this method for navigation when auto-sliding
+        autoSlideMethod: null,
+
+        // Specify the average time in seconds that you think you will spend
+        // presenting each slide. This is used to show a pacing timer in the
+        // speaker view
+        defaultTiming: null,
+
+        // Enable slide navigation via mouse wheel
+        mouseWheel: false,
+
+        // The display mode that will be used to show slides
+        display: 'block',
+
+        // Hide cursor if inactive
+        hideInactiveCursor: true,
+
+        // Time before the cursor is hidden (in ms)
+        hideCursorTime: 5000,
+
+        // Opens links in an iframe preview overlay
+        previewLinks: false,
+
+        // Transition style (none/fade/slide/convex/concave/zoom)
+        transition: 'slide',
+
+        // Transition speed (default/fast/slow)
+        transitionSpeed: 'default',
+
+        // Transition style for full page slide backgrounds
+        // (none/fade/slide/convex/concave/zoom)
+        backgroundTransition: 'fade',
+
+        // Number of slides away from the current that are visible
+        viewDistance: 3,
+
+        // Number of slides away from the current that are visible on mobile
+        // devices. It is advisable to set this to a lower number than
+        // viewDistance in order to save resources.
+        mobileViewDistance: 2,
+
+        math: {
+          mathjax: 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js',
+          config: 'TeX-AMS_HTML-full',
+          tex2jax: {
+            inlineMath: [['\\(','\\)']],
+            displayMath: [['\\[','\\]']],
+            balanceBraces: true,
+            processEscapes: false,
+            processRefs: true,
+            processEnvironments: true,
+            preview: 'TeX',
+            skipTags: ['script','noscript','style','textarea','pre','code'],
+            ignoreClass: 'tex2jax_ignore',
+            processClass: 'tex2jax_process'
+          },
+        },
+
+        // reveal.js plugins
+        plugins: [
+          RevealMath,
+          RevealNotes,
+          RevealSearch,
+          RevealZoom
+        ]
       });
-      return;
-    }
-    var next = this.slides[this.idx - 1].$$('.incremental > *')[this.step - 1];
-    if (next) {
-      next.setAttribute('aria-selected', true);
-      next.parentNode.setAttribute('active', true);
-      var found = false;
-      $$.forEach(incrementals, function(aNode) {
-        if (aNode != next.parentNode)
-          if (found)
-            aNode.removeAttribute('active');
-          else
-            aNode.setAttribute('active', true);
-        else
-          found = true;
-      });
-    } else {
-      setCursor(this.idx, 0);
-    }
-    return next;
-  }
-
-  Dz.goFullscreen = function() {
-    var html = $('html'),
-        requestFullscreen = html.requestFullscreen || html.requestFullScreen || html.mozRequestFullScreen || html.webkitRequestFullScreen;
-    if (requestFullscreen) {
-      requestFullscreen.apply(html);
-    }
-  }
-  
-  Dz.setProgress = function(aIdx, aStep) {
-    var slide = $("section:nth-of-type("+ aIdx +")");
-    if (!slide)
-      return;
-    var steps = slide.$$('.incremental > *').length + 1,
-        slideSize = 100 / (this.slides.length - 1),
-        stepSize = slideSize / steps;
-    this.progressBar.style.width = ((aIdx - 1) * slideSize + aStep * stepSize) + '%';
-  }
-  
-  Dz.postMsg = function(aWin, aMsg) { // [arg0, [arg1...]]
-    aMsg = [aMsg];
-    for (var i = 2; i < arguments.length; i++)
-      aMsg.push(encodeURIComponent(arguments[i]));
-    aWin.postMessage(aMsg.join(" "), "*");
-  }
-  
-  function init() {
-    Dz.init();
-    window.onkeydown = Dz.onkeydown.bind(Dz);
-    window.onresize = Dz.onresize.bind(Dz);
-    window.onhashchange = Dz.onhashchange.bind(Dz);
-    window.onmessage = Dz.onmessage.bind(Dz);
-  }
-
-  window.onload = init;
-</script>
-
-
-<script> // Helpers
-  if (!Function.prototype.bind) {
-    Function.prototype.bind = function (oThis) {
-
-      // closest thing possible to the ECMAScript 5 internal IsCallable
-      // function 
-      if (typeof this !== "function")
-      throw new TypeError(
-        "Function.prototype.bind - what is trying to be fBound is not callable"
-      );
-
-      var aArgs = Array.prototype.slice.call(arguments, 1),
-          fToBind = this,
-          fNOP = function () {},
-          fBound = function () {
-            return fToBind.apply( this instanceof fNOP ? this : oThis || window,
-                   aArgs.concat(Array.prototype.slice.call(arguments)));
-          };
-
-      fNOP.prototype = this.prototype;
-      fBound.prototype = new fNOP();
-
-      return fBound;
-    };
-  }
-
-  var $ = (HTMLElement.prototype.$ = function(aQuery) {
-    return this.querySelector(aQuery);
-  }).bind(document);
-
-  var $$ = (HTMLElement.prototype.$$ = function(aQuery) {
-    return this.querySelectorAll(aQuery);
-  }).bind(document);
-
-  $$.forEach = function(nodeList, fun) {
-    Array.prototype.forEach.call(nodeList, fun);
-  }
-
-</script>
-<!-- vim: set fdm=marker: }}} -->
-</body>
+    </script>
+    </body>
 </html>

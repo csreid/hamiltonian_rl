@@ -1202,6 +1202,14 @@ def phase1_cmd(**kwargs):
         )
     )
 
+    # Save the raw training episodes (frames, actions, ground-truth state) right
+    # away — Phase 2 re-encodes windows of these through the frozen encoder each
+    # batch, and this cache also doubles as a dataset for later analysis. Saved
+    # before training starts so it survives even if training is interrupted.
+    episodes_cache_path = run_dir / "episodes_cache.pt"
+    torch.save(episodes, episodes_cache_path)
+    print(f"Saved episode cache ({len(episodes)} episodes) to {episodes_cache_path}")
+
     val_energy, val_random, val_spin = [], [], []
     if n_val > 0:
         print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
@@ -1351,12 +1359,6 @@ def phase1_cmd(**kwargs):
     # Always save final checkpoint
     world_model.save(run_dir, "final", hparams, metrics, epoch)
 
-    # Save the raw training episodes (frames, actions, ground-truth state) —
-    # Phase 2 re-encodes windows of these through the frozen encoder each
-    # batch, and this cache also doubles as a dataset for later analysis.
-    episodes_cache_path = run_dir / "episodes_cache.pt"
-    torch.save(episodes, episodes_cache_path)
-    print(f"\nSaved episode cache ({len(episodes)} episodes) to {episodes_cache_path}")
     print(f"\nTo run Phase 2:\n  uv run python experiments/pendulum_offline.py phase2 --phase1-run {run_dir}")
 
     writer.close()
