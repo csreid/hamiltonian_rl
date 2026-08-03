@@ -729,6 +729,7 @@ def _train_epoch_phase2(
     max_seed_k: int = 0,
     teacher_force_weight: float = 1.0,
     closed_loop_weight: float = 1.0,
+    closed_loop_gamma: float = 1.0,
     structural_reg_weight: float = 0.0,
     h_noise_std: float = 0.0,
     h_noise_scale: torch.Tensor | None = None,
@@ -748,6 +749,14 @@ def _train_epoch_phase2(
     prediction to the corresponding real h value.  Gradients from the
     closed-loop loss flow back through phi at position k alongside those from
     the teacher-forced objective.
+
+    Per-step errors within the rollout are combined with exponential decay
+    closed_loop_gamma**t (t=0 at the first post-seed step), normalised so the
+    weights sum to 1.  closed_loop_gamma=1.0 recovers a plain mean over all T
+    steps. Discounting later steps keeps gradient pressure on getting the
+    near-term dynamics right, rather than being dominated by large late-step
+    errors that mostly reflect compounding of earlier (possibly correct)
+    error rather than a wrong local step.
 
     Logdet regulariser is applied over all T+1 encoded timesteps rather than
     a single seed point, so its strength stays constant as seq_len grows.
@@ -823,7 +832,11 @@ def _train_epoch_phase2(
         h_cl_pred = dyn_model.decode(
             q_traj.reshape(B_size * T, q_dim), p_traj.reshape(B_size * T, q_dim)
         )
-        cl_loss = F.mse_loss(h_cl_pred, h_all[:, k + 1:k + 1 + T].reshape(B_size * T, D))
+        h_cl_target = h_all[:, k + 1:k + 1 + T]
+        sq_err = (h_cl_pred.reshape(B_size, T, D) - h_cl_target).pow(2)
+        per_step_loss = sq_err.mean(dim=(0, 2))  # (T,) — mean over batch and latent dims
+        step_weights = closed_loop_gamma ** torch.arange(T, device=device, dtype=per_step_loss.dtype)
+        cl_loss = (per_step_loss * step_weights).sum() / step_weights.sum()
 
         loss = logdet_reg + teacher_force_weight * tf_loss + closed_loop_weight * cl_loss
 
@@ -1401,6 +1414,11 @@ def phase1_cmd(**kwargs):
               help="Weight on teacher-forced 1-step loss (set 0 to disable)")
 @click.option("--closed-loop-weight", type=float, default=1.0, show_default=True,
               help="Weight on closed-loop rollout loss (set 0 to disable)")
+@click.option("--closed-loop-gamma", type=float, default=1.0, show_default=True,
+              help="Exponential discount applied to closed-loop rollout steps "
+                   "(weight = gamma**t, t=0 at the first post-seed step, normalised "
+                   "to sum to 1). 1.0 = plain mean over all steps (no discounting); "
+                   "<1.0 downweights later, more error-compounded steps.")
 @click.option("--h-noise-std", type=float, default=0.0, show_default=True,
               help="Zero-mean Gaussian noise added to h inputs (augmentation; targets "
                    "stay clean), as a multiplier on each h-dim's spread across the cache. "
@@ -1580,6 +1598,7 @@ def phase2_cmd(**kwargs):
             max_seed_k=kwargs["max_seed_k"],
             teacher_force_weight=kwargs["teacher_force_weight"],
             closed_loop_weight=kwargs["closed_loop_weight"],
+            closed_loop_gamma=kwargs["closed_loop_gamma"],
             structural_reg_weight=kwargs["structural_reg_weight"],
             h_noise_std=kwargs["h_noise_std"],
             h_noise_scale=h_noise_scale,
