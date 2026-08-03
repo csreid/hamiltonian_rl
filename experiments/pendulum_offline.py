@@ -190,7 +190,7 @@ def _plot_phase_space_coverage(
     else:
         fig = ax.figure
 
-    ax.scatter(theta_all, theta_dot_all, s=2, alpha=0.08, linewidths=0, color="tab:blue")
+    ax.scatter(theta_all, theta_dot_all, s=2, alpha=0.25, linewidths=0, color="tab:blue")
     ax.set_xlabel("θ (rad)")
     ax.set_ylabel("θ̇ (rad/s)")
     ax.set_title(f"Training data phase-space coverage (N={len(theta_all):,})")
