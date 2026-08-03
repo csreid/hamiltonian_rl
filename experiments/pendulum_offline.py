@@ -1108,6 +1108,10 @@ def cli():
 
 
 @cli.command("phase1")
+@click.option("--resume-from", type=str, default=None,
+              help="Path to a checkpoint (.pt) whose autoencoder weights to warm-start "
+                   "from; training still writes to a fresh run dir, and the optimizer "
+                   "and epoch count both restart from scratch")
 # data
 @click.option("--n-episodes", type=int, default=200, show_default=True)
 @click.option("--img-size", type=int, default=64, show_default=True)
@@ -1246,6 +1250,12 @@ def phase1_cmd(**kwargs):
     ).to(device)
     print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    if kwargs["resume_from"]:
+        print(f"Resuming autoencoder weights from {kwargs['resume_from']}...")
+        resume_model = load_world_model(kwargs["resume_from"], device)
+        model.load_state_dict(resume_model.autoencoder.state_dict())
+        del resume_model
+
     optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
 
     # How the training episodes were collected — saved into the checkpoint so
@@ -1376,6 +1386,10 @@ def phase1_cmd(**kwargs):
                    "falling back to final.pt)")
 @click.option("--episode-cache", type=str, default=None,
               help="Override the episode cache path (default: {phase1-run}/episodes_cache.pt)")
+@click.option("--resume-from", type=str, default=None,
+              help="Path to a Phase 2 checkpoint (.pt) whose dynamics weights to warm-start "
+                   "from; training still writes to a fresh run dir, and the optimizer "
+                   "and epoch count both restart from scratch")
 # dynamics model
 @click.option("--dt", type=float, default=0.05, show_default=True,
               help="Integration step size (should match the env frame interval)")
@@ -1551,6 +1565,17 @@ def phase2_cmd(**kwargs):
         quadratic_t=kwargs["quadratic_t"],
     ).to(device)
     print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
+
+    if kwargs["resume_from"]:
+        print(f"Resuming dynamics weights from {kwargs['resume_from']}...")
+        resume_model = load_world_model(kwargs["resume_from"], device)
+        if resume_model.dynamics is None:
+            raise click.UsageError(
+                f"{kwargs['resume_from']} has no dynamics weights (Phase 1-only checkpoint)."
+            )
+        dyn_model.load_state_dict(resume_model.dynamics.state_dict())
+        del resume_model
+
     world_model.dynamics = dyn_model
 
     if kwargs["learn_structure"]:
