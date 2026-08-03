@@ -1539,8 +1539,9 @@ def phase2_cmd(**kwargs):
     # estimate; it doesn't need to match the windowed encoding used in training.
     h_noise_scale = None
     if kwargs["h_noise_std"] > 0:
-        h_all_full, _ = _encode_val_h(phase1_model, episodes, device)
-        h_noise_scale = h_all_full.reshape(-1, latent_dim).std(dim=0)
+        with torch.no_grad():
+            h_all_full, _ = _encode_val_h(phase1_model, episodes, device)
+            h_noise_scale = h_all_full.reshape(-1, latent_dim).std(dim=0)
         print(
             f"h noise: std={kwargs['h_noise_std']} × per-dim spread "
             f"(mean dim std={h_noise_scale.mean().item():.4f})"
