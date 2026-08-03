@@ -72,6 +72,11 @@ class PendulumPixelEnv(gym.Wrapper):
         self.env.reset(**kwargs)
         return self._obs(), {}
 
+    def set_state(self, theta: float, theta_dot: float) -> np.ndarray:
+        """Force the environment into (theta, theta_dot) and return the resulting observation."""
+        self.env.unwrapped.state = np.array([theta, theta_dot], dtype=np.float64)  # type: ignore[union-attr]
+        return self._obs()
+
     def step(self, action):
         _, reward, terminated, truncated, info = self.env.step(action)
         self._apply_damping()
@@ -110,6 +115,41 @@ def _pd_action(
 _UPRIGHT_THRESHOLD = 0.3  # radians — switch to PD when |theta| < this
 
 
+def _grid_seeds(
+    n_points: int,
+    min_theta: float = -np.pi,
+    max_theta: float = np.pi,
+    min_theta_dot: float = -10.0,
+    max_theta_dot: float = 10.0,
+) -> np.ndarray:
+    """As-square-as-possible covering grid of (theta, theta_dot) initial states.
+
+    Picks grid dimensions so cells are as close to square as possible given
+    the aspect ratio of the two ranges (theta_dot spans 20, theta spans
+    ~6.28, so the grid is wider than it is tall), then tiles/truncates to
+    exactly n_points and shuffles so consecutive episodes (which some
+    downstream code splits into interleaved train/val halves) aren't grouped
+    into a single region of the grid.
+
+    Returns (n_points, 2) array of (theta, theta_dot) pairs.
+    """
+    theta_range = max_theta - min_theta
+    theta_dot_range = max_theta_dot - min_theta_dot
+    aspect = theta_dot_range / theta_range
+    n_theta = max(1, round(np.sqrt(n_points / aspect)))
+    n_theta_dot = max(1, round(n_points / n_theta))
+
+    thetas = np.linspace(min_theta, max_theta, n_theta)
+    theta_dots = np.linspace(min_theta_dot, max_theta_dot, n_theta_dot)
+    grid_t, grid_td = np.meshgrid(thetas, theta_dots, indexing="xy")
+    grid = np.stack([grid_t.ravel(), grid_td.ravel()], axis=-1)  # (n_theta * n_theta_dot, 2)
+
+    reps = int(np.ceil(n_points / len(grid)))
+    seeds = np.tile(grid, (reps, 1))[:n_points]
+    np.random.shuffle(seeds)
+    return seeds
+
+
 # ── Data collection ──────────────────────────────────────────────────────────
 
 
@@ -131,14 +171,16 @@ def _collect_episodes(
     """
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
+    seeds = _grid_seeds(n_episodes)
 
     try:
-        for _ in tqdm(range(n_episodes), desc=desc):
+        for i in tqdm(range(n_episodes), desc=desc):
             kp = random.uniform(2.0, 15.0)
             kd = random.uniform(0.5, 5.0)
 
-            obs, _ = env.reset()
-            theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+            env.reset()
+            theta0, theta_dot0 = seeds[i]
+            obs = env.set_state(theta0, theta_dot0)
             frames = [torch.from_numpy(obs).float() / 255.0]
             actions = []
             states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
@@ -255,11 +297,13 @@ def _collect_spin_episodes(
     """Collect episodes with a spin-maximising controller (maximises |theta_dot|)."""
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
+    seeds = _grid_seeds(n_episodes)
 
     try:
-        for _ in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
-            obs, _ = env.reset()
-            theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+        for i in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
+            env.reset()
+            theta0, theta_dot0 = seeds[i]
+            obs = env.set_state(theta0, theta_dot0)
             frames = [torch.from_numpy(obs).float() / 255.0]
             actions = []
             states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
@@ -310,11 +354,13 @@ def _collect_zero_episodes(
     """Collect episodes with the action fixed at zero (uncontrolled dynamics)."""
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
+    seeds = _grid_seeds(n_episodes)
 
     try:
-        for _ in tqdm(range(n_episodes), desc="Val trajectories (zero action)"):
-            obs, _ = env.reset()
-            theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+        for i in tqdm(range(n_episodes), desc="Val trajectories (zero action)"):
+            env.reset()
+            theta0, theta_dot0 = seeds[i]
+            obs = env.set_state(theta0, theta_dot0)
             frames = [torch.from_numpy(obs).float() / 255.0]
             actions = []
             states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
@@ -374,13 +420,15 @@ def _collect_state_only_episodes(
     """
     env = gym.make("Pendulum-v1", render_mode=None)
     episodes = []
+    seeds = _grid_seeds(n_episodes)
 
-    for _ in tqdm(range(n_episodes), desc=desc):
+    for i in tqdm(range(n_episodes), desc=desc):
         kp = random.uniform(2.0, 15.0)
         kd = random.uniform(0.5, 5.0)
 
         env.reset()
-        theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+        theta0, theta_dot0 = seeds[i]
+        env.unwrapped.state = np.array([theta0, theta_dot0])  # type: ignore[union-attr]
         states = [np.array([theta0, theta_dot0], dtype=np.float32)]
         actions = []
 
@@ -468,10 +516,12 @@ def _collect_state_spin_episodes(
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     env = gym.make("Pendulum-v1", render_mode=None)
     episodes = []
+    seeds = _grid_seeds(n_episodes)
 
-    for _ in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
+    for i in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
         env.reset()
-        theta0, theta_dot0 = env.unwrapped.state  # type: ignore[union-attr]
+        theta0, theta_dot0 = seeds[i]
+        env.unwrapped.state = np.array([theta0, theta_dot0])  # type: ignore[union-attr]
         states = [np.array([theta0, theta_dot0], dtype=np.float32)]
         actions = []
 

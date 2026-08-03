@@ -345,7 +345,7 @@ def _plot_learned_energy_landscape(
         ],
         cmap="viridis",
     )
-    ax_pred.scatter(proj[:, 0], proj[:, 1], c="white", s=4, alpha=0.12, linewidths=0)
+    ax_pred.scatter(proj[:, 0], proj[:, 1], c="white", s=4, alpha=0.3, linewidths=0)
     ax_pred.set_xlabel(f"[q,p] PC1 ({land['explained'][0]:.0%} var)")
     ax_pred.set_ylabel(f"[q,p] PC2 ({land['explained'][1]:.0%} var)")
     ax_pred.set_title("Learned H (PCA slice)")
@@ -582,7 +582,7 @@ def _log_latent_scatter_phase1(
         all_true_i, all_pred_i = [], []
         for j, label in enumerate(val_pred):
             true_i, pred_i = val_true[label][:, i], val_pred[label][:, i]
-            axes[i].scatter(true_i, pred_i, s=2, alpha=0.12, color=colors[j % len(colors)], label=label, linewidths=0)
+            axes[i].scatter(true_i, pred_i, s=2, alpha=0.3, color=colors[j % len(colors)], label=label, linewidths=0)
             all_true_i.append(true_i)
             all_pred_i.append(pred_i)
         true_i = np.concatenate(all_true_i)
@@ -1075,7 +1075,7 @@ def _log_phase_space_regression_phase2(
     sc = None
     for i, name in enumerate(["cos(θ)", "sin(θ)", "θ̇ (rad/s)"]):
         true_i, pred_i = st_true[:, i], st_pred[:, i]
-        sc = axes[i].scatter(true_i, pred_i, c=val_idx, cmap="viridis", s=2, alpha=0.15, linewidths=0)
+        sc = axes[i].scatter(true_i, pred_i, c=val_idx, cmap="viridis", s=2, alpha=0.4, linewidths=0)
         lo, hi = min(true_i.min(), pred_i.min()), max(true_i.max(), pred_i.max())
         axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
         axes[i].set_xlabel(f"True {name}")
