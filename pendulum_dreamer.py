@@ -175,12 +175,13 @@ with st.sidebar:
     st.header("Checkpoint")
 
     models_root = Path("models")
+    _NON_CHECKPOINT_STEMS = {"h_cache", "episodes_cache"}
     pt_files = sorted(
-        f for f in models_root.rglob("*.pt") if f.stem != "h_cache"
+        f for f in models_root.rglob("*.pt") if f.stem not in _NON_CHECKPOINT_STEMS
     ) if models_root.exists() else []
 
     if not pt_files:
-        st.warning("No `.pt` checkpoints found under `models/` (excluding h_cache).")
+        st.warning("No `.pt` checkpoints found under `models/` (excluding data caches).")
         st.stop()
 
     # Parse each .pt file into (identifier, date, time_str, file).

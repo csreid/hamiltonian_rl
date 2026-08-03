@@ -3,16 +3,25 @@
 Phase 1 (phase1 subcommand):
     Train the LSTM autoencoder (encoder + f_psi + decoder) for reconstruction.
     Loss = MSE(decoder(f_psi(z)[:q_dim]), frame) + kl_weight * KL.
-    After training, precomputes and saves h_t = encoder_mu(frame_t) for every
-    frame of every training episode to h_cache.pt in the run directory.
+    After training, saves the raw training episodes (frames, actions,
+    ground-truth state) to episodes_cache.pt in the run directory, both for
+    Phase 2 (which re-encodes fresh windows through the frozen encoder each
+    batch — see below) and for later analysis.
     Saves a unified world-model checkpoint with dynamics=None.
 
 Phase 2 (phase2 subcommand):
-    Load precomputed h_t cache. Train a new HamiltonianFlowModel (Phi + H + J/R/B)
+    Load the cached episodes. Train a new HamiltonianFlowModel (Phi + H + J/R/B)
     that maps h_t → (q, p) such that Hamiltonian dynamics hold:
 
         L_tf  = MSE(phi^{-1}(RK4(phi(h_t), u_t)),  h_{t+1})       [teacher-forced, all t]
         L_cl  = MSE(phi^{-1}(RK4^k(phi(h_seed), u)), h_{seed+k})  [closed-loop, seq_len steps]
+
+    Each batch samples a random window [s, s+ctx+seq_len) from the full
+    episode and re-encodes just that window through the frozen Phase-1
+    encoder (fresh LSTM state at s, ctx frames of context) so the seed h
+    matches what the encoder actually produces at inference time, while
+    still covering every part of the episode over the course of training —
+    not just the first ctx+seq_len frames.
 
     Architecture and data params (latent_dim, img_size, etc.) are loaded
     automatically from the Phase 1 checkpoint — no need to re-specify them.
@@ -613,8 +622,8 @@ def _log_h_state_regression_coeffs_phase1(
     """Bar charts of bidirectional linear-probe coefficients between raw h_t and state.
 
     Unlike `_log_latent_scatter_phase1` (which probes s_all = f_psi(h_t)), this
-    probes h_t = mu_all directly — the exact quantity Phase 2 consumes from
-    h_cache.pt. `_log_latent_scatter_phase1`'s R² only shows whether state is
+    probes h_t = mu_all directly — the exact quantity Phase 2 re-encodes
+    from windows of the cached episode frames. `_log_latent_scatter_phase1`'s R² only shows whether state is
     *recoverable* from h (h → state); it says nothing about whether h contains
     additional non-Markovian content (history/burn-in transient, VAE noise
     dims) that Phase 2's dynamics model has no way to predict, since Phase 2
@@ -675,41 +684,8 @@ def _log_h_state_regression_coeffs_phase1(
 
 
 # ---------------------------------------------------------------------------
-# Precompute h_t cache (between phases)
+# Episode cache (between phases)
 # ---------------------------------------------------------------------------
-
-
-class LatentDataset(Dataset):
-    """Dataset of precomputed (h_all, actions) pairs — no images."""
-
-    def __init__(self, cache: list[tuple[torch.Tensor, torch.Tensor]]):
-        self.cache = cache
-
-    def __len__(self) -> int:
-        return len(self.cache)
-
-    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.cache[i]
-
-
-def precompute_latents(
-    model: LSTMAutoencoder,
-    episodes: list,
-    device: torch.device,
-    chunk_size: int = 8,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Run encoder over all training episodes (chunked batches) and cache h_t = mu_all."""
-    model.eval()
-    cache = []
-    frames_all = torch.stack([e[0] for e in episodes])  # (N, T+1, C, H, W)
-    with torch.no_grad():
-        for i in tqdm(range(0, len(episodes), chunk_size), desc="Precomputing latents"):
-            chunk = frames_all[i:i + chunk_size].to(device)
-            mu_all, _ = model.encoder.forward_all(chunk)
-            mu_cpu = mu_all.cpu()
-            for j in range(mu_cpu.shape[0]):
-                cache.append((mu_cpu[j], episodes[i + j][1]))
-    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -719,14 +695,15 @@ def precompute_latents(
 
 def _train_epoch_phase2(
     dyn_model: HamiltonianFlowModel,
+    encoder: torch.nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     grad_clip: float,
     device: torch.device,
     seq_len: int,
+    seed_ctx_len: int,
     logdet_weight: float,
     l1_weight: float = 0.0,
-    max_seed_k: int = 0,
     teacher_force_weight: float = 1.0,
     closed_loop_weight: float = 1.0,
     closed_loop_gamma: float = 1.0,
@@ -736,19 +713,25 @@ def _train_epoch_phase2(
 ) -> dict[str, float]:
     """Dynamics epoch: joint teacher-forced + closed-loop rollout.
 
-    The full h sequence is encoded through phi in one batched call, sharing
-    that forward pass between both objectives.
+    Each batch samples one random window [s, s+ctx+T) — shared across the
+    batch — from the raw episode frames (ctx = seed_ctx_len, T = seq_len
+    clamped to the episode length) and re-encodes only that window through
+    the frozen Phase-1 encoder, with a fresh LSTM state at s. This matches
+    what the encoder actually produces from a short real context at
+    inference time (rather than carrying full episode history from t=0),
+    while covering every part of the episode over the course of training as
+    s varies from batch to batch — not just the first ctx+seq_len frames.
 
-    Teacher-forced: for every consecutive pair (h_t, h_{t+1}), take one RK4
-    step from (q_t, p_t) and compare the decoded prediction to h_{t+1}.  All
-    T steps are independent so they are batched as (B*T, q_dim) — no Python
-    loop, no sequential graph depth.
+    Teacher-forced: for every consecutive pair (h_t, h_{t+1}) within the
+    window, take one RK4 step from (q_t, p_t) and compare the decoded
+    prediction to h_{t+1}. All steps are independent so they are batched as
+    (B*T, q_dim) — no Python loop, no sequential graph depth.
 
-    Closed-loop: starting from (q_k, p_k) already computed above, roll
-    seq_len Hamiltonian steps without re-encoding and compare each decoded
-    prediction to the corresponding real h value.  Gradients from the
-    closed-loop loss flow back through phi at position k alongside those from
-    the teacher-forced objective.
+    Closed-loop: starting from (q, p) at the end of context (local index
+    ctx-1), roll T Hamiltonian steps without re-encoding and compare each
+    decoded prediction to the corresponding freshly-encoded h. Gradients
+    from the closed-loop loss flow back through phi at the seed alongside
+    those from the teacher-forced objective.
 
     Per-step errors within the rollout are combined with exponential decay
     closed_loop_gamma**t (t=0 at the first post-seed step), normalised so the
@@ -758,8 +741,8 @@ def _train_epoch_phase2(
     errors that mostly reflect compounding of earlier (possibly correct)
     error rather than a wrong local step.
 
-    Logdet regulariser is applied over all T+1 encoded timesteps rather than
-    a single seed point, so its strength stays constant as seq_len grows.
+    Logdet regulariser is applied over all ctx+T encoded timesteps in the
+    window, so its strength stays constant as seq_len grows.
 
     If h_noise_std > 0, zero-mean Gaussian noise is added to the h values fed
     into phi (both teacher-forced and closed-loop seeds), while the prediction
@@ -770,17 +753,32 @@ def _train_epoch_phase2(
     dimension's spread; otherwise it is an absolute std applied uniformly.
     """
     dyn_model.train()
+    encoder.eval()
     total_dynamics = total_tf = total_cl = total_logdet_reg = 0.0
     total_q_var = total_p_var = total_hamiltonian_l1 = total_grad_H_norm = total_struct_reg = 0.0
     q_dim = dyn_model.latent_dim // 2
+    ctx = seed_ctx_len
 
-    for h_all, actions in loader:
-        h_all = h_all.to(device)      # (B, T+1, latent_dim)
-        actions = actions.to(device)  # (B, T)
-        B_size, T_seq, D = h_all.shape
-        T_full = actions.shape[1]     # = T_seq - 1
+    for frames, actions, _states in loader:
+        actions = actions.to(device)  # (B, T_full)
+        B_size = frames.shape[0]
+        T_full = actions.shape[1]
 
-        # --- Encode the full sequence through phi in one batched call ---
+        # --- Sample one random window [s, s+ctx+T), shared across the batch ---
+        T = max(min(seq_len, T_full - ctx + 1), 1)
+        W = ctx + T  # frames in the window
+        max_s = T_full + 1 - W  # T_full+1 total frames, indices 0..T_full
+        s = int(torch.randint(0, max_s + 1, (1,)).item()) if max_s > 0 else 0
+
+        frames_win = frames[:, s:s + W].to(device)    # (B, W, C, H, W)
+        actions_win = actions[:, s:s + W - 1]          # (B, W-1)
+
+        # --- Re-encode just this window with a fresh LSTM state at s ---
+        with torch.no_grad():
+            h_all, _ = encoder.forward_all(frames_win)  # (B, W, latent_dim)
+        D = h_all.shape[-1]
+
+        # --- Encode the window through phi in one batched call ---
         # Augmentation: jitter the inputs to phi but keep h_all (the targets)
         # clean, so the model learns to denoise toward the dynamics manifold.
         # h_noise_scale (per-dim std) makes the std relative to each dimension's
@@ -790,39 +788,33 @@ def _train_epoch_phase2(
             h_in = h_all + torch.randn_like(h_all) * std
         else:
             h_in = h_all
-        h_flat = h_in.reshape(B_size * T_seq, D)
+        h_flat = h_in.reshape(B_size * W, D)
         s_flat, log_det_flat = dyn_model.phi.forward_with_logdet(h_flat)
-        q_all = s_flat[:, :q_dim].reshape(B_size, T_seq, q_dim)  # (B, T+1, q_dim)
-        p_all = s_flat[:, q_dim:].reshape(B_size, T_seq, q_dim)
-        log_det_all = log_det_flat.reshape(B_size, T_seq)         # (B, T+1)
-        logdet_metric = log_det_all.detach().pow(2).mean()        # save before backward
+        q_all = s_flat[:, :q_dim].reshape(B_size, W, q_dim)  # (B, W, q_dim)
+        p_all = s_flat[:, q_dim:].reshape(B_size, W, q_dim)
+        log_det_all = log_det_flat.reshape(B_size, W)          # (B, W)
+        logdet_metric = log_det_all.detach().pow(2).mean()     # save before backward
 
         logdet_reg = logdet_weight * log_det_all.pow(2).mean()
 
-        # --- Teacher-forced loss: one batched RK4 step at every t ---
-        # All T steps are independent — reshape to (B*T, q_dim) for one forward pass.
-        q_tf = q_all[:, :T_full].reshape(B_size * T_full, q_dim)
-        p_tf = p_all[:, :T_full].reshape(B_size * T_full, q_dim)
-        a_tf = actions.reshape(B_size * T_full, 1)
+        # --- Teacher-forced loss: one batched RK4 step at every t in the window ---
+        # All steps are independent — reshape to (B*T_tf, q_dim) for one forward pass.
+        T_tf = W - 1
+        q_tf = q_all[:, :T_tf].reshape(B_size * T_tf, q_dim)
+        p_tf = p_all[:, :T_tf].reshape(B_size * T_tf, q_dim)
+        a_tf = actions_win.reshape(B_size * T_tf, 1)
         q_tf_next, p_tf_next = dyn_model.controlled_step(q_tf, p_tf, a_tf)
         h_tf_pred = dyn_model.decode(q_tf_next, p_tf_next)
-        h_tf_target = h_all[:, 1:].reshape(B_size * T_full, D)
+        h_tf_target = h_all[:, 1:].reshape(B_size * T_tf, D)
         tf_loss = F.mse_loss(h_tf_pred, h_tf_target)
 
-        # --- Closed-loop rollout from seed k ---
-        # Seed (q_k, p_k) is taken from the already-encoded sequence so the
-        # phi forward pass is shared with the teacher-forced objective.
-        if max_seed_k >= 2:
-            k = int(torch.randint(1, min(max_seed_k, T_full - 1) + 1, (1,)).item())
-        else:
-            k = 1
-        T = min(seq_len, T_full - k)
-
+        # --- Closed-loop rollout from the end of context (local index ctx-1) ---
+        k = ctx - 1
         q, p = q_all[:, k], p_all[:, k]
         q_k_log, p_k_log = q.detach(), p.detach()  # save before graph is freed
         qs_steps, ps_steps = [], []
         for t in range(T):
-            q, p = dyn_model.controlled_step(q, p, actions[:, k + t:k + t + 1])
+            q, p = dyn_model.controlled_step(q, p, actions_win[:, k + t:k + t + 1])
             qs_steps.append(q)
             ps_steps.append(p)
         # The decode never feeds back into the rollout, so all T states go
@@ -1359,12 +1351,12 @@ def phase1_cmd(**kwargs):
     # Always save final checkpoint
     world_model.save(run_dir, "final", hparams, metrics, epoch)
 
-    # Precompute and save h_t cache
-    print(f"\nPrecomputing h_t cache for {len(episodes)} episodes...")
-    cache = precompute_latents(model, episodes, device)
-    h_cache_path = run_dir / "h_cache.pt"
-    torch.save(cache, h_cache_path)
-    print(f"Saved h_cache to {h_cache_path}")
+    # Save the raw training episodes (frames, actions, ground-truth state) —
+    # Phase 2 re-encodes windows of these through the frozen encoder each
+    # batch, and this cache also doubles as a dataset for later analysis.
+    episodes_cache_path = run_dir / "episodes_cache.pt"
+    torch.save(episodes, episodes_cache_path)
+    print(f"\nSaved episode cache ({len(episodes)} episodes) to {episodes_cache_path}")
     print(f"\nTo run Phase 2:\n  uv run python experiments/pendulum_offline.py phase2 --phase1-run {run_dir}")
 
     writer.close()
@@ -1376,12 +1368,12 @@ def phase1_cmd(**kwargs):
 # input — architecture + data params are loaded from the Phase 1 checkpoint
 @click.option("--phase1-run", type=str, required=True,
               help="Path to a Phase 1 run directory; loads best.pt (arch/data config + "
-                   "autoencoder weights) and h_cache.pt for latents")
+                   "autoencoder weights) and episodes_cache.pt for training episodes")
 @click.option("--phase1-checkpoint", type=str, default=None,
               help="Override the Phase 1 checkpoint (default: {phase1-run}/best.pt, "
                    "falling back to final.pt)")
-@click.option("--h-cache", type=str, default=None,
-              help="Override the h_t cache path (default: {phase1-run}/h_cache.pt)")
+@click.option("--episode-cache", type=str, default=None,
+              help="Override the episode cache path (default: {phase1-run}/episodes_cache.pt)")
 # dynamics model
 @click.option("--dt", type=float, default=0.05, show_default=True,
               help="Integration step size (should match the env frame interval)")
@@ -1423,9 +1415,12 @@ def phase1_cmd(**kwargs):
               help="Zero-mean Gaussian noise added to h inputs (augmentation; targets "
                    "stay clean), as a multiplier on each h-dim's spread across the cache. "
                    "e.g. 0.05 = 5% of each dim's std. 0 disables.")
-@click.option("--max-seed-k", type=int, default=0, show_default=True,
-              help="Max closed-loop seed timestep (0 = always start from h_1); "
-                   "randomises seed in [1, max-seed-k] to match varying encoder context lengths")
+@click.option("--seed-ctx-len", type=int, default=3, show_default=True,
+              help="Frames of context re-encoded fresh (LSTM state reset) before each "
+                   "closed-loop seed, matching the context length the encoder actually "
+                   "sees at inference; should match/be within Phase 1's --max-context-len. "
+                   "The window's start point is randomised across the whole episode each "
+                   "batch, so training covers every part of the episode, not just the start.")
 @click.option("--seq-len-start", type=int, default=5, show_default=True,
               help="Initial closed-loop rollout length for curriculum")
 @click.option("--seq-len-advance-threshold", type=float, default=0.005, show_default=True,
@@ -1462,7 +1457,7 @@ def phase2_cmd(**kwargs):
         raise click.UsageError(
             f"No Phase 1 checkpoint found in {run1} (expected best.pt or final.pt)."
         )
-    h_cache_path = kwargs["h_cache"] or str(run1 / "h_cache.pt")
+    episode_cache_path = kwargs["episode_cache"] or str(run1 / "episodes_cache.pt")
 
     writer = SummaryWriter(comment="_pendulum_offline_phase2")
     run_dir = make_run_dir("pendulum_offline_phase2")
@@ -1476,14 +1471,14 @@ def phase2_cmd(**kwargs):
         f"{k}={v}" for k, v in {**phase1_model.config, **data_cfg}.items()
     ))
 
-    # Load h_cache
-    if not Path(h_cache_path).exists():
+    # Load episode cache
+    if not Path(episode_cache_path).exists():
         raise click.UsageError(
-            f"h_cache not found at {h_cache_path}. "
-            "Re-run Phase 1 to regenerate it, or pass --h-cache explicitly."
+            f"Episode cache not found at {episode_cache_path}. "
+            "Re-run Phase 1 to regenerate it, or pass --episode-cache explicitly."
         )
-    print(f"Loading h_cache from {h_cache_path}...")
-    cache = torch.load(h_cache_path, weights_only=False)
+    print(f"Loading episode cache from {episode_cache_path}...")
+    episodes = torch.load(episode_cache_path, weights_only=False)
 
     # Collect val episodes (only if dreaming logs are enabled)
     train_sample_trajs = []
@@ -1519,25 +1514,29 @@ def phase2_cmd(**kwargs):
             damping=damping,
         )
 
-    # Infer latent_dim from cache (authoritative; overrides any stale default)
-    latent_dim = cache[0][0].shape[-1]
-    print(f"Latent dim from cache: {latent_dim}")
+    latent_dim = phase1_model.config["latent_dim"]
+    print(f"Latent dim from Phase 1 config: {latent_dim}")
 
-    # Per-dim std of h across the whole cache — used to scale augmentation noise
-    # so --h-noise-std acts as a multiplier on each dimension's spread.
+    # Per-dim std of h across the training episodes — used to scale augmentation
+    # noise so --h-noise-std acts as a multiplier on each dimension's spread.
+    # Encoded with full episode history (not windowed) purely as a one-off scale
+    # estimate; it doesn't need to match the windowed encoding used in training.
     h_noise_scale = None
     if kwargs["h_noise_std"] > 0:
-        h_noise_scale = torch.cat([h for h, _ in cache], dim=0).std(dim=0).to(device)
+        h_all_full, _ = _encode_val_h(phase1_model, episodes, device)
+        h_noise_scale = h_all_full.reshape(-1, latent_dim).std(dim=0)
         print(
             f"h noise: std={kwargs['h_noise_std']} × per-dim spread "
             f"(mean dim std={h_noise_scale.mean().item():.4f})"
         )
+        del h_all_full
 
-    latent_dataset = LatentDataset(cache)
-    latent_loader = DataLoader(
-        latent_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
+    episode_dataset = PendulumDataset(episodes)
+    episode_loader = DataLoader(
+        episode_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
+        pin_memory=device.type == "cuda",
     )
-    print(f"Latent dataset: {len(latent_dataset)} episodes")
+    print(f"Episode dataset: {len(episode_dataset)} episodes")
 
     dyn_model = HamiltonianFlowModel(
         latent_dim=latent_dim,
@@ -1577,7 +1576,8 @@ def phase2_cmd(**kwargs):
     _log_hparams_text(writer, hparams)
     _log_hparams_table(writer, hparams, {})
 
-    full_seq_len = cache[0][1].shape[0] - 1  # max steps starting from h_1
+    episode_len = episodes[0][1].shape[0]  # actions per episode
+    full_seq_len = episode_len - kwargs["seed_ctx_len"] + 1  # max T given seed_ctx_len
     seq_len = kwargs["seq_len_start"]
     ema_loss = None
     ema_cl = None   # separate EMA for closed-loop loss — gates seq_len curriculum
@@ -1588,14 +1588,15 @@ def phase2_cmd(**kwargs):
     for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 2"):
         metrics = _train_epoch_phase2(
             dyn_model=dyn_model,
-            loader=latent_loader,
+            encoder=phase1_model.encoder,
+            loader=episode_loader,
             optimizer=optimizer,
             grad_clip=kwargs["grad_clip"],
             device=device,
             seq_len=seq_len,
+            seed_ctx_len=kwargs["seed_ctx_len"],
             logdet_weight=kwargs["logdet_weight"],
             l1_weight=kwargs["l1_weight"],
-            max_seed_k=kwargs["max_seed_k"],
             teacher_force_weight=kwargs["teacher_force_weight"],
             closed_loop_weight=kwargs["closed_loop_weight"],
             closed_loop_gamma=kwargs["closed_loop_gamma"],
