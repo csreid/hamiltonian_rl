@@ -16,6 +16,7 @@ from tqdm import tqdm
 _G = 10.0
 _H_STAR = 20.0  # 2 * m * g * l  with m=l=1, g=10
 _DT = 0.05  # Pendulum-v1 integration timestep
+_MAX_SPEED = 8.0  # Pendulum-v1's hard clip on |theta_dot| (gymnasium default)
 
 
 # ── Image preprocessing ──────────────────────────────────────────────────────
@@ -345,16 +346,57 @@ def collect_spin_trajectories(
     )
 
 
+def _seeds_reaching_targets(
+    targets: np.ndarray,
+    max_steps: int,
+    damping: float = 0.0,
+) -> np.ndarray:
+    """Find zero-action seeds that land at ``targets`` after ``max_steps`` steps.
+
+    Pendulum-v1's zero-action step is semi-implicit ("symplectic") Euler:
+        newthdot = clip(thdot + (3g/2l) sin(th) dt, -max_speed, max_speed)
+        newth    = th + newthdot dt
+        newthdot *= exp(-damping dt)                    (damping, applied after)
+    The position update uses the *new* velocity, so this is not reversible by
+    simply negating velocity and re-running the same forward step — that
+    would evaluate the sin(th) acceleration at the wrong angle and drift
+    (confirmed empirically: multi-step error of >1 rad). Instead the map is
+    inverted in closed form, one step at a time, walking backward from each
+    target: undo damping, recover th from th = newth - newthdot dt, then
+    recover thdot from the acceleration evaluated at that *recovered* th
+    (matching what the forward step actually used). Exact up to float
+    precision, provided no step along the way saturates the velocity clip —
+    true for the achievable phase-space region this is used for.
+
+    Returns an (N, 2) array of (theta0, theta_dot0) seeds, same shape as
+    ``targets``.
+    """
+    theta = targets[:, 0].copy()
+    theta_dot = targets[:, 1].copy()
+    for _ in range(max_steps):
+        theta_dot = theta_dot * np.exp(damping * _DT)          # undo damping
+        theta_prev = theta - theta_dot * _DT                    # invert position update
+        theta_dot_prev = theta_dot - (3 * _G / 2) * np.sin(theta_prev) * _DT
+        theta, theta_dot = theta_prev, theta_dot_prev
+    return np.stack([theta, theta_dot], axis=-1)
+
+
 def _collect_zero_episodes(
     n_episodes: int,
     img_size: int,
     max_steps: int,
     damping: float = 0.0,
+    seeds: np.ndarray | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Collect episodes with the action fixed at zero (uncontrolled dynamics)."""
+    """Collect episodes with the action fixed at zero (uncontrolled dynamics).
+
+    ``seeds``: explicit (N, 2) array of (theta0, theta_dot0) to start from;
+    defaults to the standard covering grid (``_grid_seeds``).
+    """
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
-    seeds = _grid_seeds(n_episodes)
+    if seeds is None:
+        seeds = _grid_seeds(n_episodes)
 
     try:
         for i in tqdm(range(n_episodes), desc="Val trajectories (zero action)"):
@@ -398,6 +440,42 @@ def collect_zero_trajectories(
         img_size=img_size,
         max_steps=max_steps,
         damping=damping,
+    )
+
+
+def collect_zero_trajectories_targeted(
+    n_episodes: int,
+    img_size: int,
+    max_steps: int,
+    damping: float = 0.0,
+    max_vel: float = _MAX_SPEED,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Zero-action episodes whose *final* state, not seed, covers the grid.
+
+    Plain ``collect_zero_trajectories`` seeds the covering grid and lets
+    zero-action dynamics carry each point wherever gravity takes it over
+    ``max_steps`` — near the unstable equilibrium (theta=0) at high angular
+    velocity, that's a large excursion in just a few steps, so the highest-
+    energy corner of the grid ends up unrepresented in the final states.
+    This instead treats the grid as the *targets* and backward-solves
+    (``_seeds_reaching_targets``) for the seed that reaches each one, so the
+    full grid — including the high-energy region near theta=0 — is actually
+    covered by the states each episode ends on.
+
+    ``max_vel`` defaults to Pendulum-v1's own ``max_speed`` clip (8 rad/s):
+    the env can never actually reach angular velocities beyond that, so
+    targeting a wider range wouldn't converge — the backward solve would find
+    a seed for an unreachable target and the forward rollout would just
+    saturate at the clip instead of arriving where asked.
+    """
+    targets = _grid_seeds(n_episodes, min_theta_dot=-max_vel, max_theta_dot=max_vel)
+    seeds = _seeds_reaching_targets(targets, max_steps=max_steps, damping=damping)
+    return _collect_zero_episodes(
+        n_episodes=n_episodes,
+        img_size=img_size,
+        max_steps=max_steps,
+        damping=damping,
+        seeds=seeds,
     )
 
 

@@ -61,8 +61,9 @@ from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
-    collect_zero_trajectories,
+    collect_zero_trajectories_targeted,
     _G,
+    _MAX_SPEED,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
 from hamilton_rl.models import HamiltonianFlowModel, LSTMAutoencoder, WorldModel
@@ -160,14 +161,19 @@ def _collect_energy_grid_episodes(
 
     These are pure physics rollouts (independent of the model being trained),
     so they're collected once up front and reused across every validation
-    step rather than re-simulated each time. Sweeps the same covering grid of
-    (theta, theta_dot) used to seed episode collection elsewhere
-    (`_grid_seeds`, via `collect_zero_trajectories`). Each grid point is
-    rolled forward `context_frames - 1` steps under zero action — the causal
-    LSTM encoder can't infer velocity from a single still frame, so it needs
-    that much real motion to work with, exactly as at train/inference time.
+    step rather than re-simulated each time. Each episode's *final* state
+    (context_frames - 1 zero-action steps in) covers the standard grid of
+    (theta, theta_dot) — via `collect_zero_trajectories_targeted`, which
+    backward-solves for the right seed rather than just seeding the grid
+    directly, since a plain zero-action rollout from the grid would let the
+    highest-energy points (near theta=0, the unstable equilibrium, at high
+    angular velocity) swing far away from theta=0 within just a few steps,
+    leaving that corner of the grid unsampled. Rolling forward at all (rather
+    than encoding a single still frame) is necessary because the causal LSTM
+    encoder needs real motion to infer velocity from, exactly as at
+    train/inference time.
     """
-    return collect_zero_trajectories(
+    return collect_zero_trajectories_targeted(
         n_episodes=resolution * resolution,
         img_size=img_size,
         max_steps=context_frames - 1,
@@ -215,8 +221,8 @@ def _plot_learned_energy_landscape(
     model: WorldModel,
     episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     landscape_resolution: int = 200,
-    min_vel: float = -10.0,
-    max_vel: float = 10.0,
+    min_vel: float = -_MAX_SPEED,
+    max_vel: float = _MAX_SPEED,
     device: torch.device | None = None,
 ) -> plt.Figure:
     """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
@@ -226,14 +232,20 @@ def _plot_learned_energy_landscape(
     directly from the formula (`landscape_resolution`, independent of how
     many grid points were actually sampled/encoded through the model). The
     learned H at each sampled point is overlaid as a scatter on top, using
-    the same color scale (vmin/vmax) as the heatmap, so the two are directly
-    comparable by eye — matching colors at a scatter point mean the model
-    agrees with the true landscape there.
+    the same colormap as the heatmap but its own independent color scale —
+    H is only ever constrained through its gradient during training, so it's
+    identifiable only up to an unknown affine offset/scale, and forcing a
+    shared numeric range would misleadingly imply the absolute values should
+    match. Two colorbars (one per scale) let you compare *pattern* — where
+    energy is high/low — by matching colors, without implying agreement in
+    magnitude.
 
-    q and p are learned latents (q_dim = p_dim = latent_dim // 2), not
-    literally (θ, θ̇), and H is only constrained through its gradient, so
-    agreement is only expected in *pattern* (where energy is high/low) — up
-    to an unknown affine offset/scale — not in absolute value.
+    `min_vel`/`max_vel` default to Pendulum-v1's own velocity clip
+    (`_MAX_SPEED` = 8 rad/s) rather than a wider round number — the pendulum
+    can never actually reach angular velocities beyond that, so sweeping the
+    true-energy heatmap past it would depict energy values for a region of
+    phase space the physics (and therefore the sampled points) can never
+    populate.
     """
     model.eval()
     if device is None:
@@ -252,26 +264,22 @@ def _plot_learned_energy_landscape(
     theta_dot = samples["theta_dot"].cpu().numpy()
     H_true = samples["H_true"].cpu().numpy()
 
-    vmin = min(H_true_dense.min(), H_learned.min())
-    vmax = max(H_true_dense.max(), H_learned.max())
-
-    fig, ax = plt.subplots(figsize=(7, 6))
+    fig, ax = plt.subplots(figsize=(7.5, 6))
     im = ax.imshow(
         H_true_dense,
         origin="lower",
         aspect="auto",
         extent=[-np.pi, np.pi, min_vel, max_vel],
         cmap="viridis",
-        vmin=vmin,
-        vmax=vmax,
     )
-    ax.scatter(
-        theta, theta_dot, c=H_learned, cmap="viridis", vmin=vmin, vmax=vmax,
+    sc = ax.scatter(
+        theta, theta_dot, c=H_learned, cmap="viridis",
         s=30, edgecolors="white", linewidths=0.6,
     )
     ax.set_xlabel("θ (rad)")
     ax.set_ylabel("θ̇ (rad/s)")
-    fig.colorbar(im, ax=ax, label="H")
+    fig.colorbar(im, ax=ax, label="H_true", pad=0.02)
+    fig.colorbar(sc, ax=ax, label="H_learned", pad=0.1)
 
     r = np.corrcoef(H_true, H_learned)[0, 1]
     ax.set_title(f"True energy (heatmap) vs. learned H (dots), Pearson r={r:.3f}")
