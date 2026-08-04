@@ -17,14 +17,18 @@ resulting real observation. Neither side ever free-runs open-loop.
     velocity + action penalty.
 
   - Learned: imagination = the checkpoint's `HamiltonianFlowModel` in latent
-    (q, p) space, cost = pixel MSE (imagined decoded frame vs. a fixed
-    upright target) + action penalty. Critically, the latent state used to
-    *start* each planning step is re-grounded every step by re-encoding a
-    rolling window of the real rendered frames through the frozen Phase-1
-    LSTM encoder (exactly how Phase 2 training itself re-encodes fresh
-    windows) — the learned dynamics are only ever used inside the horizon-H
-    imagination, never to carry real state forward in time. Both panels
-    therefore render real environment frames.
+    (q, p) space. Cost is the *same* angle^2 + velocity^2 + action-penalty
+    shape as ground truth, evaluated by applying the already-fitted h->state
+    linear probe to each imagined step's h — not pixel MSE against a target
+    frame, which stayed nearly flat until the pendulum was already most of
+    the way upright and gave MPPI little gradient to plan against early on.
+    Critically, the latent state used to *start* each planning step is
+    re-grounded every step by re-encoding a rolling window of the real
+    rendered frames through the frozen Phase-1 LSTM encoder (exactly how
+    Phase 2 training itself re-encodes fresh windows) — the learned dynamics
+    are only ever used inside the horizon-H imagination, never to carry real
+    state forward in time. Both panels therefore render real environment
+    frames.
 
 Both closed-loop rollouts are rendered as a side-by-side pixel GIF, plus an
 animated phase-space (theta, theta_dot) comparison: the ground-truth
@@ -174,7 +178,7 @@ def run_ground_truth_mppi(
             mean = mppi_plan(mean, cost_fn, cfg)
             u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
 
-            obs, _, _, _, _ = env.step(np.array([u0], dtype=np.float32))
+            env.step(np.array([u0], dtype=np.float32))
             # gymnasium's internal state theta is NOT wrapped to [-pi, pi] — it
             # just accumulates theta += theta_dot*dt across a full rotation, so
             # it can drift arbitrarily far outside the plotted range even though
@@ -186,7 +190,10 @@ def run_ground_truth_mppi(
             theta_cur = torch.tensor(float(theta_new), device=device)
             theta_dot_cur = torch.tensor(float(theta_dot_new), device=device)
 
-            frames.append(torch.from_numpy(obs).float() / 255.0)
+            # No encoder involved on this side, so the display frame can carry
+            # the torque-arrow overlay for the applied action freely.
+            display_obs = env.render_with_action(u0)
+            frames.append(torch.from_numpy(display_obs).float() / 255.0)
             thetas.append(float(angle_normalize(torch.tensor(float(theta_new)))))
             theta_dots.append(float(theta_dot_new))
 
@@ -206,30 +213,32 @@ def run_ground_truth_mppi(
 # ── Latent MPPI ──────────────────────────────────────────────────────────────
 
 
-def _latent_rollout_cost_fn(dynamics, autoencoder, q0, p0, target_frame, action_weight):
+def _latent_rollout_cost_fn(dynamics, q0, p0, regression, action_weight):
+    """Imagined-rollout cost in angle-space, via the h->state linear probe.
+
+    Pixel-MSE against a fixed target frame made the cost nearly flat until
+    the pendulum was already most of the way upright (the decoded image only
+    starts to resemble "vertical" quite late), which gives MPPI very little
+    gradient signal to plan against early on. Reusing the already-fitted
+    linear regression turns every imagined step directly into an estimated
+    (theta, theta_dot) and lets the cost be the same angle^2 + velocity^2
+    shape as the ground-truth cost — smooth from step 1 — and skips a CNN
+    decoder forward pass per candidate step entirely.
+    """
     def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
         K, H, _ = candidates.shape
         q = q0.expand(K, -1).clone()
         p = p0.expand(K, -1).clone()
-        qs, ps, us = [], [], []
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
         for t in range(H):
             u = candidates[:, t, :]
             q, p = dynamics.controlled_step(q, p, u)
-            qs.append(q)
-            ps.append(p)
-            us.append(u)
-        q_traj = torch.stack(qs, dim=1)  # (K, H, q_dim)
-        p_traj = torch.stack(ps, dim=1)
-        u_traj = torch.stack(us, dim=1)  # (K, H, 1)
-        q_dim = q_traj.shape[-1]
-
-        h_traj = dynamics.decode(q_traj.reshape(K * H, q_dim), p_traj.reshape(K * H, q_dim))
-        pred_frames = autoencoder.decode_latent(h_traj)  # (K*H, C, Himg, Wimg)
-        target = target_frame.unsqueeze(0).expand_as(pred_frames)
-        pixel_mse = (pred_frames - target).pow(2).mean(dim=(1, 2, 3)).reshape(K, H)
-
-        action_cost = u_traj.squeeze(-1).pow(2)  # (K, H)
-        return (pixel_mse + action_weight * action_cost).sum(dim=1)
+            h = dynamics.decode(q, p)
+            st = h @ regression  # (K, 3) -> (cos theta_hat, sin theta_hat, theta_dot_hat)
+            theta_hat = torch.atan2(st[:, 1], st[:, 0])
+            theta_dot_hat = st[:, 2]
+            total = total + angle_normalize(theta_hat) ** 2 + 0.1 * theta_dot_hat**2 + action_weight * u.squeeze(-1) ** 2
+        return total
 
     return cost_fn
 
@@ -274,12 +283,6 @@ def run_latent_mppi(
         obs, _, _, _, _ = env.step(np.array([0.0], dtype=np.float32))
         context.append(torch.from_numpy(obs).float() / 255.0)
 
-    target_env = PendulumPixelEnv(img_size=img_size, damping=damping)
-    target_env.reset()
-    target_obs = target_env.set_state(0.0, 0.0)
-    target_env.close()
-    target_frame = (torch.from_numpy(target_obs).float() / 255.0).to(device)
-
     def ground() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Re-encode the current real-frame context window -> grounded (h, q, p)."""
         ctx = torch.stack(list(context)).unsqueeze(0).to(device)  # (1, n_context, C, H, W)
@@ -299,14 +302,16 @@ def run_latent_mppi(
 
     try:
         for step in range(total_steps):
-            cost_fn = _latent_rollout_cost_fn(dynamics, autoencoder, q, p, target_frame, action_weight)
+            cost_fn = _latent_rollout_cost_fn(dynamics, q, p, A, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
             u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
 
             obs, _, _, _, _ = env.step(np.array([u0], dtype=np.float32))
-            frame = torch.from_numpy(obs).float() / 255.0
-            frames.append(frame)
-            context.append(frame)
+            # Arrow-free frame grounds the encoder (context); a separately
+            # rendered arrow frame is display-only and never touches it.
+            context.append(torch.from_numpy(obs).float() / 255.0)
+            display_obs = env.render_with_action(u0)
+            frames.append(torch.from_numpy(display_obs).float() / 255.0)
 
             h_t, q, p = ground()
             st_pred = (h_t @ A).squeeze(0)
@@ -385,7 +390,7 @@ with st.sidebar:
     st.divider()
     st.header("Cost weights")
     w_u_gt = st.number_input("Action weight (ground truth)", min_value=0.0, value=0.001, step=0.001, format="%.4f")
-    w_u_latent = st.number_input("Action weight (pixel MSE)", min_value=0.0, value=0.01, step=0.01, format="%.3f")
+    w_u_latent = st.number_input("Action weight (learned)", min_value=0.0, value=0.001, step=0.001, format="%.4f")
 
     st.divider()
     st.header("Rollout")

@@ -96,6 +96,21 @@ class PendulumPixelEnv(gym.Wrapper):
         t = preprocess_frame(frame, self.img_size)
         return (t * 255).byte().numpy()
 
+    def render_with_action(self, u: float) -> np.ndarray:
+        """Render the *current* state with gym's torque-arrow overlay for display.
+
+        Display-only counterpart to `_obs()`: every observation that could
+        reach an encoder must stay arrow-free (see `_obs()`'s docstring), but
+        a human-facing view benefits from seeing the applied action. Restores
+        `last_u = None` afterward so `_obs()`'s no-arrow invariant still holds
+        for any observation taken after this call.
+        """
+        self.env.unwrapped.last_u = u  # type: ignore[union-attr]
+        frame = self.env.render()  # (H, W, 3) uint8
+        t = preprocess_frame(frame, self.img_size)
+        self.env.unwrapped.last_u = None  # type: ignore[union-attr]
+        return (t * 255).byte().numpy()
+
     def _apply_damping(self) -> None:
         if self.damping != 0.0:
             theta, theta_dot = self.env.unwrapped.state  # type: ignore[union-attr]
