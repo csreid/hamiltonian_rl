@@ -431,7 +431,14 @@ def build_phase_space_frames(
         ax.set_ylim(-_MAX_SPEED, _MAX_SPEED)
         ax.set_xlabel("θ (rad)")
         ax.set_ylabel("θ̇ (rad/s)")
-        ax.set_title(f"Phase space  (t={i})")
+
+        title = f"Phase space  (t={i})"
+        if i < total_steps:
+            title += (
+                f"\nLearned plan's estimated final state: "
+                f"θ={learned_plan_theta[i][-1]:+.2f}  θ̇={learned_plan_theta_dot[i][-1]:+.2f}"
+            )
+        ax.set_title(title, fontsize=9)
         ax.legend(loc="upper right", fontsize=7)
         fig.tight_layout()
 
