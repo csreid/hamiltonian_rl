@@ -150,23 +150,43 @@ def _plot_phase_space_coverage(
     return fig
 
 
+def _collect_energy_grid_episodes(
+    resolution: int = 20,
+    img_size: int = 64,
+    damping: float = 0.0,
+    context_frames: int = 5,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Collect the zero-action grid-seeded episodes for the energy-landscape plot.
+
+    These are pure physics rollouts (independent of the model being trained),
+    so they're collected once up front and reused across every validation
+    step rather than re-simulated each time. Sweeps the same covering grid of
+    (theta, theta_dot) used to seed episode collection elsewhere
+    (`_grid_seeds`, via `collect_zero_trajectories`). Each grid point is
+    rolled forward `context_frames - 1` steps under zero action — the causal
+    LSTM encoder can't infer velocity from a single still frame, so it needs
+    that much real motion to work with, exactly as at train/inference time.
+    """
+    return collect_zero_trajectories(
+        n_episodes=resolution * resolution,
+        img_size=img_size,
+        max_steps=context_frames - 1,
+        damping=damping,
+    )
+
+
 @torch.no_grad()
 def _collect_grid_qp_samples(
     model: WorldModel,
-    resolution: int = 20,
-    context_frames: int = 5,
+    episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     device: torch.device | None = None,
 ) -> dict:
-    """Sweep the same covering grid of (theta, theta_dot) used to seed episode
-    collection (`_grid_seeds`), and encode each point through the full pipeline.
+    """Encode pre-collected grid episodes (see `_collect_energy_grid_episodes`)
+    through the full pipeline (encoder -> phi) to get learned (q, p).
 
-    The causal LSTM encoder can't infer velocity from a single still frame, so
-    each grid point is rolled forward `context_frames - 1` steps under zero
-    action (`collect_zero_trajectories`, which seeds from the same grid) to
-    give it real motion to work with — exactly as at train/inference time.
-    The ground-truth energy is evaluated at the state actually reached after
-    that context window, not the raw seed, since that's the state the
-    encoder's output corresponds to.
+    The ground-truth energy is evaluated at the state actually reached at the
+    end of each episode's zero-action rollout, not the raw seed, since that's
+    the state the encoder's output corresponds to.
 
     Returns a dict with q, p (each (N, q_dim), learned latents at the end of
     context), H_true (N,), theta (N,), theta_dot (N,) — the latter two being
@@ -174,16 +194,6 @@ def _collect_grid_qp_samples(
     """
     if device is None:
         device = next(model.autoencoder.parameters()).device
-    img_size = model.data_config.get("img_size", 64)
-    damping = model.data_config.get("damping", 0.0)
-    n_points = resolution * resolution
-
-    episodes = collect_zero_trajectories(
-        n_episodes=n_points,
-        img_size=img_size,
-        max_steps=context_frames - 1,
-        damping=damping,
-    )
 
     frames = torch.stack([frames for frames, _, _ in episodes]).to(device)  # (N, ctx, C, H, W)
     states = torch.stack([states for _, _, states in episodes])             # (N, ctx, 3)
@@ -203,46 +213,68 @@ def _collect_grid_qp_samples(
 @torch.no_grad()
 def _plot_learned_energy_landscape(
     model: WorldModel,
-    resolution: int = 20,
-    context_frames: int = 5,
+    episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    landscape_resolution: int = 200,
+    min_vel: float = -10.0,
+    max_vel: float = 10.0,
     device: torch.device | None = None,
 ) -> plt.Figure:
     """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
 
+    Unlike (q, p), theta and theta_dot are genuinely 1D and the true energy
+    has a closed form, so the ground truth is drawn as a dense heatmap swept
+    directly from the formula (`landscape_resolution`, independent of how
+    many grid points were actually sampled/encoded through the model). The
+    learned H at each sampled point is overlaid as a scatter on top, using
+    the same color scale (vmin/vmax) as the heatmap, so the two are directly
+    comparable by eye — matching colors at a scatter point mean the model
+    agrees with the true landscape there.
+
     q and p are learned latents (q_dim = p_dim = latent_dim // 2), not
     literally (θ, θ̇), and H is only constrained through its gradient, so
-    agreement between the two panels is only expected in *shape* — up to an
-    unknown affine offset/scale — not in absolute value. Both panels plot the
-    same grid points in true (θ, θ̇) coordinates, colored by energy, so any
-    shape mismatch is easy to spot directly.
+    agreement is only expected in *pattern* (where energy is high/low) — up
+    to an unknown affine offset/scale — not in absolute value.
     """
     model.eval()
     if device is None:
         device = next(model.autoencoder.parameters()).device
-    samples = _collect_grid_qp_samples(model, resolution=resolution, context_frames=context_frames, device=device)
+
+    theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
+    theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
+    grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
+    H_true_dense = (0.5 * grid_theta_dot**2 + _G * (1.0 + torch.cos(grid_theta))).numpy()
+
+    samples = _collect_grid_qp_samples(model, episodes, device=device)
     H_learned = model.dynamics.hamiltonian(
         samples["q"].to(device), samples["p"].to(device)
-    ).cpu()
+    ).cpu().numpy()
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
     H_true = samples["H_true"].cpu().numpy()
 
-    fig, (ax_true, ax_learned) = plt.subplots(1, 2, figsize=(11, 5))
+    vmin = min(H_true_dense.min(), H_learned.min())
+    vmax = max(H_true_dense.max(), H_learned.max())
 
-    sc0 = ax_true.scatter(theta, theta_dot, c=H_true, cmap="viridis", s=14, linewidths=0)
-    ax_true.set_xlabel("θ (rad)")
-    ax_true.set_ylabel("θ̇ (rad/s)")
-    ax_true.set_title("True energy")
-    fig.colorbar(sc0, ax=ax_true, label="H_true")
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(
+        H_true_dense,
+        origin="lower",
+        aspect="auto",
+        extent=[-np.pi, np.pi, min_vel, max_vel],
+        cmap="viridis",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    ax.scatter(
+        theta, theta_dot, c=H_learned, cmap="viridis", vmin=vmin, vmax=vmax,
+        s=30, edgecolors="white", linewidths=0.6,
+    )
+    ax.set_xlabel("θ (rad)")
+    ax.set_ylabel("θ̇ (rad/s)")
+    fig.colorbar(im, ax=ax, label="H")
 
-    sc1 = ax_learned.scatter(theta, theta_dot, c=H_learned.numpy(), cmap="viridis", s=14, linewidths=0)
-    ax_learned.set_xlabel("θ (rad)")
-    ax_learned.set_ylabel("θ̇ (rad/s)")
-    ax_learned.set_title("Learned H(q, p)")
-    fig.colorbar(sc1, ax=ax_learned, label="H_learned")
-
-    r = np.corrcoef(H_true, H_learned.numpy())[0, 1]
-    fig.suptitle(f"Learned vs. true energy on phase-space grid (Pearson r={r:.3f})")
+    r = np.corrcoef(H_true, H_learned)[0, 1]
+    ax.set_title(f"True energy (heatmap) vs. learned H (dots), Pearson r={r:.3f}")
     fig.tight_layout()
 
     return fig
@@ -1375,6 +1407,7 @@ def phase2_cmd(**kwargs):
     # Collect val episodes (only if dreaming logs are enabled)
     train_sample_trajs = []
     val_energy, val_random, val_spin = [], [], []
+    energy_grid_episodes = []
     if kwargs["val_every"] > 0:
         n_val = kwargs["n_val_episodes"]
         if n_val < 0:
@@ -1404,6 +1437,10 @@ def phase2_cmd(**kwargs):
             energy_k=data_cfg.get("energy_k", 1.0),
             max_steps=data_cfg.get("max_steps", 200),
             damping=damping,
+        )
+        print("Collecting grid episodes for energy-landscape logging...")
+        energy_grid_episodes = _collect_energy_grid_episodes(
+            img_size=img_size, damping=damping, context_frames=kwargs["val_context_frames"],
         )
 
     latent_dim = phase1_model.config["latent_dim"]
@@ -1567,7 +1604,7 @@ def phase2_cmd(**kwargs):
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
             _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
             energy_fig = _plot_learned_energy_landscape(
-                world_model, context_frames=kwargs["val_context_frames"], device=device,
+                world_model, energy_grid_episodes, device=device,
             )
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
             plt.close(energy_fig)
