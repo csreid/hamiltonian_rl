@@ -172,10 +172,23 @@ def run_ground_truth_mppi(
     frames = []
     thetas = [float(angle_normalize(torch.tensor(float(theta_b))))]
     theta_dots = [float(theta_dot_b)]
+    plan_thetas, plan_theta_dots = [], []
     try:
         for step in range(total_steps):
             cost_fn = _gt_rollout_cost_fn(theta_cur, theta_dot_cur, damping, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
+
+            # Roll the chosen (noise-free) plan forward once, purely to show
+            # "what does the controller currently intend to do" — never executed.
+            pt, ptd = theta_cur.unsqueeze(0), theta_dot_cur.unsqueeze(0)
+            plan_t, plan_td = [], []
+            for t in range(cfg.horizon):
+                pt, ptd = analytic_pendulum_step(pt, ptd, mean[t : t + 1, 0], damping=damping)
+                plan_t.append(float(angle_normalize(pt)))
+                plan_td.append(float(ptd))
+            plan_thetas.append(plan_t)
+            plan_theta_dots.append(plan_td)
+
             u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
 
             env.step(np.array([u0], dtype=np.float32))
@@ -204,9 +217,11 @@ def run_ground_truth_mppi(
         env.close()
 
     return {
-        "frames": frames,           # list of (C, H, W) float tensors, len total_steps
-        "theta": thetas,            # len total_steps + 1 (includes t=0)
+        "frames": frames,                     # list of (C, H, W) float tensors, len total_steps
+        "theta": thetas,                      # len total_steps + 1 (includes t=0)
         "theta_dot": theta_dots,
+        "plan_theta": plan_thetas,            # len total_steps; plan_theta[i] = H-step preview from theta[i]
+        "plan_theta_dot": plan_theta_dots,
     }
 
 
@@ -294,6 +309,7 @@ def run_latent_mppi(
     mean = torch.zeros(cfg.horizon, 1, device=device)
     frames = []
     theta_hats, theta_dot_hats = [], []
+    plan_thetas, plan_theta_dots = [], []
 
     h_t, q, p = ground()
     st0 = (h_t @ A).squeeze(0)
@@ -304,6 +320,20 @@ def run_latent_mppi(
         for step in range(total_steps):
             cost_fn = _latent_rollout_cost_fn(dynamics, q, p, A, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
+
+            # Roll the chosen (noise-free) plan forward once, purely to show
+            # "what does the controller currently intend to do" — never executed.
+            pq, pp = q.clone(), p.clone()
+            plan_t, plan_td = [], []
+            for t in range(cfg.horizon):
+                pq, pp = dynamics.controlled_step(pq, pp, mean[t : t + 1, :])
+                h_p = dynamics.decode(pq, pp)
+                st_p = (h_p @ A).squeeze(0)
+                plan_t.append(float(angle_normalize(torch.atan2(st_p[1], st_p[0]))))
+                plan_td.append(float(st_p[2]))
+            plan_thetas.append(plan_t)
+            plan_theta_dots.append(plan_td)
+
             u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
 
             obs, _, _, _, _ = env.step(np.array([u0], dtype=np.float32))
@@ -326,32 +356,79 @@ def run_latent_mppi(
 
     return {
         "frames": frames,
-        "theta_hat": theta_hats,
+        "theta_hat": theta_hats,              # len total_steps + 1 (includes t=0)
         "theta_dot_hat": theta_dot_hats,
+        "plan_theta": plan_thetas,            # len total_steps; plan_theta[i] = H-step preview from theta_hat[i]
+        "plan_theta_dot": plan_theta_dots,
     }
 
 
 # ── Phase-space animation ────────────────────────────────────────────────────
 
 
+def _break_wrapped(theta: list, theta_dot: list) -> tuple[list, list]:
+    """Insert a NaN separator at every angle-wrap boundary (|delta theta| > pi).
+
+    theta lives in [-pi, pi], so a genuine wrap (e.g. +3.1 -> -3.1 across one
+    real timestep) is a tiny physical motion but a huge jump in the plotted
+    coordinate. Without a break, a line plot draws a spurious edge-to-edge
+    segment straight across the axes; matplotlib treats NaN as a gap, so
+    inserting one at each such jump splits the line there without dropping
+    either real point.
+    """
+    if len(theta) < 2:
+        return list(theta), list(theta_dot)
+    out_t, out_td = [theta[0]], [theta_dot[0]]
+    for i in range(1, len(theta)):
+        if abs(theta[i] - theta[i - 1]) > np.pi:
+            out_t.append(float("nan"))
+            out_td.append(float("nan"))
+        out_t.append(theta[i])
+        out_td.append(theta_dot[i])
+    return out_t, out_td
+
+
 def build_phase_space_frames(
-    theta_actual: list, theta_dot_actual: list, theta_planned: list, theta_dot_planned: list,
+    gt_theta: list, gt_theta_dot: list, gt_plan_theta: list, gt_plan_theta_dot: list,
+    learned_theta: list, learned_theta_dot: list, learned_plan_theta: list, learned_plan_theta_dot: list,
 ) -> list[Image.Image]:
-    T = min(len(theta_actual), len(theta_planned))
+    """One frame per control step: solid = trajectory so far, dashed = the
+    *current* planned horizon only (not a history of past plans) — so a
+    controller that keeps replanning very differently from step to step
+    shows up as a dashed line that visibly changes shape frame to frame,
+    while one that tracks its own plan closely stays nearly stationary.
+    """
+    total_steps = len(gt_plan_theta)
     frames = []
-    for i in range(1, T + 1):
+    for i in range(total_steps + 1):
         fig, ax = plt.subplots(figsize=(5, 5), dpi=100)
-        ax.plot(theta_actual[:i], theta_dot_actual[:i], color="tab:blue", linewidth=1.3, label="Actual (GT MPPI)")
-        ax.scatter(theta_actual[i - 1:i], theta_dot_actual[i - 1:i], color="tab:blue", s=30, zorder=3)
-        ax.plot(theta_planned[:i], theta_dot_planned[:i], color="tab:orange", linewidth=1.3, label="Planned (latent MPPI)")
-        ax.scatter(theta_planned[i - 1:i], theta_dot_planned[i - 1:i], color="tab:orange", s=30, zorder=3)
+
+        gt_t, gt_td = _break_wrapped(gt_theta[: i + 1], gt_theta_dot[: i + 1])
+        ax.plot(gt_t, gt_td, color="tab:blue", linewidth=1.3, label="GT MPPI (actual)")
+        ax.scatter(gt_theta[i : i + 1], gt_theta_dot[i : i + 1], color="tab:blue", s=30, zorder=3)
+
+        lr_t, lr_td = _break_wrapped(learned_theta[: i + 1], learned_theta_dot[: i + 1])
+        ax.plot(lr_t, lr_td, color="tab:orange", linewidth=1.3, label="Learned MPPI (believed)")
+        ax.scatter(learned_theta[i : i + 1], learned_theta_dot[i : i + 1], color="tab:orange", s=30, zorder=3)
+
+        if i < total_steps:
+            gp_t, gp_td = _break_wrapped(
+                [gt_theta[i], *gt_plan_theta[i]], [gt_theta_dot[i], *gt_plan_theta_dot[i]]
+            )
+            ax.plot(gp_t, gp_td, color="tab:blue", linewidth=1.1, linestyle="--", alpha=0.7, label="GT plan")
+
+            lp_t, lp_td = _break_wrapped(
+                [learned_theta[i], *learned_plan_theta[i]], [learned_theta_dot[i], *learned_plan_theta_dot[i]]
+            )
+            ax.plot(lp_t, lp_td, color="tab:orange", linewidth=1.1, linestyle="--", alpha=0.7, label="Learned plan")
+
         ax.axvline(0.0, color="gray", linewidth=0.6, linestyle="--")
         ax.set_xlim(-np.pi, np.pi)
         ax.set_ylim(-_MAX_SPEED, _MAX_SPEED)
         ax.set_xlabel("θ (rad)")
         ax.set_ylabel("θ̇ (rad/s)")
         ax.set_title(f"Phase space  (t={i})")
-        ax.legend(loc="upper right", fontsize=8)
+        ax.legend(loc="upper right", fontsize=7)
         fig.tight_layout()
 
         buf = io.BytesIO()
@@ -514,10 +591,17 @@ st.image(pixel_gif, use_container_width=False)
 
 with st.spinner("Rendering phase-space animation…"):
     phase_frames = build_phase_space_frames(
-        theta_actual=gt_result["theta"][1:], theta_dot_actual=gt_result["theta_dot"][1:],
-        theta_planned=latent_result["theta_hat"][1:], theta_dot_planned=latent_result["theta_dot_hat"][1:],
+        gt_theta=gt_result["theta"], gt_theta_dot=gt_result["theta_dot"],
+        gt_plan_theta=gt_result["plan_theta"], gt_plan_theta_dot=gt_result["plan_theta_dot"],
+        learned_theta=latent_result["theta_hat"], learned_theta_dot=latent_result["theta_dot_hat"],
+        learned_plan_theta=latent_result["plan_theta"], learned_plan_theta_dot=latent_result["plan_theta_dot"],
     )
     phase_gif = frames_to_gif(phase_frames, fps)
 
-st.subheader("Phase space: actual (ground truth) vs. planned (learned controller's grounded belief, via h→state regression)")
+st.subheader("Phase space: trajectory so far (solid) vs. current planned horizon (dashed)")
+st.markdown(
+    "A well-calibrated planner's dashed preview should barely move step to step, since the "
+    "trajectory ends up following it closely; a planner replanning very differently each step "
+    "will show a dashed line that visibly reshapes every frame."
+)
 st.image(phase_gif, use_container_width=False)
