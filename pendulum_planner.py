@@ -251,7 +251,11 @@ def _latent_rollout_cost_fn(dynamics, q0, p0, regression, action_weight):
             h = dynamics.decode(q, p)
             st = h @ regression  # (K, 3) -> (cos theta_hat, sin theta_hat, theta_dot_hat)
             theta_hat = torch.atan2(st[:, 1], st[:, 0])
-            theta_dot_hat = st[:, 2]
+            # The linear probe is unconstrained and can predict velocities
+            # outside what the simulator ever actually produces (it hard-clips
+            # |theta_dot| <= _MAX_SPEED every step) — clamp so a wild
+            # out-of-domain extrapolation can't spuriously dominate the cost.
+            theta_dot_hat = st[:, 2].clamp(-_MAX_SPEED, _MAX_SPEED)
             total = total + angle_normalize(theta_hat) ** 2 + 0.1 * theta_dot_hat**2 + action_weight * u.squeeze(-1) ** 2
         return total
 
