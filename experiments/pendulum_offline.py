@@ -61,7 +61,7 @@ from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
-    _energy,
+    collect_zero_trajectories,
     _G,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
@@ -124,64 +124,6 @@ def _log_hparams_table(
     """Log flattened hparams + final metrics to the TB HParams tab for cross-run filtering."""
     writer.add_hparams(_flatten_hparams(hparams), final_metrics, run_name=".")
 
-def _energy_sweep(
-    H,
-    min_vel=-10,
-    max_vel=10,
-    min_angle=-torch.pi,
-    max_angle=torch.pi,
-    resolution=20,
-):
-    """Compute and log an energy landscape across angle and angular velocity"""
-    theta_dot = torch.linspace(min_vel, max_vel, resolution)
-    theta = torch.linspace(min_angle, max_angle, resolution)
-
-    output = H(theta[:, None], theta_dot[None, :])
-
-    return output
-
-
-def _plot_energy_sweep(
-    H,
-    min_vel=-10,
-    max_vel=10,
-    min_angle=-torch.pi,
-    max_angle=torch.pi,
-    resolution=20,
-    ax: plt.Axes | None = None,
-) -> plt.Figure:
-    """Render the energy landscape from _energy_sweep as a heatmap (θ x-axis, θ̇ y-axis)."""
-    output = _energy_sweep(
-        H,
-        min_vel=min_vel,
-        max_vel=max_vel,
-        min_angle=min_angle,
-        max_angle=max_angle,
-        resolution=resolution,
-    )
-    # output[i, j] = H(theta[i], theta_dot[j]); imshow expects rows=y, cols=x, so transpose.
-    grid = output.detach().cpu().numpy().T
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 5))
-    else:
-        fig = ax.figure
-
-    im = ax.imshow(
-        grid,
-        origin="lower",
-        aspect="auto",
-        extent=[min_angle, max_angle, min_vel, max_vel],
-        cmap="viridis",
-    )
-    ax.set_xlabel("θ (rad)")
-    ax.set_ylabel("θ̇ (rad/s)")
-    ax.set_title("Energy landscape")
-    fig.colorbar(im, ax=ax, label="H(θ, θ̇)")
-
-    return fig
-
-
 def _plot_phase_space_coverage(
     episodes: list,
     ax: plt.Axes | None = None,
@@ -208,165 +150,99 @@ def _plot_phase_space_coverage(
     return fig
 
 
-def _pca_top_k(X: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Top-k principal components of (N, D) via SVD.
-
-    Returns (mean (D,), directions (k, D) unit/orthogonal, projections (N, k),
-    explained-variance ratios (k,)).
-    """
-    mean = X.mean(dim=0)
-    Xc = X - mean
-    _, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
-    directions = Vh[:k]
-    projections = Xc @ directions.T
-    explained = S[:k] ** 2 / (S**2).sum()
-    return mean, directions, projections, explained
-
-
 @torch.no_grad()
-def _collect_qp_samples(
+def _collect_grid_qp_samples(
     model: WorldModel,
-    n_episodes: int = 5,
-    max_steps: int = 200,
+    resolution: int = 20,
+    context_frames: int = 5,
     device: torch.device | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Roll out real trajectories and encode them through the full model.
+) -> dict:
+    """Sweep the same covering grid of (theta, theta_dot) used to seed episode
+    collection (`_grid_seeds`), and encode each point through the full pipeline.
 
-    Mixes three policies for state-space coverage: random torque (broad but,
-    per earlier plots, tends to trace a near-1D energy band), spin-maximising
-    (drives high |theta_dot| regardless of angle), and energy-pumping
-    (drives toward upright with the classic swing-up energy-shaping law) —
-    together these decorrelate position and velocity better than any one
-    alone. Encoding the real frame sequence (rather than synthetic per-point
-    clips) lets the causal LSTM infer velocity from actual motion, exactly
-    as at train time.
+    The causal LSTM encoder can't infer velocity from a single still frame, so
+    each grid point is rolled forward `context_frames - 1` steps under zero
+    action (`collect_zero_trajectories`, which seeds from the same grid) to
+    give it real motion to work with — exactly as at train/inference time.
+    The ground-truth energy is evaluated at the state actually reached after
+    that context window, not the raw seed, since that's the state the
+    encoder's output corresponds to.
 
-    Returns:
-        q, p: each (N, q_dim) learned latents, N = 3 * n_episodes * (max_steps + 1)
-        H_true: (N,) ground-truth pendulum energy at each sampled timestep
+    Returns a dict with q, p (each (N, q_dim), learned latents at the end of
+    context), H_true (N,), theta (N,), theta_dot (N,) — the latter two being
+    the true post-rollout state, for plotting in physical coordinates.
     """
     if device is None:
         device = next(model.autoencoder.parameters()).device
     img_size = model.data_config.get("img_size", 64)
+    damping = model.data_config.get("damping", 0.0)
+    n_points = resolution * resolution
 
-    episodes = (
-        collect_random_trajectories(n_episodes=n_episodes, img_size=img_size, max_steps=max_steps)
-        + collect_spin_trajectories(n_episodes=n_episodes, img_size=img_size, max_steps=max_steps)
-        + collect_val_trajectories(n_episodes=n_episodes, img_size=img_size, max_steps=max_steps)
+    episodes = collect_zero_trajectories(
+        n_episodes=n_points,
+        img_size=img_size,
+        max_steps=context_frames - 1,
+        damping=damping,
     )
 
-    qs, ps, energies = [], [], []
-    for frames, _actions, states in episodes:
-        mu_all, _ = model.autoencoder.encoder.forward_all(frames.unsqueeze(0).to(device))
-        h = mu_all.squeeze(0)  # (T+1, latent_dim)
-        q, p = model.dynamics.encode(h)
-        qs.append(q.cpu())
-        ps.append(p.cpu())
+    frames = torch.stack([frames for frames, _, _ in episodes]).to(device)  # (N, ctx, C, H, W)
+    states = torch.stack([states for _, _, states in episodes])             # (N, ctx, 3)
 
-        theta = torch.atan2(states[:, 1], states[:, 0])
-        theta_dot = states[:, 2]
-        energies.append(0.5 * theta_dot**2 + _G * (1.0 + torch.cos(theta)))
+    mu_all, _ = model.autoencoder.encoder.forward_all(frames)
+    h_last = mu_all[:, -1]  # (N, latent_dim)
+    q, p = model.dynamics.encode(h_last)
 
-    return torch.cat(qs), torch.cat(ps), torch.cat(energies)
+    final_state = states[:, -1]
+    theta = torch.atan2(final_state[:, 1], final_state[:, 0])
+    theta_dot = final_state[:, 2]
+    H_true = 0.5 * theta_dot**2 + _G * (1.0 + torch.cos(theta))
+
+    return {"q": q.cpu(), "p": p.cpu(), "H_true": H_true, "theta": theta, "theta_dot": theta_dot}
 
 
 @torch.no_grad()
-def _learned_energy_landscape(
-    model: WorldModel,
-    q: torch.Tensor,
-    p: torch.Tensor,
-    resolution: int = 40,
-) -> dict:
-    """PCA the full (q, p) latent jointly and sweep learned H over its top-2 slice.
-
-    q and p individually turn out to be nearly collinear in practice (the
-    flow leaks information between blocks — see conversation), so PCA-ing
-    them separately just rediscovers the same axis twice. Doing PCA on the
-    concatenated z = [q, p] and taking its top 2 components instead finds
-    whatever 2 directions actually carry the most variance, regardless of
-    which block they fall in.
-
-    Grid point (alpha, beta) maps back to the full latent as
-    z_mean + alpha * dir0 + beta * dir1 (all other PCs held at their sample
-    mean), then split back into (q, p) halves for the Hamiltonian. Outside
-    [min, max] of the observed projections it's extrapolation into latent
-    space the model never saw.
-    """
-    device = next(model.autoencoder.parameters()).device
-    q_dim = q.shape[-1]
-    z = torch.cat([q, p], dim=-1)
-    z_mean, directions, proj, explained = _pca_top_k(z, k=2)
-    dir0, dir1 = directions[0], directions[1]
-
-    alpha = torch.linspace(proj[:, 0].min().item(), proj[:, 0].max().item(), resolution)
-    beta = torch.linspace(proj[:, 1].min().item(), proj[:, 1].max().item(), resolution)
-
-    grid_a, grid_b = torch.meshgrid(alpha, beta, indexing="ij")  # each (res, res)
-    z_grid = (
-        z_mean[None, None, :]
-        + grid_a[:, :, None] * dir0[None, None, :]
-        + grid_b[:, :, None] * dir1[None, None, :]
-    ).reshape(-1, z_mean.shape[-1]).to(device)  # (res*res, latent_dim)
-
-    q_grid, p_grid = z_grid[:, :q_dim], z_grid[:, q_dim:]
-    pred = model.dynamics.hamiltonian(q_grid, p_grid).reshape(resolution, resolution).cpu()
-
-    return {
-        "alpha": alpha,
-        "beta": beta,
-        "pred": pred,
-        "proj": proj,
-        "explained": explained,
-    }
-
-
 def _plot_learned_energy_landscape(
     model: WorldModel,
-    n_episodes: int = 5,
-    max_steps: int = 200,
-    resolution: int = 40,
+    resolution: int = 20,
+    context_frames: int = 5,
     device: torch.device | None = None,
 ) -> plt.Figure:
-    """Sanity-check the learned Hamiltonian's shape against the true pendulum energy.
+    """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
 
     q and p are learned latents (q_dim = p_dim = latent_dim // 2), not
-    literally (θ, θ̇), and H is only constrained through its gradient, so the
-    two panels can only be expected to agree in *shape* — up to an unknown
-    affine offset/scale (or even an axis flip) — not in absolute value.
-
-    Left panel:  learned H swept over the top-2-PC slice of the joint
-                 [q, p] latent, with the actual sampled points overlaid.
-    Right panel: those same sampled points, colored by their true energy.
+    literally (θ, θ̇), and H is only constrained through its gradient, so
+    agreement between the two panels is only expected in *shape* — up to an
+    unknown affine offset/scale — not in absolute value. Both panels plot the
+    same grid points in true (θ, θ̇) coordinates, colored by energy, so any
+    shape mismatch is easy to spot directly.
     """
-    q, p, H_true = _collect_qp_samples(model, n_episodes=n_episodes, max_steps=max_steps, device=device)
-    land = _learned_energy_landscape(model, q, p, resolution=resolution)
-    proj = land["proj"]
+    model.eval()
+    if device is None:
+        device = next(model.autoencoder.parameters()).device
+    samples = _collect_grid_qp_samples(model, resolution=resolution, context_frames=context_frames, device=device)
+    H_learned = model.dynamics.hamiltonian(
+        samples["q"].to(device), samples["p"].to(device)
+    ).cpu()
+    theta = samples["theta"].cpu().numpy()
+    theta_dot = samples["theta_dot"].cpu().numpy()
+    H_true = samples["H_true"].cpu().numpy()
 
-    fig, (ax_pred, ax_true) = plt.subplots(1, 2, figsize=(11, 5))
+    fig, (ax_true, ax_learned) = plt.subplots(1, 2, figsize=(11, 5))
 
-    im = ax_pred.imshow(
-        land["pred"].numpy().T,
-        origin="lower",
-        aspect="auto",
-        extent=[
-            land["alpha"][0].item(), land["alpha"][-1].item(),
-            land["beta"][0].item(), land["beta"][-1].item(),
-        ],
-        cmap="viridis",
-    )
-    ax_pred.scatter(proj[:, 0], proj[:, 1], c="white", s=4, alpha=0.3, linewidths=0)
-    ax_pred.set_xlabel(f"[q,p] PC1 ({land['explained'][0]:.0%} var)")
-    ax_pred.set_ylabel(f"[q,p] PC2 ({land['explained'][1]:.0%} var)")
-    ax_pred.set_title("Learned H (PCA slice)")
-    fig.colorbar(im, ax=ax_pred, label="learned H")
+    sc0 = ax_true.scatter(theta, theta_dot, c=H_true, cmap="viridis", s=14, linewidths=0)
+    ax_true.set_xlabel("θ (rad)")
+    ax_true.set_ylabel("θ̇ (rad/s)")
+    ax_true.set_title("True energy")
+    fig.colorbar(sc0, ax=ax_true, label="H_true")
 
-    sc = ax_true.scatter(proj[:, 0], proj[:, 1], c=H_true, cmap="viridis", s=8, alpha=0.3, linewidths=0)
-    ax_true.set_xlabel(f"[q,p] PC1 ({land['explained'][0]:.0%} var)")
-    ax_true.set_ylabel(f"[q,p] PC2 ({land['explained'][1]:.0%} var)")
-    ax_true.set_title("True energy at same points")
-    fig.colorbar(sc, ax=ax_true, label="true H")
+    sc1 = ax_learned.scatter(theta, theta_dot, c=H_learned.numpy(), cmap="viridis", s=14, linewidths=0)
+    ax_learned.set_xlabel("θ (rad)")
+    ax_learned.set_ylabel("θ̇ (rad/s)")
+    ax_learned.set_title("Learned H(q, p)")
+    fig.colorbar(sc1, ax=ax_learned, label="H_learned")
 
-    fig.suptitle("Learned vs. true energy landscape (PCA sanity check)")
+    r = np.corrcoef(H_true, H_learned.numpy())[0, 1]
+    fig.suptitle(f"Learned vs. true energy on phase-space grid (Pearson r={r:.3f})")
     fig.tight_layout()
 
     return fig
@@ -1175,7 +1051,7 @@ def phase1_cmd(**kwargs):
 
     # Mix three collection policies for training, same as the val split below —
     # an epsilon-random/energy-pumping controller alone traces a near-1D energy
-    # band and under-covers the phase space (see _collect_qp_samples).
+    # band and under-covers the phase space.
     n_energy = kwargs["n_episodes"] // 3
     n_random = kwargs["n_episodes"] // 3
     n_spin = kwargs["n_episodes"] - n_energy - n_random
@@ -1690,6 +1566,11 @@ def phase2_cmd(**kwargs):
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
             _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
+            energy_fig = _plot_learned_energy_landscape(
+                world_model, context_frames=kwargs["val_context_frames"], device=device,
+            )
+            writer.add_figure("val/energy_landscape", energy_fig, epoch)
+            plt.close(energy_fig)
             for val_trajs, label in (
                 (val_energy, "energy_pump"),
                 (val_random, "random"),
