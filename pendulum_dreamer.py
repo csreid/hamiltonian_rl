@@ -11,17 +11,11 @@ dynamics in phase space and decodes back to pixels for comparison.
 
 from __future__ import annotations
 
-import io
-import re
 import sys
-from collections import defaultdict
-from datetime import date, datetime
 from pathlib import Path
 
-import numpy as np
 import streamlit as st
 import torch
-from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -32,6 +26,12 @@ from data.pendulum import (
     collect_zero_trajectories,
 )
 from hamilton_rl.models import WorldModel
+from hamilton_rl.streamlit_common import (
+    build_sidebyside_frames,
+    frames_to_gif,
+    pick_checkpoint,
+    to_uint8,
+)
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -84,14 +84,6 @@ def collect_pendulum_episode(
 # ── Dreamed rollout ───────────────────────────────────────────────────────────
 
 
-def _to_uint8(frames: torch.Tensor) -> list[np.ndarray]:
-    """(N, C, H, W) float [0,1] → list of (H, W, C) uint8 arrays."""
-    return [
-        (f.clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        for f in frames
-    ]
-
-
 @torch.no_grad()
 def run_dreamed_rollout(
     world_model: WorldModel,
@@ -113,57 +105,10 @@ def run_dreamed_rollout(
     n_steps = len(dreamed)
     gt_slice = frames[n_context : n_context + n_steps]  # (n_steps, C, H, W)
     return {
-        "gt_frames": _to_uint8(gt_slice),
-        "dream_frames": _to_uint8(dreamed),
+        "gt_frames": to_uint8(gt_slice),
+        "dream_frames": to_uint8(dreamed),
         "n_steps": n_steps,
     }
-
-
-# ── Frame compositing ─────────────────────────────────────────────────────────
-
-
-def _label_frame(img: Image.Image, text: str, color: tuple) -> Image.Image:
-    img = img.copy()
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([(0, 0), (img.width - 1, 14)], fill=(0, 0, 0, 180))
-    draw.text((3, 2), text, fill=color)
-    return img
-
-
-def build_sidebyside_frames(
-    gt_frames: list[np.ndarray],
-    dream_frames: list[np.ndarray],
-    display_size: int,
-    gap: int = 4,
-) -> list[Image.Image]:
-    """Combine GT (left) and dreamed (right) into one wide frame."""
-    out: list[Image.Image] = []
-    total_w = display_size * 2 + gap
-    for i, (gt_arr, dr_arr) in enumerate(zip(gt_frames, dream_frames)):
-        gt_pil = Image.fromarray(gt_arr).resize((display_size, display_size), Image.BILINEAR)
-        dr_pil = Image.fromarray(dr_arr).resize((display_size, display_size), Image.BILINEAR)
-        gt_pil = _label_frame(gt_pil, f"GT  t={i}", color=(100, 200, 255))
-        dr_pil = _label_frame(dr_pil, f"PHn t={i}", color=(255, 160, 60))
-        canvas = Image.new("RGB", (total_w, display_size), (40, 40, 40))
-        canvas.paste(gt_pil, (0, 0))
-        canvas.paste(dr_pil, (display_size + gap, 0))
-        out.append(canvas)
-    return out
-
-
-def frames_to_gif(frames: list[Image.Image], fps: float) -> bytes:
-    duration_ms = max(20, int(1000 / fps))
-    buf = io.BytesIO()
-    frames[0].save(
-        buf,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=duration_ms,
-        loop=0,
-        optimize=False,
-    )
-    return buf.getvalue()
 
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
@@ -175,72 +120,7 @@ with st.sidebar:
     st.header("Checkpoint")
 
     models_root = Path("models")
-    _NON_CHECKPOINT_STEMS = {"h_cache", "episodes_cache"}
-    pt_files = sorted(
-        f for f in models_root.rglob("*.pt") if f.stem not in _NON_CHECKPOINT_STEMS
-    ) if models_root.exists() else []
-
-    if not pt_files:
-        st.warning("No `.pt` checkpoints found under `models/` (excluding data caches).")
-        st.stop()
-
-    # Parse each .pt file into (identifier, date, time_str, file).
-    # Expected layout: models/<identifier>/<YYYY-MM-DD>_<HH-MM-SS>/<stem>.pt
-    _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})$")
-
-    # nested dict: identifier → date → time_str → [Path, ...]
-    _tree: dict[str, dict[date, dict[str, list[Path]]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(list))
-    )
-    _unstructured: list[Path] = []
-
-    for f in pt_files:
-        rel = f.relative_to(models_root)
-        parts = rel.parts  # e.g. ("pendulum_offline", "2024-04-29_12-36-49", "checkpoint_5.pt")
-        if len(parts) >= 3:
-            *id_parts, ts_part, _ = parts
-            m = _TIMESTAMP_RE.match(ts_part)
-            if m:
-                identifier = "/".join(id_parts)
-                run_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-                run_time = m.group(2)
-                _tree[identifier][run_date][run_time].append(f)
-                continue
-        _unstructured.append(f)
-
-    def _pick_checkpoint(label: str, key_prefix: str) -> Path:
-        """Nested date-aware selector: identifier → date → time → checkpoint."""
-        identifiers = sorted(_tree.keys())
-        identifier = st.selectbox(
-            f"{label} — model",
-            identifiers,
-            key=f"{key_prefix}_id",
-        )
-        dates = sorted(_tree[identifier].keys(), reverse=True)
-        chosen_date = st.selectbox(
-            f"{label} — date",
-            dates,
-            format_func=lambda d: d.strftime("%A, %B %-d %Y"),
-            key=f"{key_prefix}_date",
-        )
-        times = sorted(_tree[identifier][chosen_date].keys(), reverse=True)
-        chosen_time = st.selectbox(
-            f"{label} — run",
-            times,
-            format_func=lambda t: t.replace("-", ":"),
-            key=f"{key_prefix}_time",
-        )
-        files = _tree[identifier][chosen_date][chosen_time]
-        file_names = [f.name for f in files]
-        chosen_name = st.selectbox(
-            f"{label} — checkpoint",
-            file_names,
-            index=len(file_names) - 1,  # default to last (highest epoch)
-            key=f"{key_prefix}_file",
-        )
-        return models_root / identifier / f"{chosen_date.strftime('%Y-%m-%d')}_{chosen_time}" / chosen_name
-
-    ckpt_path = _pick_checkpoint("World model", "wm")
+    ckpt_path = pick_checkpoint(models_root, "World model", "wm")
 
     st.divider()
     st.header("Episode")
@@ -360,9 +240,11 @@ with col_size:
 
 with st.spinner("Rendering GIF…"):
     composite = build_sidebyside_frames(
-        gt_frames=rollout["gt_frames"],
-        dream_frames=rollout["dream_frames"],
+        left_frames=rollout["gt_frames"],
+        right_frames=rollout["dream_frames"],
         display_size=display_size,
+        left_label="GT",
+        right_label="PHn",
     )
     gif_bytes = frames_to_gif(composite, fps)
 

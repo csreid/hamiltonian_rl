@@ -19,6 +19,39 @@ _DT = 0.05  # Pendulum-v1 integration timestep
 _MAX_SPEED = 8.0  # Pendulum-v1's hard clip on |theta_dot| (gymnasium default)
 
 
+# ── Analytic (batched) dynamics ──────────────────────────────────────────────
+
+
+def angle_normalize(theta: torch.Tensor) -> torch.Tensor:
+    return ((theta + torch.pi) % (2 * torch.pi)) - torch.pi
+
+
+def analytic_pendulum_step(
+    theta: torch.Tensor,
+    theta_dot: torch.Tensor,
+    u: torch.Tensor,
+    dt: float = _DT,
+    damping: float = 0.0,
+    g: float = _G,
+    max_speed: float = _MAX_SPEED,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched replica of Pendulum-v1's own semi-implicit Euler step (m=l=1).
+
+    Matches ``gymnasium.envs.classic_control.pendulum.PendulumEnv.step`` (and
+    ``PendulumPixelEnv``'s post-step damping) exactly, but as plain tensor ops
+    over arbitrarily-shaped ``theta``/``theta_dot``/``u`` — lets a planner
+    simulate many candidate rollouts in parallel without stepping copies of
+    the real env.
+    """
+    u = u.clamp(-2.0, 2.0)
+    new_theta_dot = theta_dot + (1.5 * g * torch.sin(theta) + 3.0 * u) * dt
+    new_theta_dot = new_theta_dot.clamp(-max_speed, max_speed)
+    new_theta = theta + new_theta_dot * dt
+    if damping != 0.0:
+        new_theta_dot = new_theta_dot * np.exp(-damping * dt)
+    return new_theta, new_theta_dot
+
+
 # ── Image preprocessing ──────────────────────────────────────────────────────
 
 
@@ -441,6 +474,29 @@ def collect_zero_trajectories(
         max_steps=max_steps,
         damping=damping,
     )
+
+
+def collect_zero_trajectory_from(
+    theta0: float,
+    theta_dot0: float,
+    img_size: int,
+    max_steps: int,
+    damping: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Single zero-action rollout from an explicit seed (theta0, theta_dot0).
+
+    Unlike ``collect_zero_trajectories`` (which seeds from the standard
+    covering grid), this starts from a caller-chosen state — for building a
+    real zero-action motion context to feed the causal LSTM encoder ahead of
+    e.g. an MPPI planning rollout, matching the reasoning in
+    ``_collect_energy_grid_episodes``: the encoder needs real motion, not a
+    single still frame, to infer velocity.
+    """
+    seeds = np.array([[theta0, theta_dot0]])
+    return _collect_zero_episodes(
+        n_episodes=1, img_size=img_size, max_steps=max_steps,
+        damping=damping, seeds=seeds,
+    )[0]
 
 
 def collect_zero_trajectories_targeted(
