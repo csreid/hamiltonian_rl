@@ -5,30 +5,39 @@ Usage:
 
 Loads a unified world-model checkpoint (LSTM autoencoder + Hamiltonian flow
 dynamics), then runs two independent receding-horizon MPPI controllers, both
-trying to swing up and balance the pendulum from the same initial condition:
+trying to swing up and balance the pendulum from the same initial condition.
+Both are real closed-loop MPC: at every control step, MPPI samples candidate
+action sequences, *imagines* them forward through a dynamics model to score
+them, picks the best one by the usual MPPI soft-min weighting, and applies
+only its first action to a real `PendulumPixelEnv` — then repeats from the
+resulting real observation. Neither side ever free-runs open-loop.
 
-  - Ground truth: MPPI samples candidate action sequences and rolls them
-    forward through an analytic replica of Pendulum-v1's own dynamics
-    (`data.pendulum.analytic_pendulum_step`), cost = angle^2 + damping term +
-    action penalty. The chosen action is applied to a real `PendulumPixelEnv`
-    each control step, so the rendered frames are real renders.
+  - Ground truth: imagination = an analytic replica of Pendulum-v1's own
+    dynamics (`data.pendulum.analytic_pendulum_step`), cost = angle^2 +
+    velocity + action penalty.
 
-  - Learned: MPPI samples candidate action sequences and rolls them forward
-    through the checkpoint's `HamiltonianFlowModel.controlled_step` in
-    latent (q, p) space, cost = pixel MSE (decoded frame vs. a fixed upright
-    target frame) + action penalty. The model drives itself — no real env
-    involved on this side.
+  - Learned: imagination = the checkpoint's `HamiltonianFlowModel` in latent
+    (q, p) space, cost = pixel MSE (imagined decoded frame vs. a fixed
+    upright target) + action penalty. Critically, the latent state used to
+    *start* each planning step is re-grounded every step by re-encoding a
+    rolling window of the real rendered frames through the frozen Phase-1
+    LSTM encoder (exactly how Phase 2 training itself re-encodes fresh
+    windows) — the learned dynamics are only ever used inside the horizon-H
+    imagination, never to carry real state forward in time. Both panels
+    therefore render real environment frames.
 
 Both closed-loop rollouts are rendered as a side-by-side pixel GIF, plus an
 animated phase-space (theta, theta_dot) comparison: the ground-truth
-trajectory vs. the latent trajectory mapped to physical coordinates via a
-linear probe h -> (cos theta, sin theta, theta_dot), fit once per checkpoint.
+trajectory vs. the learned controller's own belief about its (real, grounded)
+trajectory, mapped to physical coordinates via a linear probe
+h -> (cos theta, sin theta, theta_dot), fit once per checkpoint.
 """
 
 from __future__ import annotations
 
 import io
 import sys
+from collections import deque
 from pathlib import Path
 
 import matplotlib
@@ -50,7 +59,6 @@ from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
-    collect_zero_trajectory_from,
 )
 from hamilton_rl.mppi import MPPIConfig, mppi_plan, shift_mean
 from hamilton_rl.models import WorldModel
@@ -135,6 +143,7 @@ def run_ground_truth_mppi(
     theta_dot0: float,
     img_size: int,
     damping: float,
+    n_context: int,
     total_steps: int,
     cfg: MPPIConfig,
     action_weight: float,
@@ -146,11 +155,19 @@ def run_ground_truth_mppi(
     env.reset()
     env.set_state(theta0, theta_dot0)
 
-    theta_cur = torch.tensor(theta0, device=device)
-    theta_dot_cur = torch.tensor(theta_dot0, device=device)
+    # Same zero-action warm-up duration the learned controller needs to fill
+    # its encoder context, purely so both panels' t=0 is the same real time.
+    for _ in range(max(n_context - 1, 0)):
+        env.step(np.array([0.0], dtype=np.float32))
+    theta_b, theta_dot_b = env.unwrapped.state
+
+    theta_cur = torch.tensor(float(theta_b), device=device)
+    theta_dot_cur = torch.tensor(float(theta_dot_b), device=device)
     mean = torch.zeros(cfg.horizon, 1, device=device)
 
-    frames, thetas, theta_dots = [], [theta0], [theta_dot0]
+    frames = []
+    thetas = [float(angle_normalize(torch.tensor(float(theta_b))))]
+    theta_dots = [float(theta_dot_b)]
     try:
         for step in range(total_steps):
             cost_fn = _gt_rollout_cost_fn(theta_cur, theta_dot_cur, damping, action_weight)
@@ -158,12 +175,19 @@ def run_ground_truth_mppi(
             u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
 
             obs, _, _, _, _ = env.step(np.array([u0], dtype=np.float32))
+            # gymnasium's internal state theta is NOT wrapped to [-pi, pi] — it
+            # just accumulates theta += theta_dot*dt across a full rotation, so
+            # it can drift arbitrarily far outside the plotted range even though
+            # the pendulum's physical orientation is periodic. sin/cos (and thus
+            # the dynamics) only ever depend on theta through trig functions, so
+            # feeding the unwrapped value back into the next planning step is
+            # still exactly correct — only display needs the wrapped value.
             theta_new, theta_dot_new = env.unwrapped.state  # post-damping
             theta_cur = torch.tensor(float(theta_new), device=device)
             theta_dot_cur = torch.tensor(float(theta_dot_new), device=device)
 
             frames.append(torch.from_numpy(obs).float() / 255.0)
-            thetas.append(float(theta_new))
+            thetas.append(float(angle_normalize(torch.tensor(float(theta_new)))))
             theta_dots.append(float(theta_dot_new))
 
             mean = shift_mean(mean)
@@ -222,21 +246,33 @@ def run_latent_mppi(
     regression: torch.Tensor,
     progress_cb=None,
 ) -> dict:
-    """Closed-loop receding-horizon MPPI driven entirely by the model's own dynamics."""
+    """Closed-loop receding-horizon MPPI: plan with the learned dynamics, act on the real pendulum.
+
+    At every control step the latent state used to *start* planning is
+    re-grounded from a rolling window of the real rendered frames (re-encoded
+    through the frozen Phase-1 LSTM encoder from scratch each time — exactly
+    how Phase 2 training re-encodes fresh windows, see `_train_epoch_phase2`
+    in experiments/pendulum_offline.py). The learned `HamiltonianFlowModel`
+    is only ever used *inside* MPPI's horizon-H imagination to score candidate
+    action sequences; only the resulting first action is ever applied, and
+    only to the real `PendulumPixelEnv`. So the rendered frames are real, and
+    latent state can never silently drift off-manifold across the rollout —
+    each step starts fresh from what the encoder actually sees.
+    """
     device = next(world_model.autoencoder.parameters()).device
     data_cfg = world_model.data_config
     img_size = data_cfg.get("img_size", 64)
     damping = data_cfg.get("damping", 0.0)
     autoencoder, dynamics = world_model.autoencoder, world_model.dynamics
+    A = regression.to(device)
 
-    # Real zero-action motion context so the causal LSTM encoder can infer velocity.
-    ctx_frames, _ctx_actions, _ctx_states = collect_zero_trajectory_from(
-        theta0, theta_dot0, img_size=img_size, max_steps=max(n_context - 1, 0), damping=damping,
-    )
-    ctx = ctx_frames.unsqueeze(0).to(device)
-    mu_all, _ = autoencoder.encoder.forward_all(ctx)
-    h0 = mu_all[:, -1]
-    q, p = dynamics.encode(h0)
+    env = PendulumPixelEnv(img_size=img_size, damping=damping)
+    env.reset()
+    obs0 = env.set_state(theta0, theta_dot0)
+    context = deque([torch.from_numpy(obs0).float() / 255.0], maxlen=n_context)
+    for _ in range(max(n_context - 1, 0)):
+        obs, _, _, _, _ = env.step(np.array([0.0], dtype=np.float32))
+        context.append(torch.from_numpy(obs).float() / 255.0)
 
     target_env = PendulumPixelEnv(img_size=img_size, damping=damping)
     target_env.reset()
@@ -244,33 +280,44 @@ def run_latent_mppi(
     target_env.close()
     target_frame = (torch.from_numpy(target_obs).float() / 255.0).to(device)
 
+    def ground() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Re-encode the current real-frame context window -> grounded (h, q, p)."""
+        ctx = torch.stack(list(context)).unsqueeze(0).to(device)  # (1, n_context, C, H, W)
+        mu_all, _ = autoencoder.encoder.forward_all(ctx)
+        h_t = mu_all[:, -1]
+        q_t, p_t = dynamics.encode(h_t)
+        return h_t, q_t, p_t
+
     mean = torch.zeros(cfg.horizon, 1, device=device)
     frames = []
     theta_hats, theta_dot_hats = [], []
 
-    A = regression.to(device)
-    h_init = dynamics.decode(q, p)
-    st0 = (h_init @ A).squeeze(0)
+    h_t, q, p = ground()
+    st0 = (h_t @ A).squeeze(0)
     theta_hats.append(float(torch.atan2(st0[1], st0[0])))
     theta_dot_hats.append(float(st0[2]))
 
-    for step in range(total_steps):
-        cost_fn = _latent_rollout_cost_fn(dynamics, autoencoder, q, p, target_frame, action_weight)
-        mean = mppi_plan(mean, cost_fn, cfg)
-        u0 = mean[0:1].clamp(cfg.action_low, cfg.action_high)
+    try:
+        for step in range(total_steps):
+            cost_fn = _latent_rollout_cost_fn(dynamics, autoencoder, q, p, target_frame, action_weight)
+            mean = mppi_plan(mean, cost_fn, cfg)
+            u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
 
-        q, p = dynamics.controlled_step(q, p, u0)
-        h_exec = dynamics.decode(q, p)
-        frame = autoencoder.decode_latent(h_exec).squeeze(0).cpu()
-        frames.append(frame)
+            obs, _, _, _, _ = env.step(np.array([u0], dtype=np.float32))
+            frame = torch.from_numpy(obs).float() / 255.0
+            frames.append(frame)
+            context.append(frame)
 
-        st_pred = (h_exec @ A).squeeze(0)
-        theta_hats.append(float(torch.atan2(st_pred[1], st_pred[0])))
-        theta_dot_hats.append(float(st_pred[2]))
+            h_t, q, p = ground()
+            st_pred = (h_t @ A).squeeze(0)
+            theta_hats.append(float(torch.atan2(st_pred[1], st_pred[0])))
+            theta_dot_hats.append(float(st_pred[2]))
 
-        mean = shift_mean(mean)
-        if progress_cb is not None:
-            progress_cb(step + 1, total_steps)
+            mean = shift_mean(mean)
+            if progress_cb is not None:
+                progress_cb(step + 1, total_steps)
+    finally:
+        env.close()
 
     return {
         "frames": frames,
@@ -388,7 +435,7 @@ if generate_btn:
     try:
         gt_result = run_ground_truth_mppi(
             theta0=theta0, theta_dot0=theta_dot0, img_size=img_size, damping=damping,
-            total_steps=total_steps, cfg=cfg, action_weight=w_u_gt, device=device,
+            n_context=n_context, total_steps=total_steps, cfg=cfg, action_weight=w_u_gt, device=device,
             progress_cb=lambda i, n: gt_progress.progress(i / n, text=f"Ground-truth MPPI… {i}/{n}"),
         )
     except Exception as exc:
@@ -453,6 +500,11 @@ with st.spinner("Rendering pixel-rollout GIF…"):
     pixel_gif = frames_to_gif(composite, fps)
 
 st.subheader("Ground-truth MPPI  (left)  |  Learned-dynamics MPPI  (right)")
+st.markdown(
+    "Both panels render real `PendulumPixelEnv` frames — the learned side plans with the "
+    "checkpoint's dynamics but only ever executes on the real pendulum, re-grounding its "
+    "latent state from real frames every step."
+)
 st.image(pixel_gif, use_container_width=False)
 
 with st.spinner("Rendering phase-space animation…"):
@@ -462,5 +514,5 @@ with st.spinner("Rendering phase-space animation…"):
     )
     phase_gif = frames_to_gif(phase_frames, fps)
 
-st.subheader("Phase space: actual (ground truth) vs. planned (latent, via h→state regression)")
+st.subheader("Phase space: actual (ground truth) vs. planned (learned controller's grounded belief, via h→state regression)")
 st.image(phase_gif, use_container_width=False)
