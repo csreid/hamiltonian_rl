@@ -318,7 +318,7 @@ def run_latent_mppi(
     h_t, q, p = ground()
     st0 = (h_t @ A).squeeze(0)
     theta_hats.append(float(torch.atan2(st0[1], st0[0])))
-    theta_dot_hats.append(float(st0[2]))
+    theta_dot_hats.append(float(st0[2].clamp(-_MAX_SPEED, _MAX_SPEED)))
 
     try:
         for step in range(total_steps):
@@ -334,7 +334,12 @@ def run_latent_mppi(
                 h_p = dynamics.decode(pq, pp)
                 st_p = (h_p @ A).squeeze(0)
                 plan_t.append(float(angle_normalize(torch.atan2(st_p[1], st_p[0]))))
-                plan_td.append(float(st_p[2]))
+                # atan2 is scale-invariant, so theta stays plausible-looking
+                # even if the linear probe's raw output has blown up under
+                # extrapolation this far into pure imagination — theta_dot has
+                # no such protection, so clamp it to what the real simulator
+                # (and the MPPI cost function) can ever actually produce.
+                plan_td.append(float(st_p[2].clamp(-_MAX_SPEED, _MAX_SPEED)))
             plan_thetas.append(plan_t)
             plan_theta_dots.append(plan_td)
 
@@ -350,7 +355,7 @@ def run_latent_mppi(
             h_t, q, p = ground()
             st_pred = (h_t @ A).squeeze(0)
             theta_hats.append(float(torch.atan2(st_pred[1], st_pred[0])))
-            theta_dot_hats.append(float(st_pred[2]))
+            theta_dot_hats.append(float(st_pred[2].clamp(-_MAX_SPEED, _MAX_SPEED)))
 
             mean = shift_mean(mean)
             if progress_cb is not None:

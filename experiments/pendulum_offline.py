@@ -459,6 +459,51 @@ def _log_reconstruction_lstm_video(
 
 
 @torch.no_grad()
+@torch.no_grad()
+def _log_latent_distribution_phase1(
+    model: LSTMAutoencoder,
+    val_traj_sets: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/latent_distribution",
+) -> None:
+    """Violin plot of per-dimension h_t values, sorted by std descending.
+
+    Purpose is to visualize latent sparsity: a well-factored encoding of the
+    pendulum's 2D phase space should concentrate variance in a small handful
+    of dims (ideally ~2-3) while the rest collapse to near-zero, unused
+    dims — the more of the tail is flat, the sparser (better) the code.
+    """
+    model.eval()
+    all_h = []
+    for val_trajs, _label in val_traj_sets:
+        for frames, actions, states in val_trajs:
+            ctx = frames.unsqueeze(0).to(device)
+            mu_all, _ = model.encoder.forward_all(ctx)
+            all_h.append(mu_all.squeeze(0).cpu())
+    h_pool = torch.cat(all_h, dim=0)  # (N, dim_h)
+
+    std = h_pool.std(dim=0)
+    order = torch.argsort(std, descending=True)
+    h_sorted = h_pool[:, order].numpy()
+    dim_h = h_sorted.shape[1]
+
+    fig, ax = plt.subplots(figsize=(max(8, dim_h * 0.35), 4))
+    parts = ax.violinplot(h_sorted, showmedians=False, showextrema=False)
+    for pc in parts["bodies"]:
+        pc.set_facecolor("tab:blue")
+        pc.set_alpha(0.6)
+    ax.set_xticks(np.arange(1, dim_h + 1))
+    ax.set_xticklabels([str(i.item()) for i in order], fontsize=6 if dim_h > 16 else 8)
+    ax.set_xlabel("h dimension (sorted by std, descending)")
+    ax.set_ylabel("value")
+    ax.set_title(f"LSTM latent value distribution, held-out trajectories (epoch {epoch + 1})")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
+
 def _log_latent_scatter_phase1(
     model: LSTMAutoencoder,
     val_traj_sets: list,
@@ -1265,6 +1310,10 @@ def phase1_cmd(**kwargs):
             scatter_sets = [(vt, label) for vt, label in policy_val_trajs if len(vt) >= 2]
             if scatter_sets:
                 _log_latent_scatter_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+                _log_latent_distribution_phase1(
                     model=model, val_traj_sets=scatter_sets,
                     device=device, writer=writer, epoch=epoch,
                 )
