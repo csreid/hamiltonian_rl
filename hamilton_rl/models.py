@@ -84,14 +84,16 @@ class FlexLSTMEncoder(nn.Module):
         feat_dim: int = 256,
         latent_dim: int = 32,
         img_size: int = 64,
+        num_layers: int = 1,
     ):
         super().__init__()
         self.feat_dim = feat_dim
+        self.num_layers = num_layers
         self.frame_cnn = FlexFrameCNN(img_ch=img_ch, feat_dim=feat_dim, img_size=img_size)
         self.lstm = nn.LSTM(
             input_size=feat_dim,
             hidden_size=feat_dim,
-            num_layers=1,
+            num_layers=num_layers,
             batch_first=True,
             bidirectional=False,
         )
@@ -124,7 +126,7 @@ class FlexLSTMEncoder(nn.Module):
         else:
             _, (h_n, _) = self.lstm(feats)
 
-        h = h_n[0]  # (B, feat_dim) — final forward hidden state
+        h = h_n[-1]  # (B, feat_dim) — final layer's hidden state at the last step
         return self.mu_head(h), self.logvar_head(h)
 
     def forward_all(
@@ -475,6 +477,7 @@ class LSTMAutoencoder(nn.Module):
         img_size:    spatial resolution of input/output frames
         img_ch:      image channels (3 for RGB)
         control_dim: dimension of the action fed to next_frame_decoder
+        num_layers:  number of stacked LSTM layers in the encoder
     """
 
     def __init__(
@@ -485,6 +488,7 @@ class LSTMAutoencoder(nn.Module):
         img_size: int = 64,
         img_ch: int = 3,
         control_dim: int = 1,
+        num_layers: int = 1,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -495,6 +499,7 @@ class LSTMAutoencoder(nn.Module):
             "img_size": img_size,
             "img_ch": img_ch,
             "control_dim": control_dim,
+            "num_layers": num_layers,
         }
         q_dim = latent_dim // 2
 
@@ -503,6 +508,7 @@ class LSTMAutoencoder(nn.Module):
             feat_dim=feat_dim,
             latent_dim=latent_dim,
             img_size=img_size,
+            num_layers=num_layers,
         )
         self.f_psi = NormalizingFlow(latent_dim)
         self.decoder = FlexDecoder(

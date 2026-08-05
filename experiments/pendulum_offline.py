@@ -1088,6 +1088,8 @@ def cli():
 @click.option("--pos-ch", type=int, default=8, show_default=True)
 @click.option("--feat-dim", type=int, default=256, show_default=True)
 @click.option("--latent-dim", type=int, default=32, show_default=True)
+@click.option("--lstm-layers", type=int, default=1, show_default=True,
+              help="Number of stacked LSTM layers in the encoder")
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=8, show_default=True)
@@ -1208,6 +1210,7 @@ def phase1_cmd(**kwargs):
         pos_ch=kwargs["pos_ch"],
         img_size=kwargs["img_size"],
         control_dim=1,
+        num_layers=kwargs["lstm_layers"],
     ).to(device)
     print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
