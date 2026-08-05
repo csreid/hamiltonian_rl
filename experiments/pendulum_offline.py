@@ -459,7 +459,6 @@ def _log_reconstruction_lstm_video(
 
 
 @torch.no_grad()
-@torch.no_grad()
 def _log_latent_distribution_phase1(
     model: LSTMAutoencoder,
     val_traj_sets: list,
@@ -504,6 +503,7 @@ def _log_latent_distribution_phase1(
     plt.close(fig)
 
 
+@torch.no_grad()
 def _log_latent_scatter_phase1(
     model: LSTMAutoencoder,
     val_traj_sets: list,
