@@ -68,14 +68,22 @@ class PendulumPixelEnv(gym.Wrapper):
     """Pendulum-v1 with (3, img_size, img_size) uint8 pixel observations.
 
     Args:
-        img_size: Side length of the square pixel observation.
-        damping:  Linear viscous damping coefficient applied post-step.
-                  ``theta_dot *= exp(-damping * dt)`` each step.
-                  0.0 (default) reproduces the standard frictionless pendulum.
+        img_size:   Side length of the square pixel observation.
+        damping:    Linear viscous damping coefficient applied post-step.
+                    ``theta_dot *= exp(-damping * dt)`` each step.
+                    0.0 (default) reproduces the standard frictionless pendulum.
+        max_speed:  Overrides gym's hard clip on |theta_dot| (default 8.0).
+                    Pass ``float("inf")`` to disable it entirely — used by
+                    ``collect_zero_trajectories_targeted(uncapped=True)`` so
+                    the backward-solved seed's analytic inversion (which
+                    assumes unclipped dynamics) is exact even when reaching
+                    the target requires momentarily exceeding the normal clip.
     """
 
-    def __init__(self, img_size: int = 64, damping: float = 0.0):
+    def __init__(self, img_size: int = 64, damping: float = 0.0, max_speed: float | None = None):
         env = gym.make("Pendulum-v1", render_mode="rgb_array")
+        if max_speed is not None:
+            env.unwrapped.max_speed = max_speed  # type: ignore[union-attr]
         super().__init__(env)
         self.img_size = img_size
         self.damping = damping
@@ -429,35 +437,22 @@ def _seeds_reaching_targets(
     return np.stack([theta, theta_dot], axis=-1)
 
 
-def _target_velocity_action(
-    theta: float,
-    theta_dot: float,
-    target_theta_dot: float,
-    k: float = 6.0,
-) -> float:
-    """Proportional torque nudging ``theta_dot`` toward ``target_theta_dot``.
-
-    Used to actively steer a rollout toward a high-energy grid target that a
-    passive zero-action rollout can't reach — see
-    ``_collect_actuated_targeted_episodes``.
-    """
-    u = k * (target_theta_dot - theta_dot)
-    return float(np.clip(u, -2.0, 2.0))
-
-
 def _collect_zero_episodes(
     n_episodes: int,
     img_size: int,
     max_steps: int,
     damping: float = 0.0,
     seeds: np.ndarray | None = None,
+    max_speed: float | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Collect episodes with the action fixed at zero (uncontrolled dynamics).
 
     ``seeds``: explicit (N, 2) array of (theta0, theta_dot0) to start from;
     defaults to the standard covering grid (``_grid_seeds``).
+    ``max_speed``: overrides gym's hard |theta_dot| clip for this rollout —
+    see ``PendulumPixelEnv``.
     """
-    env = PendulumPixelEnv(img_size=img_size, damping=damping)
+    env = PendulumPixelEnv(img_size=img_size, damping=damping, max_speed=max_speed)
     episodes = []
     if seeds is None:
         seeds = _grid_seeds(n_episodes)
@@ -536,6 +531,7 @@ def collect_zero_trajectories_targeted(
     max_steps: int,
     damping: float = 0.0,
     max_vel: float = _MAX_SPEED,
+    uncapped: bool = False,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Zero-action episodes whose *final* state, not seed, covers the grid.
 
@@ -554,6 +550,21 @@ def collect_zero_trajectories_targeted(
     targeting a wider range wouldn't converge — the backward solve would find
     a seed for an unreachable target and the forward rollout would just
     saturate at the clip instead of arriving where asked.
+
+    ``uncapped``: reaching a target near theta=0 (the unstable equilibrium)
+    at high angular velocity requires *exceeding* max_speed at every point
+    along the approach — energy conservation demands more kinetic energy
+    away from theta=0, where potential energy is lower — so even the exact
+    backward-solved seed falls short once the real, clipped env clips that
+    excursion and bleeds off energy. ``_seeds_reaching_targets``'s inversion
+    assumes unclipped dynamics, so it's only exact if the rollout env also
+    doesn't clip. Set ``uncapped=True`` to roll out on a
+    ``PendulumPixelEnv`` with its velocity clip disabled, matching that
+    assumption — the seed then lands exactly on every target, including the
+    high-energy corner. The clip is a Pendulum-v1 implementation detail, not
+    a physical law, and this is used only for a few-frame LSTM warmup
+    context (not training data), so the brief unclipped excursion mid-rollout
+    doesn't misrepresent anything the model is evaluated against.
     """
     targets = _grid_seeds(n_episodes, min_theta_dot=-max_vel, max_theta_dot=max_vel)
     seeds = _seeds_reaching_targets(targets, max_steps=max_steps, damping=damping)
@@ -563,87 +574,7 @@ def collect_zero_trajectories_targeted(
         max_steps=max_steps,
         damping=damping,
         seeds=seeds,
-    )
-
-
-def _collect_actuated_targeted_episodes(
-    n_episodes: int,
-    img_size: int,
-    max_steps: int,
-    damping: float = 0.0,
-    max_vel: float = _MAX_SPEED,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Actuated episodes whose *final* state covers the grid, including the
-    high-energy corner near theta=0 that ``collect_zero_trajectories_targeted``
-    can't reach.
-
-    Near the unstable equilibrium (theta=0) at high angular velocity, energy
-    conservation demands *higher* speed than the target everywhere along the
-    approach (potential energy is lower away from theta=0, so kinetic energy
-    must be higher to hold the same total H) — which exceeds Pendulum-v1's
-    hard ``max_speed`` clip. So no zero-action rollout of any seed, forward or
-    backward-solved, can land there; the clip silently bleeds off energy and
-    the achieved state falls short (confirmed empirically: >2 rad/s
-    shortfall right at the corner). Applying a small proportional torque
-    (``_target_velocity_action``) toward the target's angular velocity during
-    the rollout — on top of the same backward-solved seed used by the
-    zero-action version — closes most of that gap. Since H_true and
-    H_learned are evaluated at whatever state the rollout actually ends on
-    (not the nominal target), and the encoder consumes only pixels, applying
-    torque here doesn't compromise either — it just lets the rollout reach
-    states passive dynamics can't.
-    """
-    targets = _grid_seeds(n_episodes, min_theta_dot=-max_vel, max_theta_dot=max_vel)
-    seeds = _seeds_reaching_targets(targets, max_steps=max_steps, damping=damping)
-
-    env = PendulumPixelEnv(img_size=img_size, damping=damping)
-    episodes = []
-    try:
-        for i in tqdm(range(n_episodes), desc="Val trajectories (actuated, targeted)"):
-            env.reset()
-            theta0, theta_dot0 = seeds[i]
-            target_theta_dot = targets[i, 1]
-            obs = env.set_state(theta0, theta_dot0)
-            frames = [torch.from_numpy(obs).float() / 255.0]
-            actions = []
-            states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
-
-            for _ in range(max_steps):
-                theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
-                action = _target_velocity_action(theta, theta_dot, target_theta_dot)
-                obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
-                theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
-                frames.append(torch.from_numpy(obs).float() / 255.0)
-                actions.append(action)
-                states.append(np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32))
-
-            episodes.append(
-                (
-                    torch.stack(frames),
-                    torch.tensor(actions, dtype=torch.float32),
-                    torch.from_numpy(np.stack(states)),  # (T+1, 3)
-                )
-            )
-    finally:
-        env.close()
-
-    return episodes
-
-
-def collect_actuated_trajectories_targeted(
-    n_episodes: int,
-    img_size: int,
-    max_steps: int,
-    damping: float = 0.0,
-    max_vel: float = _MAX_SPEED,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """See ``_collect_actuated_targeted_episodes``."""
-    return _collect_actuated_targeted_episodes(
-        n_episodes=n_episodes,
-        img_size=img_size,
-        max_steps=max_steps,
-        damping=damping,
-        max_vel=max_vel,
+        max_speed=float("inf") if uncapped else None,
     )
 
 
