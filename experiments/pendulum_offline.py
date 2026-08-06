@@ -51,6 +51,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
+from scipy.interpolate import griddata
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -227,16 +228,23 @@ def _plot_learned_energy_landscape(
 ) -> plt.Figure:
     """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
 
-    Unlike (q, p), theta and theta_dot are genuinely 1D and the true energy
-    has a closed form, so the ground truth is drawn as a dense heatmap swept
-    directly from the formula (`landscape_resolution`, independent of how
-    many grid points were actually sampled/encoded through the model). The
-    learned H at each sampled point is overlaid as a scatter on top, using
-    the same colormap as the heatmap but its own independent color scale —
-    H is only ever constrained through its gradient during training, so it's
-    identifiable only up to an unknown affine offset/scale, and forcing a
-    shared numeric range would misleadingly imply the absolute values should
-    match. Two colorbars (one per scale) let you compare *pattern* — where
+    Three panels, side by side:
+      1. Ground truth: the true energy, swept densely from its closed form
+         (`landscape_resolution`, independent of how many grid points were
+         actually sampled/encoded through the model).
+      2. Interpolated: the learned H at the sampled (theta, theta_dot) points,
+         interpolated onto that same dense grid (via `scipy.griddata`) so it
+         can be compared shape-for-shape against panel 1.
+      3. The same interpolated surface with the measured (sampled) points
+         overlaid, to show what data the interpolation was built from and
+         where it's extrapolating past the convex hull of the samples (NaN,
+         left transparent).
+
+    The learned H uses its own independent color scale from the true energy
+    — H is only ever constrained through its gradient during training, so
+    it's identifiable only up to an unknown affine offset/scale, and forcing
+    a shared numeric range would misleadingly imply the absolute values
+    should match. Separate colorbars let you compare *pattern* — where
     energy is high/low — by matching colors, without implying agreement in
     magnitude.
 
@@ -264,25 +272,44 @@ def _plot_learned_energy_landscape(
     theta_dot = samples["theta_dot"].cpu().numpy()
     H_true = samples["H_true"].cpu().numpy()
 
-    fig, ax = plt.subplots(figsize=(7.5, 6))
-    im = ax.imshow(
-        H_true_dense,
-        origin="lower",
-        aspect="auto",
-        extent=[-np.pi, np.pi, min_vel, max_vel],
-        cmap="viridis",
+    H_learned_dense = griddata(
+        points=np.stack([theta, theta_dot], axis=-1),
+        values=H_learned,
+        xi=(grid_theta.numpy(), grid_theta_dot.numpy()),
+        method="cubic",
     )
-    sc = ax.scatter(
-        theta, theta_dot, c=H_learned, cmap="viridis",
+
+    extent = [-np.pi, np.pi, min_vel, max_vel]
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6), sharex=True, sharey=True)
+
+    im0 = axes[0].imshow(
+        H_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
+    )
+    axes[0].set_title("Ground truth")
+    fig.colorbar(im0, ax=axes[0], label="H_true", pad=0.02)
+
+    im1 = axes[1].imshow(
+        H_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
+    )
+    axes[1].set_title("Learned H (interpolated)")
+    fig.colorbar(im1, ax=axes[1], label="H_learned", pad=0.02)
+
+    im2 = axes[2].imshow(
+        H_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
+    )
+    axes[2].scatter(
+        theta, theta_dot, c=H_learned, cmap="viridis", vmin=im2.norm.vmin, vmax=im2.norm.vmax,
         s=30, edgecolors="white", linewidths=0.6,
     )
-    ax.set_xlabel("θ (rad)")
-    ax.set_ylabel("θ̇ (rad/s)")
-    fig.colorbar(im, ax=ax, label="H_true", pad=0.02)
-    fig.colorbar(sc, ax=ax, label="H_learned", pad=0.1)
+    axes[2].set_title("Learned H (interpolated + measured points)")
+    fig.colorbar(im2, ax=axes[2], label="H_learned", pad=0.02)
+
+    for ax in axes:
+        ax.set_xlabel("θ (rad)")
+    axes[0].set_ylabel("θ̇ (rad/s)")
 
     r = np.corrcoef(H_true, H_learned)[0, 1]
-    ax.set_title(f"True energy (heatmap) vs. learned H (dots), Pearson r={r:.3f}")
+    fig.suptitle(f"True energy vs. learned H, Pearson r={r:.3f}")
     fig.tight_layout()
 
     return fig
