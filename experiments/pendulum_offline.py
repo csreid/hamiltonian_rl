@@ -542,7 +542,6 @@ def _log_latent_distribution_phase1(
 
 
 @torch.no_grad()
-@torch.no_grad()
 def _log_markov_pairwise_probe_phase1(
     model: LSTMAutoencoder,
     val_traj_sets: list,
@@ -662,6 +661,7 @@ def _log_markov_pairwise_probe_phase1(
     )
 
 
+@torch.no_grad()
 def _log_latent_scatter_phase1(
     model: LSTMAutoencoder,
     val_traj_sets: list,
