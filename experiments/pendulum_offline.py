@@ -58,11 +58,11 @@ from tqdm import tqdm
 
 from data.pendulum import (
     PendulumDataset,
+    collect_actuated_trajectories_targeted,
     collect_data,
     collect_random_trajectories,
     collect_spin_trajectories,
     collect_val_trajectories,
-    collect_zero_trajectories_targeted,
     _G,
     _MAX_SPEED,
 )
@@ -163,18 +163,24 @@ def _collect_energy_grid_episodes(
     These are pure physics rollouts (independent of the model being trained),
     so they're collected once up front and reused across every validation
     step rather than re-simulated each time. Each episode's *final* state
-    (context_frames - 1 zero-action steps in) covers the standard grid of
-    (theta, theta_dot) — via `collect_zero_trajectories_targeted`, which
-    backward-solves for the right seed rather than just seeding the grid
-    directly, since a plain zero-action rollout from the grid would let the
-    highest-energy points (near theta=0, the unstable equilibrium, at high
-    angular velocity) swing far away from theta=0 within just a few steps,
-    leaving that corner of the grid unsampled. Rolling forward at all (rather
-    than encoding a single still frame) is necessary because the causal LSTM
-    encoder needs real motion to infer velocity from, exactly as at
-    train/inference time.
+    (context_frames - 1 steps in) covers the standard grid of (theta,
+    theta_dot) — via `collect_actuated_trajectories_targeted`, which
+    backward-solves for a seed and then applies a small corrective torque
+    toward each target's angular velocity, rather than just seeding the grid
+    directly or relying on zero-action alone. A plain zero-action rollout
+    from the grid would let the highest-energy points (near theta=0, the
+    unstable equilibrium, at high angular velocity) swing far away from
+    theta=0 within just a few steps; even the zero-action backward-solved
+    seed falls short right at that corner, since reaching it requires
+    passing through speeds beyond Pendulum-v1's hard velocity clip, which
+    bleeds off energy. The small corrective torque recovers most of that
+    gap. H_true/H_learned are evaluated at whatever state is actually
+    reached, so this doesn't bias the ground truth. Rolling forward at all
+    (rather than encoding a single still frame) is necessary because the
+    causal LSTM encoder needs real motion to infer velocity from, exactly as
+    at train/inference time.
     """
-    return collect_zero_trajectories_targeted(
+    return collect_actuated_trajectories_targeted(
         n_episodes=resolution * resolution,
         img_size=img_size,
         max_steps=context_frames - 1,
