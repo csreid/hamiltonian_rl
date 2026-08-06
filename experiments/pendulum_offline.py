@@ -542,6 +542,126 @@ def _log_latent_distribution_phase1(
 
 
 @torch.no_grad()
+@torch.no_grad()
+def _log_markov_pairwise_probe_phase1(
+    model: LSTMAutoencoder,
+    val_traj_sets: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/markov_pairwise_probe",
+    n_pairs: int = 50_000,
+    neighbor_pct: float = 5.0,
+    n_bins: int = 20,
+    seed: int = 0,
+) -> None:
+    """Cross-trajectory Markov-consistency probe (see experiments/test_markov_pairwise.py).
+
+    Pools every val trajectory across all policies, encodes each one fully
+    (real full-history h_t via forward_all), then samples pairs of frames
+    drawn from *different* episodes and compares closeness in true phase
+    space (cos θ, sin θ, θ̇) against closeness in h. If h is Markov, pairs
+    that are close in phase space should be close in h regardless of which
+    trajectory/policy produced them — overlapping "neighbor" vs. "random
+    pair" distributions below mean h carries path-dependent information
+    beyond the physical state, something Phase 2's single-step dynamics
+    model has no way to recover.
+    """
+    model.eval()
+    h_list, phase_list, traj_id_list = [], [], []
+    traj_id = 0
+    for val_trajs, _label in val_traj_sets:
+        for frames, _actions, states in val_trajs:
+            ctx = frames.unsqueeze(0).to(device)
+            mu_all, _ = model.encoder.forward_all(ctx)
+            h_list.append(mu_all.squeeze(0).cpu())
+            phase = states.float().clone()
+            phase[:, 2] = phase[:, 2] / _MAX_SPEED
+            phase_list.append(phase)
+            traj_id_list.append(torch.full((frames.shape[0],), traj_id, dtype=torch.long))
+            traj_id += 1
+
+    if traj_id < 2:
+        return  # need at least two trajectories for a cross-trajectory pair
+
+    h_all = torch.cat(h_list, dim=0)
+    phase_all = torch.cat(phase_list, dim=0)
+    traj_ids = torch.cat(traj_id_list, dim=0).numpy()
+    n = h_all.shape[0]
+
+    rng = np.random.default_rng(seed)
+    idx_i = np.empty(n_pairs, dtype=np.int64)
+    idx_j = np.empty(n_pairs, dtype=np.int64)
+    filled = 0
+    while filled < n_pairs:
+        batch = n_pairs - filled
+        ci = rng.integers(0, n, size=batch)
+        cj = rng.integers(0, n, size=batch)
+        keep = traj_ids[ci] != traj_ids[cj]
+        n_keep = int(keep.sum())
+        idx_i[filled:filled + n_keep] = ci[keep]
+        idx_j[filled:filled + n_keep] = cj[keep]
+        filled += n_keep
+
+    hi, hj = h_all[idx_i], h_all[idx_j]
+    pi, pj = phase_all[idx_i], phase_all[idx_j]
+    delta_phase = (pi - pj).norm(dim=-1).numpy()
+    delta_hidden = (hi - hj).norm(dim=-1).numpy()
+    cos_sim = F.cosine_similarity(hi, hj, dim=-1).numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    ax = axes[0]
+    bin_edges = np.quantile(delta_phase, np.linspace(0, 1, n_bins + 1))
+    bin_edges[-1] += 1e-6
+    bin_idx = np.digitize(delta_phase, bin_edges) - 1
+    centers, medians, q25, q75 = [], [], [], []
+    for b in range(n_bins):
+        mask = bin_idx == b
+        if not mask.any():
+            continue
+        centers.append(delta_phase[mask].mean())
+        medians.append(np.median(delta_hidden[mask]))
+        q25.append(np.percentile(delta_hidden[mask], 25))
+        q75.append(np.percentile(delta_hidden[mask], 75))
+    ax.fill_between(centers, q25, q75, alpha=0.3, label="IQR")
+    ax.plot(centers, medians, marker="o", markersize=3, label="median")
+    ax.set_xlabel("Δ phase-space (cross-trajectory pairs)")
+    ax.set_ylabel("Δ hidden ||h_i - h_j||")
+    ax.set_title("h-distance vs. phase-distance")
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    thresh = np.percentile(delta_phase, neighbor_pct)
+    is_neighbor = delta_phase <= thresh
+    ax.hist(delta_hidden[is_neighbor], bins=50, density=True, alpha=0.6,
+            label=f"phase-neighbors (n={is_neighbor.sum()})")
+    ax.hist(delta_hidden, bins=50, density=True, alpha=0.6,
+            label=f"all pairs (n={len(delta_hidden)})")
+    ax.set_xlabel("Δ hidden ||h_i - h_j||")
+    ax.set_title(f"Neighbors (bottom {neighbor_pct:.0f}%) vs. random")
+    ax.legend(fontsize=8)
+
+    ax = axes[2]
+    ax.hist(cos_sim[is_neighbor], bins=50, density=True, alpha=0.6, label="phase-neighbors")
+    ax.hist(cos_sim, bins=50, density=True, alpha=0.6, label="all pairs")
+    ax.set_xlabel("cos similarity(h_i, h_j)")
+    ax.set_title("Hidden-state cosine similarity")
+    ax.legend(fontsize=8)
+
+    fig.suptitle(f"Markov pairwise probe, cross-trajectory (epoch {epoch + 1})")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
+    writer.add_scalar(
+        f"{tag}_median_delta_h/neighbors", float(np.median(delta_hidden[is_neighbor])), epoch,
+    )
+    writer.add_scalar(
+        f"{tag}_median_delta_h/all_pairs", float(np.median(delta_hidden)), epoch,
+    )
+
+
 def _log_latent_scatter_phase1(
     model: LSTMAutoencoder,
     val_traj_sets: list,
@@ -1358,6 +1478,10 @@ def phase1_cmd(**kwargs):
                     model=model, val_traj_sets=scatter_sets,
                     device=device, writer=writer, epoch=epoch,
                 )
+            _log_markov_pairwise_probe_phase1(
+                model=model, val_traj_sets=policy_val_trajs,
+                device=device, writer=writer, epoch=epoch,
+            )
             _log_reconstruction_lstm_video(
                 model=model, val_traj=episodes[0],
                 device=device, writer=writer, epoch=epoch,
