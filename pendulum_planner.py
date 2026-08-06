@@ -32,9 +32,12 @@ resulting real observation. Neither side ever free-runs open-loop.
 
 Both closed-loop rollouts are rendered as a side-by-side pixel GIF, plus an
 animated phase-space (theta, theta_dot) comparison: the ground-truth
-trajectory vs. the learned controller's own belief about its (real, grounded)
-trajectory, mapped to physical coordinates via a linear probe
-h -> (cos theta, sin theta, theta_dot), fit once per checkpoint.
+trajectory vs. the *actual* physical trajectory of the pendulum under the
+learned controller's actions (both read directly from the real simulator
+state, `env.unwrapped.state`) — the dashed preview lines are the only place
+each side's own model of dynamics (analytic vs. learned, the latter mapped
+to physical coordinates via a linear probe h -> (cos theta, sin theta,
+theta_dot), fit once per checkpoint) shows up.
 """
 
 from __future__ import annotations
@@ -312,13 +315,13 @@ def run_latent_mppi(
 
     mean = torch.zeros(cfg.horizon, 1, device=device)
     frames = []
-    theta_hats, theta_dot_hats = [], []
+    thetas, theta_dots = [], []
     plan_thetas, plan_theta_dots = [], []
 
     h_t, q, p = ground()
-    st0 = (h_t @ A).squeeze(0)
-    theta_hats.append(float(torch.atan2(st0[1], st0[0])))
-    theta_dot_hats.append(float(st0[2].clamp(-_MAX_SPEED, _MAX_SPEED)))
+    theta_b, theta_dot_b = env.unwrapped.state
+    thetas.append(float(angle_normalize(torch.tensor(float(theta_b)))))
+    theta_dots.append(float(theta_dot_b))
 
     try:
         for step in range(total_steps):
@@ -353,9 +356,9 @@ def run_latent_mppi(
             frames.append(torch.from_numpy(display_obs).float() / 255.0)
 
             h_t, q, p = ground()
-            st_pred = (h_t @ A).squeeze(0)
-            theta_hats.append(float(torch.atan2(st_pred[1], st_pred[0])))
-            theta_dot_hats.append(float(st_pred[2].clamp(-_MAX_SPEED, _MAX_SPEED)))
+            theta_new, theta_dot_new = env.unwrapped.state  # post-step, actual physical state
+            thetas.append(float(angle_normalize(torch.tensor(float(theta_new)))))
+            theta_dots.append(float(theta_dot_new))
 
             mean = shift_mean(mean)
             if progress_cb is not None:
@@ -365,9 +368,9 @@ def run_latent_mppi(
 
     return {
         "frames": frames,
-        "theta_hat": theta_hats,              # len total_steps + 1 (includes t=0)
-        "theta_dot_hat": theta_dot_hats,
-        "plan_theta": plan_thetas,            # len total_steps; plan_theta[i] = H-step preview from theta_hat[i]
+        "theta": thetas,                  # len total_steps + 1 (includes t=0); actual physical state
+        "theta_dot": theta_dots,
+        "plan_theta": plan_thetas,            # len total_steps; plan_theta[i] = H-step preview from theta[i]
         "plan_theta_dot": plan_theta_dots,
     }
 
@@ -417,7 +420,7 @@ def build_phase_space_frames(
         ax.scatter(gt_theta[i : i + 1], gt_theta_dot[i : i + 1], color="tab:blue", s=30, zorder=3)
 
         lr_t, lr_td = _break_wrapped(learned_theta[: i + 1], learned_theta_dot[: i + 1])
-        ax.plot(lr_t, lr_td, color="tab:orange", linewidth=1.3, label="Learned MPPI (believed)")
+        ax.plot(lr_t, lr_td, color="tab:orange", linewidth=1.3, label="Learned MPPI (actual)")
         ax.scatter(learned_theta[i : i + 1], learned_theta_dot[i : i + 1], color="tab:orange", s=30, zorder=3)
 
         if i < total_steps:
@@ -609,7 +612,7 @@ with st.spinner("Rendering phase-space animation…"):
     phase_frames = build_phase_space_frames(
         gt_theta=gt_result["theta"], gt_theta_dot=gt_result["theta_dot"],
         gt_plan_theta=gt_result["plan_theta"], gt_plan_theta_dot=gt_result["plan_theta_dot"],
-        learned_theta=latent_result["theta_hat"], learned_theta_dot=latent_result["theta_dot_hat"],
+        learned_theta=latent_result["theta"], learned_theta_dot=latent_result["theta_dot"],
         learned_plan_theta=latent_result["plan_theta"], learned_plan_theta_dot=latent_result["plan_theta_dot"],
     )
     phase_gif = frames_to_gif(phase_frames, fps)
