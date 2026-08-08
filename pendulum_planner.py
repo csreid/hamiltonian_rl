@@ -60,7 +60,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data.pendulum import (
     PendulumPixelEnv,
-    _MAX_SPEED,
     analytic_pendulum_step,
     angle_normalize,
     collect_random_trajectories,
@@ -74,6 +73,13 @@ from hamilton_rl.streamlit_common import (
     frames_to_gif,
     pick_checkpoint,
 )
+
+# Display-sanity bound for theta_dot: not a physics guarantee (the env's old
+# hard clip is gone, replaced by quadratic drag that only *softly* bounds
+# speed — see data.pendulum._DRAG_COEFF), just a generous ceiling past the
+# drag's calibrated worst-case range (~10-12 rad/s) so a wild linear-probe
+# extrapolation can't spuriously dominate the MPPI cost or blow out the plots.
+_DISPLAY_VEL_LIMIT = 15.0
 
 
 # ── Model / regression loading ──────────────────────────────────────────────
@@ -255,10 +261,10 @@ def _latent_rollout_cost_fn(dynamics, q0, p0, regression, action_weight):
             st = h @ regression  # (K, 3) -> (cos theta_hat, sin theta_hat, theta_dot_hat)
             theta_hat = torch.atan2(st[:, 1], st[:, 0])
             # The linear probe is unconstrained and can predict velocities
-            # outside what the simulator ever actually produces (it hard-clips
-            # |theta_dot| <= _MAX_SPEED every step) — clamp so a wild
-            # out-of-domain extrapolation can't spuriously dominate the cost.
-            theta_dot_hat = st[:, 2].clamp(-_MAX_SPEED, _MAX_SPEED)
+            # well outside the simulator's typical range — clamp to a
+            # generous display-sanity bound so a wild out-of-domain
+            # extrapolation can't spuriously dominate the cost.
+            theta_dot_hat = st[:, 2].clamp(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)
             total = total + angle_normalize(theta_hat) ** 2 + 0.1 * theta_dot_hat**2 + action_weight * u.squeeze(-1) ** 2
         return total
 
@@ -340,9 +346,9 @@ def run_latent_mppi(
                 # atan2 is scale-invariant, so theta stays plausible-looking
                 # even if the linear probe's raw output has blown up under
                 # extrapolation this far into pure imagination — theta_dot has
-                # no such protection, so clamp it to what the real simulator
-                # (and the MPPI cost function) can ever actually produce.
-                plan_td.append(float(st_p[2].clamp(-_MAX_SPEED, _MAX_SPEED)))
+                # no such protection, so clamp it to the same display-sanity
+                # bound used by the MPPI cost function.
+                plan_td.append(float(st_p[2].clamp(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)))
             plan_thetas.append(plan_t)
             plan_theta_dots.append(plan_td)
 
@@ -436,7 +442,7 @@ def build_phase_space_frames(
 
         ax.axvline(0.0, color="gray", linewidth=0.6, linestyle="--")
         ax.set_xlim(-np.pi, np.pi)
-        ax.set_ylim(-_MAX_SPEED, _MAX_SPEED)
+        ax.set_ylim(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)
         ax.set_xlabel("θ (rad)")
         ax.set_ylabel("θ̇ (rad/s)")
 

@@ -171,14 +171,9 @@ def _collect_energy_grid_episodes(
     angular velocity) swing far away from theta=0 within just a few steps,
     leaving that corner of the grid unsampled.
 
-    ``uncapped=True``: the analytic backward solve assumes unclipped
-    dynamics, but reaching the high-energy corner near theta=0 requires
-    momentarily exceeding Pendulum-v1's hard velocity clip along the way
-    (energy conservation demands more speed away from theta=0, where
-    potential energy is lower) — so on a normal, clipped rollout the seed
-    still falls short right at that corner. Rolling out on an uncapped env
-    instead makes the backward solve exact everywhere, including there; see
-    `collect_zero_trajectories_targeted`'s docstring.
+    The backward solve is exact everywhere (including the high-energy corner
+    near theta=0) since there's no hard velocity clip to saturate against
+    anymore — see `collect_zero_trajectories_targeted`'s docstring.
 
     Rolling forward at all (rather than encoding a single still frame) is
     necessary because the causal LSTM encoder needs real motion to infer
@@ -189,7 +184,6 @@ def _collect_energy_grid_episodes(
         img_size=img_size,
         max_steps=context_frames - 1,
         damping=damping,
-        uncapped=True,
     )
 
 
@@ -233,8 +227,8 @@ def _plot_learned_energy_landscape(
     model: WorldModel,
     episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     landscape_resolution: int = 200,
-    min_vel: float = -_MAX_SPEED,
-    max_vel: float = _MAX_SPEED,
+    min_vel: float | None = None,
+    max_vel: float | None = None,
     device: torch.device | None = None,
 ) -> plt.Figure:
     """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
@@ -259,21 +253,16 @@ def _plot_learned_energy_landscape(
     energy is high/low — by matching colors, without implying agreement in
     magnitude.
 
-    `min_vel`/`max_vel` default to Pendulum-v1's own velocity clip
-    (`_MAX_SPEED` = 8 rad/s) rather than a wider round number — the pendulum
-    can never actually reach angular velocities beyond that, so sweeping the
-    true-energy heatmap past it would depict energy values for a region of
-    phase space the physics (and therefore the sampled points) can never
-    populate.
+    `min_vel`/`max_vel` default to the *sampled* episodes' own
+    theta_dot range (with a small margin) rather than a fixed constant — the
+    env's old hard velocity clip is gone (replaced by a soft quadratic drag,
+    see `data.pendulum._DRAG_COEFF`), so there's no longer a physical bound
+    to assume; deriving the range from the data avoids silently cropping real
+    high-speed samples out of the heatmap.
     """
     model.eval()
     if device is None:
         device = next(model.autoencoder.parameters()).device
-
-    theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
-    theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
-    grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
-    H_true_dense = (0.5 * grid_theta_dot**2 + _G * (1.0 + torch.cos(grid_theta))).numpy()
 
     samples = _collect_grid_qp_samples(model, episodes, device=device)
     H_learned = model.dynamics.hamiltonian(
@@ -282,6 +271,16 @@ def _plot_learned_energy_landscape(
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
     H_true = samples["H_true"].cpu().numpy()
+
+    if min_vel is None or max_vel is None:
+        vel_margin = 1.1
+        max_vel = float(np.abs(theta_dot).max()) * vel_margin
+        min_vel = -max_vel
+
+    theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
+    theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
+    grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
+    H_true_dense = (0.5 * grid_theta_dot**2 + _G * (1.0 + torch.cos(grid_theta))).numpy()
 
     H_learned_dense = griddata(
         points=np.stack([theta, theta_dot], axis=-1),
@@ -843,6 +842,210 @@ def _log_h_state_regression_coeffs_phase1(
     fig.tight_layout()
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
+
+
+@torch.no_grad()
+def _log_cnn_feature_distribution_phase1(
+    model: LSTMAutoencoder,
+    val_traj_sets: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/cnn_feature_distribution",
+) -> None:
+    """Violin plot of per-dimension CNN-feature values, sorted by std descending.
+
+    Same purpose as `_log_latent_distribution_phase1` but probing
+    `encoder.frame_cnn` output directly, one stage before the LSTM. Comparing
+    the two tells you whether any latent collapse originates in the per-frame
+    conv or is introduced downstream by the LSTM/KL training.
+    """
+    model.eval()
+    all_feat = []
+    for val_trajs, _label in val_traj_sets:
+        for frames, _actions, _states in val_trajs:
+            all_feat.append(model.encoder.frame_cnn(frames.to(device)).cpu())
+    feat_pool = torch.cat(all_feat, dim=0)
+
+    std = feat_pool.std(dim=0)
+    order = torch.argsort(std, descending=True)
+    feat_sorted = feat_pool[:, order].numpy()
+    dim_feat = feat_sorted.shape[1]
+
+    fig, ax = plt.subplots(figsize=(max(8, dim_feat * 0.08), 4))
+    parts = ax.violinplot(feat_sorted, showmedians=False, showextrema=False)
+    for pc in parts["bodies"]:
+        pc.set_facecolor("tab:orange")
+        pc.set_alpha(0.6)
+    if dim_feat <= 64:
+        ax.set_xticks(np.arange(1, dim_feat + 1))
+        ax.set_xticklabels([str(i.item()) for i in order], fontsize=6 if dim_feat > 16 else 8)
+    else:
+        ax.set_xticks([])
+    ax.set_xlabel("CNN feature dimension (sorted by std, descending)")
+    ax.set_ylabel("value")
+    ax.set_title(f"Per-frame CNN feature distribution, held-out trajectories (epoch {epoch + 1})")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def _log_cnn_feature_regression_phase1(
+    model: LSTMAutoencoder,
+    val_traj_sets: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/cnn_feature_regression",
+) -> None:
+    """Linear probe from per-frame CNN features to (cos θ, sin θ).
+
+    Mirrors `_log_latent_scatter_phase1` but on `encoder.frame_cnn` output and
+    without θ̇ — a single static frame carries no velocity information, so
+    including it would only measure the probe's inability to see something
+    that was never there. High R² here means position is already linearly
+    recoverable before the LSTM even runs; a low R² here contrasted against a
+    high R² for h → state would point at the conv itself, not the LSTM, as
+    the source of any position-encoding failure.
+    """
+    model.eval()
+    per_policy_feat, per_policy_theta = {}, {}
+    for val_trajs, label in val_traj_sets:
+        all_feat, all_theta = [], []
+        for frames, _actions, states in val_trajs:
+            all_feat.append(model.encoder.frame_cnn(frames.to(device)).cpu())
+            all_theta.append(states[:, :2].float())  # (cos θ, sin θ)
+        per_policy_feat[label] = all_feat
+        per_policy_theta[label] = all_theta
+
+    train_feat = torch.cat([f for all_f in per_policy_feat.values() for f in all_f[0::2]], dim=0)
+    train_theta = torch.cat([t for all_t in per_policy_theta.values() for t in all_t[0::2]], dim=0)
+    A = torch.linalg.lstsq(train_feat, train_theta).solution
+
+    val_pred, val_true = {}, {}
+    for label in per_policy_feat:
+        val_feat = torch.cat(per_policy_feat[label][1::2], dim=0)
+        val_theta = torch.cat(per_policy_theta[label][1::2], dim=0)
+        val_pred[label] = (val_feat @ A).numpy()
+        val_true[label] = val_theta.numpy()
+
+    colors = plt.get_cmap("tab10").colors
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+    for i, name in enumerate(["cos(θ)", "sin(θ)"]):
+        all_true_i, all_pred_i = [], []
+        for j, label in enumerate(val_pred):
+            true_i, pred_i = val_true[label][:, i], val_pred[label][:, i]
+            axes[i].scatter(true_i, pred_i, s=2, alpha=0.3, color=colors[j % len(colors)], label=label, linewidths=0)
+            all_true_i.append(true_i)
+            all_pred_i.append(pred_i)
+        true_i = np.concatenate(all_true_i)
+        pred_i = np.concatenate(all_pred_i)
+        lo, hi = min(true_i.min(), pred_i.min()), max(true_i.max(), pred_i.max())
+        axes[i].plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
+        axes[i].set_xlabel(f"True {name}")
+        axes[i].set_ylabel(f"Predicted {name}")
+        ss_res = ((true_i - pred_i) ** 2).sum()
+        ss_tot = ((true_i - true_i.mean()) ** 2).sum()
+        axes[i].set_title(f"{name}  R²={1 - ss_res / (ss_tot + 1e-8):.3f}")
+    axes[0].legend(markerscale=4, fontsize=8)
+    fig.suptitle(f"CNN feature → position regression, held-out trajectories (epoch {epoch + 1})")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def _log_cnn_feature_fold_probe_phase1(
+    model: LSTMAutoencoder,
+    val_traj_sets: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/cnn_feature_fold_probe",
+    n_pairs: int = 50_000,
+    neighbor_pct: float = 5.0,
+    seed: int = 0,
+) -> None:
+    """Fold check on per-frame CNN features, mirroring the reverse-direction
+    panels of `_log_markov_pairwise_probe_phase1` but one stage earlier.
+
+    Unlike the h-space probe, pairs aren't restricted to cross-trajectory —
+    a single frame's CNN embedding has no temporal/path dependence to guard
+    against, so any two frames anywhere in the val pool are fair game. Only
+    position matters (θ, via circular distance) since a static frame carries
+    no velocity. If the θ ↔ -θ / θ ↔ π-θ mirror lines already show up here,
+    the fold originates in the per-frame conv (or the render itself), not in
+    LSTM/VAE training dynamics.
+    """
+    model.eval()
+    feat_list, theta_list = [], []
+    for val_trajs, _label in val_traj_sets:
+        for frames, _actions, states in val_trajs:
+            feat_list.append(model.encoder.frame_cnn(frames.to(device)).cpu())
+            theta_list.append(torch.atan2(states[:, 1].float(), states[:, 0].float()))
+
+    feat_all = torch.cat(feat_list, dim=0)
+    theta_all = torch.cat(theta_list, dim=0)
+    n = feat_all.shape[0]
+
+    rng = np.random.default_rng(seed)
+    idx_i = rng.integers(0, n, size=n_pairs)
+    idx_j = rng.integers(0, n, size=n_pairs)
+
+    fi, fj = feat_all[idx_i], feat_all[idx_j]
+    ti, tj = theta_all[idx_i].numpy(), theta_all[idx_j].numpy()
+    delta_feat = (fi - fj).norm(dim=-1).numpy()
+    delta_theta = np.abs(np.angle(np.exp(1j * (ti - tj))))  # circular distance in [0, pi]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    ax = axes[0]
+    feat_thresh = np.percentile(delta_feat, neighbor_pct)
+    is_feat_neighbor = delta_feat <= feat_thresh
+    fold_median = float(np.median(delta_theta[is_feat_neighbor]))
+    fold_p95 = float(np.percentile(delta_theta[is_feat_neighbor], 95))
+    ax.hist(delta_theta[is_feat_neighbor], bins=50, density=True, alpha=0.6,
+            label=f"feat-neighbors (n={is_feat_neighbor.sum()})")
+    ax.hist(delta_theta, bins=50, density=True, alpha=0.6, label="all pairs")
+    ax.set_xlabel("Δθ (circular, rad)")
+    ax.set_title(f"Fold check: angular distance of CNN-feat-neighbors (bottom {neighbor_pct:.0f}%)")
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    bin_edges = np.linspace(0, delta_feat.max(), 21)
+    bin_idx = np.digitize(delta_feat, bin_edges) - 1
+    centers, medians = [], []
+    for b in range(len(bin_edges) - 1):
+        mask = bin_idx == b
+        if not mask.any():
+            continue
+        centers.append(delta_feat[mask].mean())
+        medians.append(np.median(delta_theta[mask]))
+    ax.plot(centers, medians, marker="o", markersize=3)
+    ax.set_xlabel("Δ CNN feature ||f_i - f_j||")
+    ax.set_ylabel("median Δθ")
+    ax.set_title("Δθ vs. feature-distance")
+
+    ax = axes[2]
+    fold_thresh = np.percentile(delta_theta[is_feat_neighbor], 90)
+    folded = is_feat_neighbor & (delta_theta >= fold_thresh)
+    ax.scatter(ti, tj, s=2, alpha=0.15, color="gray", label="all pairs")
+    sc = ax.scatter(ti[folded], tj[folded], s=6, c=delta_theta[folded], cmap="viridis",
+                     label=f"worst folds (n={folded.sum()})")
+    fig.colorbar(sc, ax=ax, label="Δθ", pad=0.02)
+    ax.set_xlabel("θ_i (rad)")
+    ax.set_ylabel("θ_j (rad)")
+    ax.set_title("Where CNN-feature folds occur")
+    ax.legend(fontsize=8, markerscale=3)
+
+    fig.suptitle(f"CNN feature fold probe (epoch {epoch + 1})")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
+    writer.add_scalar(f"{tag}_fold_score/median", fold_median, epoch)
+    writer.add_scalar(f"{tag}_fold_score/p95", fold_p95, epoch)
 
 
 # ---------------------------------------------------------------------------
@@ -1518,6 +1721,18 @@ def phase1_cmd(**kwargs):
                     device=device, writer=writer, epoch=epoch,
                 )
                 _log_latent_distribution_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+                _log_cnn_feature_distribution_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+                _log_cnn_feature_regression_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+                _log_cnn_feature_fold_probe_phase1(
                     model=model, val_traj_sets=scatter_sets,
                     device=device, writer=writer, epoch=epoch,
                 )

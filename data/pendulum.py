@@ -15,15 +15,79 @@ from tqdm import tqdm
 # Pendulum-v1 physical constants (gymnasium defaults)
 _G = 10.0
 _H_STAR = 20.0  # 2 * m * g * l  with m=l=1, g=10
-_DT = 0.05  # Pendulum-v1 integration timestep
-_MAX_SPEED = 8.0  # Pendulum-v1's hard clip on |theta_dot| (gymnasium default)
+_DT = 0.05  # integration timestep (matches Pendulum-v1's default)
+_MAX_SPEED = 8.0  # nominal velocity scale used for normalization/plot ranges
+                   # (Pendulum-v1's old hard clip value; no longer physically
+                   # enforced — see _DRAG_COEFF, which bounds speed smoothly
+                   # instead)
+_DRAG_COEFF = 0.05  # quadratic (Rayleigh) drag coefficient, ṗ_drag = -c·p·|p|
+                     # replaces the old hard |theta_dot| clip. Calibrated so
+                     # typical energy-pump episodes are barely affected
+                     # (mean peak ~7.9 rad/s vs ~8.6 undamped) while sustained
+                     # max-torque spin-up saturates around ~10-12 rad/s
+                     # instead of growing unboundedly.
 
 
 # ── Analytic (batched) dynamics ──────────────────────────────────────────────
+#
+# Canonical Hamiltonian coordinates: q = theta, p = theta_dot, with
+# T(p) = p²/2 (unit "mass") and V(q) = 1.5·g·cos(theta), so that the
+# unforced/undamped flow q̇ = ∂T/∂p = p, ṗ = -∂V/∂q = 1.5·g·sin(theta)
+# matches Pendulum-v1's own equation of motion (m=l=1). Control enters as
+# ṗ += 3·u (matching gym's B=3), dissipation (linear ``damping`` and/or
+# quadratic ``drag``) acts on p alone, exactly as in
+# ``HamiltonianFlowModel``'s R (see hamilton_rl/models.py).
+#
+# Integrated with the same Strang-split leapfrog (kick-drift-kick, with the
+# dissipative flow split symmetrically around it) as
+# ``HamiltonianFlowModel._leapfrog_step`` — this is the single source of
+# truth for pendulum physics: the real env (``PendulumPixelEnv.step``), the
+# state-only collectors, and the planner's MPPI ground-truth imagination all
+# call this same function, so there is no way for them to drift apart.
 
 
 def angle_normalize(theta: torch.Tensor) -> torch.Tensor:
     return ((theta + torch.pi) % (2 * torch.pi)) - torch.pi
+
+
+def _grad_V(theta: torch.Tensor, g: float = _G) -> torch.Tensor:
+    return -1.5 * g * torch.sin(theta)
+
+
+def _drag_substep(p: torch.Tensor, tau: float, c: float) -> torch.Tensor:
+    """Exact flow of dp/dt = -c·p·|p| over time ``tau`` (any sign).
+
+    Closed form: p(t) = sign(p0) / (1/|p0| + c·t). Evaluating the same
+    formula at -t recovers p0 exactly (up to float precision) — the same
+    functional form inverts itself, so this is exactly reversible.
+    """
+    if c == 0.0:
+        return p
+    sign = torch.sign(p)
+    inv_abs_p = 1.0 / p.abs().clamp_min(1e-12) + c * tau
+    return sign / inv_abs_p.clamp_min(1e-12)
+
+
+def _dissipation_substep(
+    q: torch.Tensor, p: torch.Tensor, tau: float, damping: float, drag: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward dissipative flow over time ``tau``: exponential damping, then drag."""
+    if damping != 0.0:
+        p = p * float(np.exp(-damping * tau))
+    if drag != 0.0:
+        p = _drag_substep(p, tau, drag)
+    return q, p
+
+
+def _dissipation_substep_inverse(
+    q: torch.Tensor, p: torch.Tensor, tau: float, damping: float, drag: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact inverse of ``_dissipation_substep`` (reverses composition order)."""
+    if drag != 0.0:
+        p = _drag_substep(p, -tau, drag)
+    if damping != 0.0:
+        p = p * float(np.exp(damping * tau))
+    return q, p
 
 
 def analytic_pendulum_step(
@@ -32,24 +96,70 @@ def analytic_pendulum_step(
     u: torch.Tensor,
     dt: float = _DT,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
     g: float = _G,
-    max_speed: float = _MAX_SPEED,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Batched replica of Pendulum-v1's own semi-implicit Euler step (m=l=1).
+    """One leapfrog (Strang-split) step of the pendulum's port-Hamiltonian dynamics.
 
-    Matches ``gymnasium.envs.classic_control.pendulum.PendulumEnv.step`` (and
-    ``PendulumPixelEnv``'s post-step damping) exactly, but as plain tensor ops
-    over arbitrarily-shaped ``theta``/``theta_dot``/``u`` — lets a planner
+    Structurally identical to ``HamiltonianFlowModel._leapfrog_step``: a
+    dissipative half-step, canonical kick-drift-kick (with the constant
+    control force folded into the two half-kicks as an exact zero-order
+    hold), then the other dissipative half-step. Plain tensor ops over
+    arbitrarily-shaped ``theta``/``theta_dot``/``u`` — lets a planner
     simulate many candidate rollouts in parallel without stepping copies of
     the real env.
     """
     u = u.clamp(-2.0, 2.0)
-    new_theta_dot = theta_dot + (1.5 * g * torch.sin(theta) + 3.0 * u) * dt
-    new_theta_dot = new_theta_dot.clamp(-max_speed, max_speed)
-    new_theta = theta + new_theta_dot * dt
-    if damping != 0.0:
-        new_theta_dot = new_theta_dot * np.exp(-damping * dt)
-    return new_theta, new_theta_dot
+    q, p = theta, theta_dot
+    has_dissipation = damping != 0.0 or drag != 0.0
+
+    if has_dissipation:
+        q, p = _dissipation_substep(q, p, dt / 2, damping, drag)
+
+    Bu = 3.0 * u
+    p = p - (dt / 2) * _grad_V(q, g) + (dt / 2) * Bu
+    q = q + dt * p
+    p = p - (dt / 2) * _grad_V(q, g) + (dt / 2) * Bu
+
+    if has_dissipation:
+        q, p = _dissipation_substep(q, p, dt / 2, damping, drag)
+
+    return q, p
+
+
+def analytic_pendulum_step_inverse(
+    theta: torch.Tensor,
+    theta_dot: torch.Tensor,
+    u: torch.Tensor,
+    dt: float = _DT,
+    damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
+    g: float = _G,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact inverse of ``analytic_pendulum_step``: recover (theta_t, theta_dot_t)
+    from (theta_{t+1}, theta_dot_{t+1}) and u_t.
+
+    Mirrors ``HamiltonianFlowModel._leapfrog_step_inverse``: D(-dt/2) ∘
+    core⁻¹ ∘ D(-dt/2), exact up to float precision (the symplectic core is
+    ρ-reversible; the dissipation substep inverts exactly via
+    ``_dissipation_substep_inverse``).
+    """
+    u = u.clamp(-2.0, 2.0)
+    q, p = theta, theta_dot
+    has_dissipation = damping != 0.0 or drag != 0.0
+
+    if has_dissipation:
+        q, p = _dissipation_substep_inverse(q, p, dt / 2, damping, drag)
+
+    Bu = 3.0 * u
+    p = p + (dt / 2) * _grad_V(q, g) - (dt / 2) * Bu
+    q = q - dt * p
+    p = p + (dt / 2) * _grad_V(q, g) - (dt / 2) * Bu
+
+    if has_dissipation:
+        q, p = _dissipation_substep_inverse(q, p, dt / 2, damping, drag)
+
+    return q, p
 
 
 # ── Image preprocessing ──────────────────────────────────────────────────────
@@ -67,26 +177,26 @@ def preprocess_frame(frame: np.ndarray, img_size: int = 64) -> torch.Tensor:
 class PendulumPixelEnv(gym.Wrapper):
     """Pendulum-v1 with (3, img_size, img_size) uint8 pixel observations.
 
+    Physics is driven entirely by ``analytic_pendulum_step`` (see module
+    docstring above ``analytic_pendulum_step``) — gym's own built-in step is
+    bypassed so the real env can never drift from the "ground truth" dynamics
+    used elsewhere (e.g. the planner's MPPI imagination).
+
     Args:
         img_size:   Side length of the square pixel observation.
-        damping:    Linear viscous damping coefficient applied post-step.
-                    ``theta_dot *= exp(-damping * dt)`` each step.
-                    0.0 (default) reproduces the standard frictionless pendulum.
-        max_speed:  Overrides gym's hard clip on |theta_dot| (default 8.0).
-                    Pass ``float("inf")`` to disable it entirely — used by
-                    ``collect_zero_trajectories_targeted(uncapped=True)`` so
-                    the backward-solved seed's analytic inversion (which
-                    assumes unclipped dynamics) is exact even when reaching
-                    the target requires momentarily exceeding the normal clip.
+        damping:    Linear viscous damping coefficient. ``theta_dot *=
+                    exp(-damping * dt)`` each step. 0.0 (default) disables it.
+        drag:       Quadratic (Rayleigh) drag coefficient — see
+                    ``_DRAG_COEFF``. Smoothly bounds angular velocity in
+                    place of gym's old hard clip; 0.0 disables it.
     """
 
-    def __init__(self, img_size: int = 64, damping: float = 0.0, max_speed: float | None = None):
+    def __init__(self, img_size: int = 64, damping: float = 0.0, drag: float = _DRAG_COEFF):
         env = gym.make("Pendulum-v1", render_mode="rgb_array")
-        if max_speed is not None:
-            env.unwrapped.max_speed = max_speed  # type: ignore[union-attr]
         super().__init__(env)
         self.img_size = img_size
         self.damping = damping
+        self.drag = drag
         self.observation_space = spaces.Box(
             low=0,
             high=255,
@@ -119,12 +229,6 @@ class PendulumPixelEnv(gym.Wrapper):
         self.env.unwrapped.last_u = None  # type: ignore[union-attr]
         return (t * 255).byte().numpy()
 
-    def _apply_damping(self) -> None:
-        if self.damping != 0.0:
-            theta, theta_dot = self.env.unwrapped.state  # type: ignore[union-attr]
-            theta_dot *= np.exp(-self.damping * _DT)
-            self.env.unwrapped.state = np.array([theta, theta_dot])  # type: ignore[union-attr]
-
     def reset(self, **kwargs):
         self.env.reset(**kwargs)
         return self._obs(), {}
@@ -135,9 +239,19 @@ class PendulumPixelEnv(gym.Wrapper):
         return self._obs()
 
     def step(self, action):
-        _, reward, terminated, truncated, info = self.env.step(action)
-        self._apply_damping()
-        return self._obs(), reward, terminated, truncated, info
+        theta, theta_dot = self.env.unwrapped.state  # type: ignore[union-attr]
+        u = torch.as_tensor([float(action[0])], dtype=torch.float64)
+        new_theta, new_theta_dot = analytic_pendulum_step(
+            torch.as_tensor([theta], dtype=torch.float64),
+            torch.as_tensor([theta_dot], dtype=torch.float64),
+            u,
+            damping=self.damping,
+            drag=self.drag,
+        )
+        self.env.unwrapped.state = np.array(  # type: ignore[union-attr]
+            [new_theta.item(), new_theta_dot.item()], dtype=np.float64
+        )
+        return self._obs(), 0.0, False, False, {}
 
 
 # ── Energy-based controller ───────────────────────────────────────────────────
@@ -406,35 +520,26 @@ def _seeds_reaching_targets(
     targets: np.ndarray,
     max_steps: int,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
 ) -> np.ndarray:
     """Find zero-action seeds that land at ``targets`` after ``max_steps`` steps.
 
-    Pendulum-v1's zero-action step is semi-implicit ("symplectic") Euler:
-        newthdot = clip(thdot + (3g/2l) sin(th) dt, -max_speed, max_speed)
-        newth    = th + newthdot dt
-        newthdot *= exp(-damping dt)                    (damping, applied after)
-    The position update uses the *new* velocity, so this is not reversible by
-    simply negating velocity and re-running the same forward step — that
-    would evaluate the sin(th) acceleration at the wrong angle and drift
-    (confirmed empirically: multi-step error of >1 rad). Instead the map is
-    inverted in closed form, one step at a time, walking backward from each
-    target: undo damping, recover th from th = newth - newthdot dt, then
-    recover thdot from the acceleration evaluated at that *recovered* th
-    (matching what the forward step actually used). Exact up to float
-    precision, provided no step along the way saturates the velocity clip —
-    true for the achievable phase-space region this is used for.
+    Walks backward from each target one step at a time via
+    ``analytic_pendulum_step_inverse`` — exact up to float precision (see
+    that function's docstring), unlike the old semi-implicit-Euler map,
+    which had no exact multi-step inverse.
 
     Returns an (N, 2) array of (theta0, theta_dot0) seeds, same shape as
     ``targets``.
     """
-    theta = targets[:, 0].copy()
-    theta_dot = targets[:, 1].copy()
+    theta = torch.as_tensor(targets[:, 0].copy(), dtype=torch.float64)
+    theta_dot = torch.as_tensor(targets[:, 1].copy(), dtype=torch.float64)
+    zero_u = torch.zeros_like(theta)
     for _ in range(max_steps):
-        theta_dot = theta_dot * np.exp(damping * _DT)          # undo damping
-        theta_prev = theta - theta_dot * _DT                    # invert position update
-        theta_dot_prev = theta_dot - (3 * _G / 2) * np.sin(theta_prev) * _DT
-        theta, theta_dot = theta_prev, theta_dot_prev
-    return np.stack([theta, theta_dot], axis=-1)
+        theta, theta_dot = analytic_pendulum_step_inverse(
+            theta, theta_dot, zero_u, damping=damping, drag=drag
+        )
+    return np.stack([theta.numpy(), theta_dot.numpy()], axis=-1)
 
 
 def _collect_zero_episodes(
@@ -443,16 +548,14 @@ def _collect_zero_episodes(
     max_steps: int,
     damping: float = 0.0,
     seeds: np.ndarray | None = None,
-    max_speed: float | None = None,
+    drag: float = _DRAG_COEFF,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Collect episodes with the action fixed at zero (uncontrolled dynamics).
 
     ``seeds``: explicit (N, 2) array of (theta0, theta_dot0) to start from;
     defaults to the standard covering grid (``_grid_seeds``).
-    ``max_speed``: overrides gym's hard |theta_dot| clip for this rollout —
-    see ``PendulumPixelEnv``.
     """
-    env = PendulumPixelEnv(img_size=img_size, damping=damping, max_speed=max_speed)
+    env = PendulumPixelEnv(img_size=img_size, damping=damping, drag=drag)
     episodes = []
     if seeds is None:
         seeds = _grid_seeds(n_episodes)
@@ -530,8 +633,8 @@ def collect_zero_trajectories_targeted(
     img_size: int,
     max_steps: int,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
     max_vel: float = _MAX_SPEED,
-    uncapped: bool = False,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Zero-action episodes whose *final* state, not seed, covers the grid.
 
@@ -545,40 +648,37 @@ def collect_zero_trajectories_targeted(
     full grid — including the high-energy region near theta=0 — is actually
     covered by the states each episode ends on.
 
-    ``max_vel`` defaults to Pendulum-v1's own ``max_speed`` clip (8 rad/s):
-    the env can never actually reach angular velocities beyond that, so
-    targeting a wider range wouldn't converge — the backward solve would find
-    a seed for an unreachable target and the forward rollout would just
-    saturate at the clip instead of arriving where asked.
-
-    ``uncapped``: reaching a target near theta=0 (the unstable equilibrium)
-    at high angular velocity requires *exceeding* max_speed at every point
-    along the approach — energy conservation demands more kinetic energy
-    away from theta=0, where potential energy is lower — so even the exact
-    backward-solved seed falls short once the real, clipped env clips that
-    excursion and bleeds off energy. ``_seeds_reaching_targets``'s inversion
-    assumes unclipped dynamics, so it's only exact if the rollout env also
-    doesn't clip. Set ``uncapped=True`` to roll out on a
-    ``PendulumPixelEnv`` with its velocity clip disabled, matching that
-    assumption — the seed then lands exactly on every target, including the
-    high-energy corner. The clip is a Pendulum-v1 implementation detail, not
-    a physical law, and this is used only for a few-frame LSTM warmup
-    context (not training data), so the brief unclipped excursion mid-rollout
-    doesn't misrepresent anything the model is evaluated against.
+    Because ``analytic_pendulum_step``/``..._inverse`` are exact inverses of
+    each other regardless of speed (no hard clip to saturate against), the
+    backward-solved seed lands exactly on every target — including the
+    high-energy corner near theta=0 — with no special-casing needed.
+    ``max_vel`` just sets how wide a range of target velocities to cover.
     """
     targets = _grid_seeds(n_episodes, min_theta_dot=-max_vel, max_theta_dot=max_vel)
-    seeds = _seeds_reaching_targets(targets, max_steps=max_steps, damping=damping)
+    seeds = _seeds_reaching_targets(targets, max_steps=max_steps, damping=damping, drag=drag)
     return _collect_zero_episodes(
         n_episodes=n_episodes,
         img_size=img_size,
         max_steps=max_steps,
         damping=damping,
+        drag=drag,
         seeds=seeds,
-        max_speed=float("inf") if uncapped else None,
     )
 
 
 # ── State-only data collection (no pixel rendering) ──────────────────────────
+
+
+def _state_step(theta: float, theta_dot: float, action: float, damping: float, drag: float) -> tuple[float, float]:
+    """Scalar convenience wrapper around ``analytic_pendulum_step``."""
+    new_theta, new_theta_dot = analytic_pendulum_step(
+        torch.tensor([theta], dtype=torch.float64),
+        torch.tensor([theta_dot], dtype=torch.float64),
+        torch.tensor([action], dtype=torch.float64),
+        damping=damping,
+        drag=drag,
+    )
+    return new_theta.item(), new_theta_dot.item()
 
 
 def _collect_state_only_episodes(
@@ -588,6 +688,7 @@ def _collect_state_only_episodes(
     energy_k: float,
     desc: str,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Collect (states, actions) without rendering frames.
 
@@ -595,7 +696,6 @@ def _collect_state_only_episodes(
         states  : (T+1, 2) float32 — (theta, theta_dot)
         actions : (T,)  float32
     """
-    env = gym.make("Pendulum-v1", render_mode=None)
     episodes = []
     seeds = _grid_seeds(n_episodes)
 
@@ -603,15 +703,11 @@ def _collect_state_only_episodes(
         kp = random.uniform(2.0, 15.0)
         kd = random.uniform(0.5, 5.0)
 
-        env.reset()
-        theta0, theta_dot0 = seeds[i]
-        env.unwrapped.state = np.array([theta0, theta_dot0])  # type: ignore[union-attr]
-        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
+        theta, theta_dot = (float(x) for x in seeds[i])
+        states = [np.array([theta, theta_dot], dtype=np.float32)]
         actions = []
 
         for _ in range(max_steps):
-            theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
-
             if random.random() < epsilon:
                 action = float(np.random.uniform(-2.0, 2.0))
             elif abs(theta) < _UPRIGHT_THRESHOLD:
@@ -619,13 +715,9 @@ def _collect_state_only_episodes(
             else:
                 action = _energy_pumping_action(theta, theta_dot, energy_k)
 
-            env.step(np.array([action], dtype=np.float32))
-            theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
-            if damping != 0.0:
-                theta_dot_new *= np.exp(-damping * _DT)
-                env.unwrapped.state = np.array([theta_new, theta_dot_new])  # type: ignore[union-attr]
+            theta, theta_dot = _state_step(theta, theta_dot, action, damping, drag)
             actions.append(action)
-            states.append(np.array([theta_new, theta_dot_new], dtype=np.float32))
+            states.append(np.array([theta, theta_dot], dtype=np.float32))
 
         episodes.append((
             torch.from_numpy(np.stack(states)),          # (T+1, 3)
@@ -641,6 +733,7 @@ def collect_state_data(
     max_steps: int = 200,
     energy_k: float = 1.0,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Collect state-only Pendulum episodes (no pixel rendering)."""
     episodes = _collect_state_only_episodes(
@@ -650,6 +743,7 @@ def collect_state_data(
         energy_k=energy_k,
         desc="Collecting state data",
         damping=damping,
+        drag=drag,
     )
     print(f"  Collected {n_episodes} episodes ({max_steps} steps each).")
     return episodes
@@ -660,6 +754,7 @@ def collect_state_val_trajectories(
     max_steps: int = 200,
     energy_k: float = 1.0,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return _collect_state_only_episodes(
         n_episodes=n_episodes,
@@ -668,6 +763,7 @@ def collect_state_val_trajectories(
         energy_k=energy_k,
         desc="Val trajectories (energy-pump)",
         damping=damping,
+        drag=drag,
     )
 
 
@@ -675,6 +771,7 @@ def collect_state_random_trajectories(
     n_episodes: int,
     max_steps: int = 200,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return _collect_state_only_episodes(
         n_episodes=n_episodes,
@@ -683,6 +780,7 @@ def collect_state_random_trajectories(
         energy_k=1.0,
         desc="Val trajectories (random)",
         damping=damping,
+        drag=drag,
     )
 
 
@@ -690,28 +788,21 @@ def _collect_state_spin_episodes(
     n_episodes: int,
     max_steps: int,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    env = gym.make("Pendulum-v1", render_mode=None)
     episodes = []
     seeds = _grid_seeds(n_episodes)
 
     for i in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
-        env.reset()
-        theta0, theta_dot0 = seeds[i]
-        env.unwrapped.state = np.array([theta0, theta_dot0])  # type: ignore[union-attr]
-        states = [np.array([theta0, theta_dot0], dtype=np.float32)]
+        theta, theta_dot = (float(x) for x in seeds[i])
+        states = [np.array([theta, theta_dot], dtype=np.float32)]
         actions = []
 
         for _ in range(max_steps):
-            _, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
             action = _spin_action(theta_dot)
-            env.step(np.array([action], dtype=np.float32))
-            theta_new, theta_dot_new = env.unwrapped.state  # type: ignore[union-attr]
-            if damping != 0.0:
-                theta_dot_new *= np.exp(-damping * _DT)
-                env.unwrapped.state = np.array([theta_new, theta_dot_new])  # type: ignore[union-attr]
+            theta, theta_dot = _state_step(theta, theta_dot, action, damping, drag)
             actions.append(action)
-            states.append(np.array([theta_new, theta_dot_new], dtype=np.float32))
+            states.append(np.array([theta, theta_dot], dtype=np.float32))
 
         episodes.append((
             torch.from_numpy(np.stack(states)),
@@ -725,11 +816,13 @@ def collect_state_spin_trajectories(
     n_episodes: int,
     max_steps: int = 200,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return _collect_state_spin_episodes(
         n_episodes=n_episodes,
         max_steps=max_steps,
         damping=damping,
+        drag=drag,
     )
 
 
