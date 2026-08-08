@@ -565,6 +565,14 @@ def _log_markov_pairwise_probe_phase1(
     pair" distributions below mean h carries path-dependent information
     beyond the physical state, something Phase 2's single-step dynamics
     model has no way to recover.
+
+    This only checks one direction (phase-neighbors → close in h, i.e.
+    "tearing": physically adjacent states thrown apart). It says nothing
+    about the reverse — h-neighbors that are actually far apart in phase
+    space ("folding": physically distant states collapsed together, e.g.
+    pendulum-up and pendulum-down sharing a latent code because both render
+    as a thin centered rod). The `fold_score` scalars and the last two
+    panels below check that reverse direction directly.
     """
     model.eval()
     h_list, phase_list, traj_id_list = [], [], []
@@ -607,8 +615,10 @@ def _log_markov_pairwise_probe_phase1(
     delta_phase = (pi - pj).norm(dim=-1).numpy()
     delta_hidden = (hi - hj).norm(dim=-1).numpy()
     cos_sim = F.cosine_similarity(hi, hj, dim=-1).numpy()
+    theta_i = torch.atan2(pi[:, 1], pi[:, 0]).numpy()
+    theta_j = torch.atan2(pj[:, 1], pj[:, 0]).numpy()
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    fig, axes = plt.subplots(1, 5, figsize=(24, 4.5))
 
     ax = axes[0]
     bin_edges = np.quantile(delta_phase, np.linspace(0, 1, n_bins + 1))
@@ -648,6 +658,37 @@ def _log_markov_pairwise_probe_phase1(
     ax.set_title("Hidden-state cosine similarity")
     ax.legend(fontsize=8)
 
+    # --- Reverse direction: h-neighbors that are actually far apart in phase
+    # space ("folding"). Same bottom-neighbor_pct% construction as above, but
+    # thresholded on delta_hidden instead of delta_phase.
+    h_thresh = np.percentile(delta_hidden, neighbor_pct)
+    is_h_neighbor = delta_hidden <= h_thresh
+    fold_median = float(np.median(delta_phase[is_h_neighbor]))
+    fold_p95 = float(np.percentile(delta_phase[is_h_neighbor], 95))
+
+    ax = axes[3]
+    ax.hist(delta_phase[is_h_neighbor], bins=50, density=True, alpha=0.6,
+            label=f"h-neighbors (n={is_h_neighbor.sum()})")
+    ax.hist(delta_phase, bins=50, density=True, alpha=0.6, label="all pairs")
+    ax.set_xlabel("Δ phase-space ||p_i - p_j||")
+    ax.set_title(f"Fold check: phase-distance of h-neighbors (bottom {neighbor_pct:.0f}%)")
+    ax.legend(fontsize=8)
+
+    # Localize *where* the worst folded pairs sit in phase space: h-neighbors
+    # whose phase distance is itself in the top decile of the h-neighbor
+    # population, i.e. the pairs h thinks are close but truly aren't.
+    ax = axes[4]
+    fold_thresh = np.percentile(delta_phase[is_h_neighbor], 90)
+    folded = is_h_neighbor & (delta_phase >= fold_thresh)
+    ax.scatter(theta_i, theta_j, s=2, alpha=0.15, color="gray", label="all pairs")
+    sc = ax.scatter(theta_i[folded], theta_j[folded], s=6, c=delta_phase[folded],
+                     cmap="viridis", label=f"worst folds (n={folded.sum()})")
+    fig.colorbar(sc, ax=ax, label="Δ phase", pad=0.02)
+    ax.set_xlabel("θ_i (rad)")
+    ax.set_ylabel("θ_j (rad)")
+    ax.set_title("Where folds occur (worst h-neighbor / phase-distant pairs)")
+    ax.legend(fontsize=8, markerscale=3)
+
     fig.suptitle(f"Markov pairwise probe, cross-trajectory (epoch {epoch + 1})")
     fig.tight_layout()
     writer.add_figure(tag, fig, epoch)
@@ -659,6 +700,8 @@ def _log_markov_pairwise_probe_phase1(
     writer.add_scalar(
         f"{tag}_median_delta_h/all_pairs", float(np.median(delta_hidden)), epoch,
     )
+    writer.add_scalar(f"{tag}_fold_score/median", fold_median, epoch)
+    writer.add_scalar(f"{tag}_fold_score/p95", fold_p95, epoch)
 
 
 @torch.no_grad()
