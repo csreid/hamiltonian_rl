@@ -341,12 +341,19 @@ def _train_epoch_phase1(
     temporal_scale: float = 0.01,
     sparsity_weight: float = 0.0,
     max_context_len: int = 0,
+    deterministic: bool = False,
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
 
     Two prediction targets from the causal (forward-only) LSTM:
       - h_t → current frame   (reconstruction signal)
       - h_t → next frame      (predictive signal; h_t has seen only 0..t)
+
+    deterministic=True is an ablation against the VAE machinery: skip the
+    reparameterization noise and KL term entirely and train h as a plain
+    (non-probabilistic) autoencoder latent. logvar_head is still computed by
+    the encoder (unused) so model architecture/checkpoints stay identical
+    either way — only the training-time treatment of h changes.
     """
     model.train()
     total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_loss = 0.0
@@ -362,9 +369,12 @@ def _train_epoch_phase1(
         q_dim = model.latent_dim // 2
 
         mu_all, logvar_all = model.encoder.forward_all(frames)
-        logvar_all = logvar_all.clamp(-10, 2)
 
-        z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
+        if deterministic:
+            z_all = mu_all
+        else:
+            logvar_all = logvar_all.clamp(-10, 2)
+            z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
 
         def _decode(z: torch.Tensor, B: int, T: int):
             s = model.f_psi(z.reshape(B * T, -1))
@@ -380,15 +390,18 @@ def _train_epoch_phase1(
         pred_next = model.next_frame_decoder(h_curr, a_curr).reshape(B_size, T_full, *frames.shape[2:])
         recon_next = F.mse_loss(pred_next, frames[:, 1:])
 
-        def _kl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-            return (
-                (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()))
-                .clamp(min=free_bits)
-                .sum(dim=-1)
-                .mean()
-            )
+        if deterministic:
+            kl = torch.zeros((), device=device)
+        else:
+            def _kl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+                return (
+                    (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp()))
+                    .clamp(min=free_bits)
+                    .sum(dim=-1)
+                    .mean()
+                )
 
-        kl = _kl(mu_all, logvar_all)
+            kl = _kl(mu_all, logvar_all)
 
         loss = recon + recon_next + kl_weight * kl
 
@@ -1500,6 +1513,10 @@ def cli():
 @click.option("--lr", type=float, default=1e-4, show_default=True)
 @click.option("--kl-weight", type=float, default=1e-3, show_default=True)
 @click.option("--free-bits", type=float, default=0.5, show_default=True)
+@click.option("--deterministic", is_flag=True, default=False, show_default=True,
+              help="Ablation: skip VAE reparameterization/KL entirely and train h "
+                   "as a plain deterministic autoencoder latent (kl-weight/free-bits "
+                   "are ignored when set).")
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 @click.option("--max-context-len", type=int, default=0, show_default=True,
               help="Max frames fed to LSTM per batch step (0 = full sequence). "
@@ -1654,6 +1671,7 @@ def phase1_cmd(**kwargs):
             temporal_scale=kwargs["temporal_scale"],
             sparsity_weight=kwargs["sparsity_weight"],
             max_context_len=kwargs["max_context_len"],
+            deterministic=kwargs["deterministic"],
         )
 
         alpha = kwargs["ema_alpha"]
