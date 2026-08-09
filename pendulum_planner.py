@@ -72,6 +72,7 @@ from hamilton_rl.streamlit_common import (
     build_sidebyside_frames,
     frames_to_gif,
     pick_checkpoint,
+    to_uint8,
 )
 
 # Display-sanity bound for theta_dot: not a physics guarantee (the env's old
@@ -323,6 +324,7 @@ def run_latent_mppi(
     frames = []
     thetas, theta_dots = [], []
     plan_thetas, plan_theta_dots = [], []
+    plan_q0, plan_p0, plan_actions = [], [], []
 
     h_t, q, p = ground()
     theta_b, theta_dot_b = env.unwrapped.state
@@ -333,6 +335,13 @@ def run_latent_mppi(
         for step in range(total_steps):
             cost_fn = _latent_rollout_cost_fn(dynamics, q, p, A, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
+
+            # Snapshot the grounded latent state this step planned from, plus
+            # the chosen action sequence, so a single step's plan can later be
+            # decoded to pixels on demand (see decode_plan_frames).
+            plan_q0.append(q.clone().cpu())
+            plan_p0.append(p.clone().cpu())
+            plan_actions.append(mean.clone().cpu())
 
             # Roll the chosen (noise-free) plan forward once, purely to show
             # "what does the controller currently intend to do" — never executed.
@@ -378,7 +387,36 @@ def run_latent_mppi(
         "theta_dot": theta_dots,
         "plan_theta": plan_thetas,            # len total_steps; plan_theta[i] = H-step preview from theta[i]
         "plan_theta_dot": plan_theta_dots,
+        "plan_q0": plan_q0,                # len total_steps; grounded (q, p) each step planned from
+        "plan_p0": plan_p0,
+        "plan_actions": plan_actions,      # len total_steps; the chosen (noise-free) H-step action sequence
     }
+
+
+# ── Decoded plan (single control step) ──────────────────────────────────────
+
+
+@torch.no_grad()
+def decode_plan_frames(
+    world_model: WorldModel, q0: torch.Tensor, p0: torch.Tensor, actions: torch.Tensor
+) -> list:
+    """Decode one control step's imagined H-step plan to pixels.
+
+    Same per-step pipeline as `WorldModel.dream` (controlled_step -> decode ->
+    decode_latent), just starting from an already-grounded (q0, p0) instead of
+    an encoded context window, and following the fixed `actions` sequence MPPI
+    committed to for that step rather than a held-out action tape.
+    """
+    device = next(world_model.autoencoder.parameters()).device
+    dynamics, autoencoder = world_model.dynamics, world_model.autoencoder
+    q, p = q0.to(device), p0.to(device)
+    horizon = actions.shape[0]
+    decoded = []
+    for t in range(horizon):
+        q, p = dynamics.controlled_step(q, p, actions[t : t + 1].to(device))
+        h_pred = dynamics.decode(q, p)
+        decoded.append(autoencoder.decode_latent(h_pred).squeeze(0).cpu())
+    return to_uint8(torch.stack(decoded)) if decoded else []
 
 
 # ── Phase-space animation ────────────────────────────────────────────────────
@@ -630,3 +668,41 @@ st.markdown(
     "will show a dashed line that visibly reshapes every frame."
 )
 st.image(phase_gif, use_container_width=False)
+
+st.subheader("Decoded imagined plan at one control step")
+st.markdown(
+    "MPPI replans from scratch every control step, so the imagined horizon can look "
+    "completely different step to step — averaging or animating across steps would just "
+    "blur that together. Instead, pick one step below to decode *that step's* full "
+    "H-frame plan straight from the learned dynamics (`controlled_step` → `decode` → "
+    "`decode_latent`, the same pipeline `WorldModel.dream` uses), and compare it against "
+    "the real frame the pendulum was actually in when that plan was made."
+)
+n_control_steps = len(latent_result["plan_actions"])
+plan_step = st.slider(
+    "Control step to inspect", min_value=0, max_value=n_control_steps - 1, value=0
+)
+with st.spinner("Decoding imagined plan…"):
+    plan_frames_u8 = decode_plan_frames(
+        world_model=world_model,
+        q0=latent_result["plan_q0"][plan_step],
+        p0=latent_result["plan_p0"][plan_step],
+        actions=latent_result["plan_actions"][plan_step],
+    )
+    plan_pil = [
+        Image.fromarray(f).resize((display_size, display_size), Image.BILINEAR)
+        for f in plan_frames_u8
+    ]
+    plan_gif = frames_to_gif(plan_pil, fps)
+
+col_real, col_plan = st.columns(2)
+with col_real:
+    st.caption(f"Real frame at t={plan_step} (start of this step's plan)")
+    real_frame = Image.fromarray(latent_frames_u8[max(plan_step - 1, 0)]).resize(
+        (display_size, display_size), Image.BILINEAR
+    )
+    st.image(real_frame, use_container_width=False)
+with col_plan:
+    horizon_len = len(latent_result["plan_actions"][plan_step])
+    st.caption(f"Imagined {horizon_len}-step plan from t={plan_step}")
+    st.image(plan_gif, use_container_width=False)
