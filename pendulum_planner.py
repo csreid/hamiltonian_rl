@@ -17,11 +17,18 @@ resulting real observation. Neither side ever free-runs open-loop.
     velocity + action penalty.
 
   - Learned: imagination = the checkpoint's `HamiltonianFlowModel` in latent
-    (q, p) space. Cost is the *same* angle^2 + velocity^2 + action-penalty
-    shape as ground truth, evaluated by applying the already-fitted h->state
-    linear probe to each imagined step's h — not pixel MSE against a target
-    frame, which stayed nearly flat until the pendulum was already most of
-    the way upright and gave MPPI little gradient to plan against early on.
+    (q, p) space. Default cost is the *same* angle^2 + velocity^2 +
+    action-penalty shape as ground truth, evaluated by applying the
+    already-fitted h->state linear probe to each imagined step's h — not
+    pixel MSE against a target frame, which stayed nearly flat until the
+    pendulum was already most of the way upright and gave MPPI little
+    gradient to plan against early on. A sidebar selector can switch the
+    learned cost to exactly that pixel-MSE variant (decoded imagined frames
+    vs. a rendered upright target) to see the difference first-hand, or to a
+    computer-vision cost that reads an implied (theta, theta_dot) directly
+    off each decoded frame (soft rod-direction centroid + finite-difference
+    velocity, see `frames_to_direction`) — the probe cost's shape without
+    the probe's privileged access to simulator state at fit time.
     Critically, the latent state used to *start* each planning step is
     re-grounded every step by re-encoding a rolling window of the real
     rendered frames through the frozen Phase-1 LSTM encoder (exactly how
@@ -59,6 +66,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.pendulum import (
+    _DT,
     PendulumPixelEnv,
     analytic_pendulum_step,
     angle_normalize,
@@ -272,6 +280,110 @@ def _latent_rollout_cost_fn(dynamics, q0, p0, regression, action_weight):
     return cost_fn
 
 
+def _latent_pixel_cost_fn(dynamics, autoencoder, q0, p0, target, action_weight):
+    """Imagined-rollout cost in pixel space: decoded-frame MSE vs. an upright target.
+
+    The alternative to the linear-probe cost, selectable from the sidebar.
+    Each imagined step is decoded all the way to pixels (`decode` →
+    `decode_latent`, same pipeline as `WorldModel.dream`) and scored by MSE
+    against a real rendered frame of the upright, at-rest pendulum. Kept
+    around for comparison despite the known drawbacks that motivated the
+    probe cost: the MSE stays nearly flat until the pendulum is already most
+    of the way upright (little early gradient for MPPI), and it costs a CNN
+    decoder forward pass per candidate per step.
+    """
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        K, H, _ = candidates.shape
+        q = q0.expand(K, -1).clone()
+        p = p0.expand(K, -1).clone()
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
+        for t in range(H):
+            u = candidates[:, t, :]
+            q, p = dynamics.controlled_step(q, p, u)
+            h = dynamics.decode(q, p)
+            frame = autoencoder.decode_latent(h)  # (K, C, H, W)
+            pixel_mse = ((frame - target) ** 2).mean(dim=(1, 2, 3))
+            total = total + pixel_mse + action_weight * u.squeeze(-1) ** 2
+        return total
+
+    return cost_fn
+
+
+def frames_to_direction(frames: torch.Tensor) -> torch.Tensor:
+    """(B, 3, H, W) frames in [0,1] → (B, 2) unit rod-direction vectors, via soft centroid.
+
+    The rendered rod is the only strongly red thing in the scene and is pinned
+    at the image center, so a redness-weighted centroid of pixel coordinates
+    (weighted additionally by radius, which both discounts the near-center
+    pixels that carry no direction information and masks the dark axle dot)
+    points along the rod. Robust to decoder blur, since blur is roughly
+    symmetric about the rod and barely moves the centroid.
+
+    The returned vectors are in raw image coordinates (x right, y down);
+    convert to a pendulum angle with `theta = atan2(-v_x, -v_y)`. That
+    convention was calibrated empirically against `env.set_state` sweeps on
+    real 64px frames (max |error| 0.003 rad over a 25-angle grid).
+    """
+    r, g, b = frames[:, 0], frames[:, 1], frames[:, 2]
+    w = (r - 0.5 * (g + b)).clamp(min=0)
+    B, H, W = w.shape
+    ys = torch.arange(H, dtype=frames.dtype, device=frames.device) - (H - 1) / 2
+    xs = torch.arange(W, dtype=frames.dtype, device=frames.device) - (W - 1) / 2
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    w = w * torch.sqrt(gx**2 + gy**2)
+    wsum = w.sum(dim=(1, 2)) + 1e-8
+    cx = (w * gx).sum(dim=(1, 2)) / wsum
+    cy = (w * gy).sum(dim=(1, 2)) / wsum
+    v = torch.stack([cx, cy], dim=-1)
+    return v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+def _latent_cv_cost_fn(dynamics, autoencoder, q0, p0, v_prev0, action_weight):
+    """Imagined-rollout cost via computer vision on the decoded frames.
+
+    Middle ground between the other two learned costs: decode each imagined
+    step to pixels like the pixel-distance cost, but then extract an implied
+    (theta, theta_dot) from the decoded frame with `frames_to_direction` and
+    reuse the same well-shaped angle^2 + velocity^2 cost as the probe cost.
+    Unlike the linear probe this needs no privileged access to the
+    simulator's state at fit time — everything comes out of the decoder.
+
+    theta_dot has no single-frame signature (no torque arrow, no motion
+    blur), so it is finite-differenced from consecutive implied directions
+    along the imagined rollout: atan2(cross, dot) of successive unit vectors
+    is the wrap-safe angle increment. `v_prev0` — the direction extracted
+    from the *current real frame* — seeds the difference for the first
+    imagined step. Real-rollout calibration puts the finite-difference
+    velocity within ~0.1-0.2 rad/s of truth at 64px (soft-centroid
+    subpixel resolution), plenty for a cost term.
+    """
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        K, H, _ = candidates.shape
+        q = q0.expand(K, -1).clone()
+        p = p0.expand(K, -1).clone()
+        v_prev = v_prev0.expand(K, -1)
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
+        for t in range(H):
+            u = candidates[:, t, :]
+            q, p = dynamics.controlled_step(q, p, u)
+            h = dynamics.decode(q, p)
+            frame = autoencoder.decode_latent(h)  # (K, C, H, W)
+            v = frames_to_direction(frame)
+            theta_hat = torch.atan2(-v[:, 0], -v[:, 1])
+            # Wrap-safe angle increment between consecutive implied
+            # directions; sign matches theta by the same calibration as
+            # frames_to_direction. Max representable speed is pi/_DT
+            # (~62 rad/s), far above anything physical here.
+            cross = v[:, 0] * v_prev[:, 1] - v[:, 1] * v_prev[:, 0]
+            dot = (v * v_prev).sum(dim=-1)
+            theta_dot_hat = (torch.atan2(cross, dot) / _DT).clamp(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)
+            v_prev = v
+            total = total + theta_hat**2 + 0.1 * theta_dot_hat**2 + action_weight * u.squeeze(-1) ** 2
+        return total
+
+    return cost_fn
+
+
 @torch.no_grad()
 def run_latent_mppi(
     world_model: WorldModel,
@@ -282,6 +394,7 @@ def run_latent_mppi(
     cfg: MPPIConfig,
     action_weight: float,
     regression: torch.Tensor,
+    cost_mode: str = "probe",
     progress_cb=None,
 ) -> dict:
     """Closed-loop receding-horizon MPPI: plan with the learned dynamics, act on the real pendulum.
@@ -306,6 +419,15 @@ def run_latent_mppi(
 
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     env.reset()
+
+    # For the pixel-distance cost: a real rendered frame of the goal state
+    # (upright, at rest), grabbed before the env is placed at the actual
+    # initial condition below.
+    target_frame = None
+    if cost_mode == "pixel":
+        target_obs = env.set_state(0.0, 0.0)
+        target_frame = (torch.from_numpy(target_obs).float() / 255.0).unsqueeze(0).to(device)
+
     obs0 = env.set_state(theta0, theta_dot0)
     context = deque([torch.from_numpy(obs0).float() / 255.0], maxlen=n_context)
     for _ in range(max(n_context - 1, 0)):
@@ -333,7 +455,15 @@ def run_latent_mppi(
 
     try:
         for step in range(total_steps):
-            cost_fn = _latent_rollout_cost_fn(dynamics, q, p, A, action_weight)
+            if cost_mode == "pixel":
+                cost_fn = _latent_pixel_cost_fn(dynamics, autoencoder, q, p, target_frame, action_weight)
+            elif cost_mode == "cv":
+                # Seed the finite-difference velocity with the implied
+                # direction of the newest *real* frame in the context window.
+                v0 = frames_to_direction(context[-1].unsqueeze(0).to(device))
+                cost_fn = _latent_cv_cost_fn(dynamics, autoencoder, q, p, v0, action_weight)
+            else:
+                cost_fn = _latent_rollout_cost_fn(dynamics, q, p, A, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
 
             # Snapshot the grounded latent state this step planned from, plus
@@ -531,6 +661,27 @@ with st.sidebar:
     st.header("Cost weights")
     w_u_gt = st.number_input("Action weight (ground truth)", min_value=0.0, value=0.001, step=0.001, format="%.4f")
     w_u_latent = st.number_input("Action weight (learned)", min_value=0.0, value=0.001, step=0.001, format="%.4f")
+    # label -> mode key understood by run_latent_mppi
+    cost_mode_options = {
+        "Linear probe (θ, θ̇)": "probe",
+        "Pixel distance": "pixel",
+        "CV on decoded frames": "cv",
+    }
+    cost_mode_label = st.selectbox(
+        "Cost function (learned)",
+        options=list(cost_mode_options),
+        index=0,
+        help="How the learned MPPI scores imagined rollouts. Linear probe: "
+        "apply the h → state regression and use the same angle² + velocity² "
+        "cost as ground truth. Pixel distance: decoded-frame MSE against a "
+        "rendered upright target frame — slower (CNN decoder per candidate "
+        "per step) and known to give little gradient until the pendulum is "
+        "nearly upright. CV on decoded frames: decode to pixels, then read "
+        "an implied (θ, θ̇) off each decoded frame via a soft rod-direction "
+        "centroid (θ̇ by finite differences) and use the probe-style angle² "
+        "+ velocity² cost — no privileged state regression involved.",
+    )
+    cost_mode = cost_mode_options[cost_mode_label]
 
     st.divider()
     st.header("Rollout")
@@ -593,6 +744,7 @@ if generate_btn:
         latent_result = run_latent_mppi(
             world_model=world_model, theta0=theta0, theta_dot0=theta_dot0, n_context=n_context,
             total_steps=total_steps, cfg=cfg, action_weight=w_u_latent, regression=A,
+            cost_mode=cost_mode,
             progress_cb=lambda i, n: latent_progress.progress(i / n, text=f"Learned-dynamics MPPI… {i}/{n}"),
         )
     except Exception as exc:
