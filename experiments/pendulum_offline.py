@@ -68,7 +68,7 @@ from data.pendulum import (
     _MAX_SPEED,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
-from hamilton_rl.models import HamiltonianFlowModel, LSTMAutoencoder, WorldModel
+from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldModel
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +331,7 @@ def _plot_learned_energy_landscape(
 
 
 def _train_epoch_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     kl_weight: float,
@@ -457,7 +457,7 @@ def _train_epoch_phase1(
 
 @torch.no_grad()
 def _eval_loss_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_trajs: list,
     device: torch.device,
     chunk_size: int = 4,
@@ -484,7 +484,7 @@ def _eval_loss_phase1(
 
 @torch.no_grad()
 def _log_reconstruction_lstm_video(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_traj: tuple,
     device: torch.device,
     writer: SummaryWriter,
@@ -511,7 +511,7 @@ def _log_reconstruction_lstm_video(
 
 @torch.no_grad()
 def _log_latent_distribution_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -556,7 +556,7 @@ def _log_latent_distribution_phase1(
 
 @torch.no_grad()
 def _log_markov_pairwise_probe_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -719,7 +719,7 @@ def _log_markov_pairwise_probe_phase1(
 
 @torch.no_grad()
 def _log_latent_scatter_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -787,7 +787,7 @@ def _log_latent_scatter_phase1(
 
 @torch.no_grad()
 def _log_h_state_regression_coeffs_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_trajs: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -860,7 +860,7 @@ def _log_h_state_regression_coeffs_phase1(
 
 @torch.no_grad()
 def _log_cnn_feature_distribution_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -906,7 +906,7 @@ def _log_cnn_feature_distribution_phase1(
 
 @torch.no_grad()
 def _log_cnn_feature_regression_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -971,7 +971,7 @@ def _log_cnn_feature_regression_phase1(
 
 @torch.no_grad()
 def _log_cnn_feature_fold_probe_phase1(
-    model: LSTMAutoencoder,
+    model: TemporalAutoencoder,
     val_traj_sets: list,
     device: torch.device,
     writer: SummaryWriter,
@@ -1272,7 +1272,7 @@ def _train_epoch_phase2(
 
 
 def _encode_val_h(
-    phase1_model: LSTMAutoencoder,
+    phase1_model: TemporalAutoencoder,
     val_trajs: list,
     device: torch.device,
     enc_chunk: int = 8,
@@ -1583,7 +1583,13 @@ def cli():
 @click.option("--feat-dim", type=int, default=256, show_default=True)
 @click.option("--latent-dim", type=int, default=32, show_default=True)
 @click.option("--lstm-layers", type=int, default=1, show_default=True,
-              help="Number of stacked LSTM layers in the encoder")
+              help="Number of stacked LSTM layers in the encoder (lstm encoder only)")
+@click.option("--encoder-type", type=click.Choice(["lstm", "framestack"]), default="lstm",
+              show_default=True,
+              help="How h_t is built from frames: 'lstm' (causal LSTM hidden state over "
+                   "the whole context) or 'framestack' (memoryless function of the two "
+                   "most recent frames — momentum is identifiable from two consecutive "
+                   "frames, so in theory no longer history is needed)")
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=8, show_default=True)
@@ -1702,13 +1708,14 @@ def phase1_cmd(**kwargs):
     )
     print(f"Dataset: {len(dataset)} episodes")
 
-    model = LSTMAutoencoder(
+    model = TemporalAutoencoder(
         latent_dim=kwargs["latent_dim"],
         feat_dim=kwargs["feat_dim"],
         pos_ch=kwargs["pos_ch"],
         img_size=kwargs["img_size"],
         control_dim=1,
         num_layers=kwargs["lstm_layers"],
+        encoder_type=kwargs["encoder_type"],
     ).to(device)
     print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
 

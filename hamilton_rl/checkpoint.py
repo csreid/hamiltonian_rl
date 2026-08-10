@@ -7,7 +7,7 @@ hyperparameters required to load:
     {
       "format_version": 1,
       "config": {
-        "autoencoder": {...LSTMAutoencoder ctor args...},
+        "autoencoder": {...TemporalAutoencoder ctor args...},
         "dynamics":    {...HamiltonianFlowModel ctor args...} | None,
         "data":        {...how the training episodes were collected...},
       },
@@ -100,7 +100,7 @@ def save_world_model(
 
 def load_world_model(path, device: torch.device | None = None):
     """Load a unified checkpoint into a WorldModel (dynamics may be None)."""
-    from hamilton_rl.models import HamiltonianFlowModel, LSTMAutoencoder, WorldModel
+    from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldModel
 
     path = Path(path)
     ckpt = torch.load(path, map_location=device or "cpu", weights_only=True)
@@ -111,7 +111,7 @@ def load_world_model(path, device: torch.device | None = None):
         )
 
     config = ckpt["config"]
-    autoencoder = LSTMAutoencoder(**config["autoencoder"])
+    autoencoder = TemporalAutoencoder(**config["autoencoder"])
     autoencoder.load_state_dict(ckpt["autoencoder"])
 
     dynamics = None

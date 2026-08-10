@@ -2,8 +2,9 @@
 
 Two independently trained halves plus a wrapper that stitches them:
 
-    LSTMAutoencoder       Phase 1 — pixels ↔ latent h_t
-        encoder             causal LSTM over per-frame CNN features → (mu, logvar)
+    TemporalAutoencoder       Phase 1 — pixels ↔ latent h_t
+        encoder             causal LSTM over per-frame CNN features → (mu, logvar),
+                            or a memoryless two-frame stack (encoder_type="framestack")
         f_psi               normalizing flow h → s (decoder input is s[:q_dim])
         decoder             q → frame
         next_frame_decoder  (h_t, a_t) → frame_{t+1} (auxiliary predictive head)
@@ -156,6 +157,72 @@ class FlexLSTMEncoder(nn.Module):
 
         # out: (B, T, feat_dim) — per-timestep forward hidden states
         return self.mu_head(out), self.logvar_head(out)
+
+
+class FrameStackEncoder(nn.Module):
+    """Two-frame stacked encoder: (frame_{t-1}, frame_t) → (mu, logvar) at t.
+
+    Drop-in replacement for FlexLSTMEncoder (same forward_all interface and
+    frame_cnn attribute) that replaces the recurrent hidden state with a
+    memoryless function of the current and previous frame embeddings —
+    momentum is identifiable from two consecutive frames, so in principle no
+    longer history is needed. At t=0 the frame is paired with itself, which
+    carries no motion evidence, matching the LSTM's blindness to velocity at
+    the first step.
+    """
+
+    def __init__(
+        self,
+        img_ch: int = 3,
+        feat_dim: int = 256,
+        latent_dim: int = 32,
+        img_size: int = 64,
+    ):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.frame_cnn = FlexFrameCNN(img_ch=img_ch, feat_dim=feat_dim, img_size=img_size)
+        self.fuse = nn.Sequential(
+            nn.Linear(2 * feat_dim, feat_dim),
+            nn.LeakyReLU(),
+            nn.Linear(feat_dim, feat_dim),
+            nn.LeakyReLU(),
+        )
+        self.mu_head = nn.Linear(feat_dim, latent_dim)
+        self.logvar_head = nn.Linear(feat_dim, latent_dim)
+
+    def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = imgs.shape
+        return self.frame_cnn(imgs.reshape(B * T, C, H, W)).reshape(B, T, -1)
+
+    def forward_all(
+        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode each timestep → per-step (mu, logvar).
+
+        Args:
+            imgs:    (B, T, C, H, W)
+            lengths: accepted for interface parity with FlexLSTMEncoder and
+                     ignored — each output depends only on frames t-1 and t,
+                     so padded positions never contaminate valid ones.
+
+        Returns:
+            mu_all, logvar_all: each (B, T, latent_dim)
+        """
+        feats = self._embed_frames(imgs)                       # (B, T, feat_dim)
+        prev = torch.cat([feats[:, :1], feats[:, :-1]], dim=1)  # frame_{-1} := frame_0
+        out = self.fuse(torch.cat([prev, feats], dim=-1))      # (B, T, feat_dim)
+        return self.mu_head(out), self.logvar_head(out)
+
+    def forward(
+        self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode a sequence to the final step's (mu, logvar), each (B, latent_dim)."""
+        if lengths is None:
+            mu_all, logvar_all = self.forward_all(imgs[:, -2:])
+            return mu_all[:, -1], logvar_all[:, -1]
+        mu_all, logvar_all = self.forward_all(imgs)
+        idx = (lengths.to(imgs.device) - 1).view(-1, 1, 1).expand(-1, 1, mu_all.shape[-1])
+        return mu_all.gather(1, idx).squeeze(1), logvar_all.gather(1, idx).squeeze(1)
 
 
 # ---------------------------------------------------------------------------
@@ -461,24 +528,26 @@ class NextFrameDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# LSTMAutoencoder — Phase 1: reconstruction-only model
+# TemporalAutoencoder — Phase 1: reconstruction-only model
 # ---------------------------------------------------------------------------
 
 
-class LSTMAutoencoder(nn.Module):
-    """Phase 1 model: LSTM encoder + normalizing flow + CNN decoders. No dynamics.
+class TemporalAutoencoder(nn.Module):
+    """Phase 1 model: temporal encoder + normalizing flow + CNN decoders. No dynamics.
 
     The latent h_t produced by the encoder is what the Phase 2 dynamics model
     (HamiltonianFlowModel) consumes.  Decoding goes h → f_psi(h)[:q_dim] → frame.
 
     Args:
-        latent_dim:  flat latent dimension of h_t (decoder sees latent_dim // 2)
-        feat_dim:    per-frame CNN embedding size and LSTM hidden size
-        pos_ch:      spatial channel depth for the decoders' 4×4 seed
-        img_size:    spatial resolution of input/output frames
-        img_ch:      image channels (3 for RGB)
-        control_dim: dimension of the action fed to next_frame_decoder
-        num_layers:  number of stacked LSTM layers in the encoder
+        latent_dim:   flat latent dimension of h_t (decoder sees latent_dim // 2)
+        feat_dim:     per-frame CNN embedding size and encoder hidden size
+        pos_ch:       spatial channel depth for the decoders' 4×4 seed
+        img_size:     spatial resolution of input/output frames
+        img_ch:       image channels (3 for RGB)
+        control_dim:  dimension of the action fed to next_frame_decoder
+        num_layers:   number of stacked LSTM layers (lstm encoder only)
+        encoder_type: "lstm" (causal LSTM over frame embeddings) or "framestack"
+                      (memoryless two-consecutive-frame encoder)
     """
 
     def __init__(
@@ -490,6 +559,7 @@ class LSTMAutoencoder(nn.Module):
         img_ch: int = 3,
         control_dim: int = 1,
         num_layers: int = 1,
+        encoder_type: str = "lstm",
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -501,16 +571,27 @@ class LSTMAutoencoder(nn.Module):
             "img_ch": img_ch,
             "control_dim": control_dim,
             "num_layers": num_layers,
+            "encoder_type": encoder_type,
         }
         q_dim = latent_dim // 2
 
-        self.encoder = FlexLSTMEncoder(
-            img_ch=img_ch,
-            feat_dim=feat_dim,
-            latent_dim=latent_dim,
-            img_size=img_size,
-            num_layers=num_layers,
-        )
+        if encoder_type == "lstm":
+            self.encoder = FlexLSTMEncoder(
+                img_ch=img_ch,
+                feat_dim=feat_dim,
+                latent_dim=latent_dim,
+                img_size=img_size,
+                num_layers=num_layers,
+            )
+        elif encoder_type == "framestack":
+            self.encoder = FrameStackEncoder(
+                img_ch=img_ch,
+                feat_dim=feat_dim,
+                latent_dim=latent_dim,
+                img_size=img_size,
+            )
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type!r}")
         self.f_psi = NormalizingFlow(latent_dim)
         self.decoder = FlexDecoder(
             q_dim=q_dim, pos_ch=pos_ch, img_ch=img_ch, img_size=img_size
@@ -538,13 +619,13 @@ class LSTMAutoencoder(nn.Module):
 class HamiltonianFlowModel(nn.Module):
     """Phase 2 model: learns Φ mapping precomputed h_t → (q, p) for Hamiltonian dynamics.
 
-    Completely separate from Phase 1 (LSTMAutoencoder). Takes precomputed
+    Completely separate from Phase 1 (TemporalAutoencoder). Takes precomputed
     LSTM encoder outputs h_t as input — no encoder or decoder.
 
     The controlled ODE integrated with RK4: dz/dt = (J − R(z)) ∇H(z) + B u
 
     Args:
-        latent_dim:      dimension of h_t (= LSTMAutoencoder.latent_dim)
+        latent_dim:      dimension of h_t (= TemporalAutoencoder.latent_dim)
         control_dim:     dimension of control input u
         separable:       if True, use T + V Hamiltonian decomposition
         learn_structure: if True, learn R/B; if False, R is fixed from damping
@@ -960,7 +1041,7 @@ class WorldModel(nn.Module):
 
     def __init__(
         self,
-        autoencoder: LSTMAutoencoder,
+        autoencoder: TemporalAutoencoder,
         dynamics: HamiltonianFlowModel | None = None,
         data_config: dict | None = None,
     ):
