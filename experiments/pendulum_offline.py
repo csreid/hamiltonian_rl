@@ -1,4 +1,4 @@
-"""Offline Pendulum world-model training — two-phase regimen.
+"""Offline Pendulum world-model training — three-phase regimen.
 
 Phase 1 (phase1 subcommand):
     Train the LSTM autoencoder (encoder + f_psi + decoder) for reconstruction.
@@ -28,7 +28,30 @@ Phase 2 (phase2 subcommand):
     Saves a complete world-model checkpoint (autoencoder + dynamics): the one
     file the dashboard needs.
 
-Inference (dreaming) after both phases:
+Phase 3 (phase3 subcommand):
+    Load a complete Phase 2 world model and finetune everything end-to-end
+    (encoder + f_psi + decoder + phi + H + R/B) through the full dreaming
+    pipeline. The primary objective is pixel-space: dreamed frames (encode
+    context → phi → Hamiltonian rollout → phi⁻¹ → f_psi → decoder) against
+    ground-truth frames — the first time the quantity we actually care about
+    at inference is optimised directly, and the only place the encoder can be
+    pulled toward producing a *predictable* h (Phases 1-2 only measure the
+    representation/dynamics mismatch; they can't fix it).
+
+    Guard rails against representation collapse (with the encoder unfrozen, a
+    latent-space loss whose target is also encoder output is minimised by
+    shrinking h):
+      - the Phase-1 reconstruction loss stays on as an anchor — the encoder
+        must keep explaining the pixels, so it can't throw information away;
+      - the h-space teacher-forced/closed-loop losses are kept as denser
+        signals but with stop-grad targets, so gradients flow only through
+        the prediction path;
+      - much lower default LR than Phases 1-2, per-module param groups, and
+        --freeze-physics / --freeze-encoder switches for constrained runs.
+    h is used deterministically (h = mu, no reparameterization/KL), matching
+    how the encoder is consumed in Phase 2 and at inference.
+
+Inference (dreaming) — same pipeline after Phase 2 or Phase 3:
     h_0  = encoder(frame_0..frame_{ctx-1})              [Phase 1 encoder]
     q, p = Phi(h_{ctx-1})                               [Phase 2 forward]
     q_k, p_k = HamiltonianRollout(q, p, actions)        [Phase 2 dynamics]
@@ -1552,13 +1575,242 @@ def _log_phase_space_regression_phase2(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: end-to-end finetuning
+# ---------------------------------------------------------------------------
+
+
+def _train_epoch_phase3(
+    world_model: WorldModel,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    grad_clip: float,
+    device: torch.device,
+    seq_len: int,
+    seed_ctx_len: int,
+    logdet_weight: float,
+    recon_weight: float,
+    pixel_cl_weight: float,
+    h_tf_weight: float,
+    h_cl_weight: float,
+    closed_loop_gamma: float,
+    decode_stride: int = 1,
+) -> dict[str, float]:
+    """End-to-end epoch: every module trains through the full dreaming pipeline.
+
+    Window sampling matches Phase 2 (one random [s, s+ctx+T) window shared
+    across the batch, fresh LSTM state at s), but the encoder now runs WITH
+    gradients and h = mu is used deterministically (no reparameterization/KL),
+    matching how the encoder is consumed in Phase 2 and at inference.
+
+    Losses:
+      recon     pixel MSE decoding the encoded h at each window frame — the
+                anti-collapse anchor: the encoder must keep explaining the
+                pixels, so it cannot shrink h to make dynamics trivially easy.
+      pixel_cl  the dreaming objective: closed-loop rollout from the end of
+                context, decoded to pixels, vs. ground-truth frames.
+      tf_h/cl_h the Phase-2 h-space losses, kept as denser training signal
+                but with STOP-GRAD targets — with the encoder unfrozen, a
+                loss of the form MSE(pred, encoder(frames)) whose gradient
+                also flows into the target is minimised by collapsing h;
+                detaching the target restricts gradients to the prediction
+                path. (The targets still drift as the encoder updates across
+                steps; recon + pixel_cl are what anchor that slow direction.)
+      logdet    same near-volume-preservation regulariser on phi as Phase 2.
+
+    closed_loop_gamma discounts later rollout steps exactly as in Phase 2.
+    decode_stride > 1 decodes only every decode_stride-th window frame (recon)
+    and rollout step (pixel_cl) to bound decoder activation memory at long
+    curriculum horizons; the h-space losses still cover every step.
+    """
+    world_model.train()
+    ae = world_model.autoencoder
+    dyn = world_model.dynamics
+    q_dim = dyn.latent_dim // 2
+    ctx = seed_ctx_len
+    total_loss = total_recon = total_pix_cl = total_tf = total_cl_h = 0.0
+    total_logdet = total_q_var = total_p_var = 0.0
+
+    for frames, actions, _states in loader:
+        actions = actions.to(device)  # (B, T_full)
+        B_size = frames.shape[0]
+        T_full = actions.shape[1]
+
+        # --- Sample one random window [s, s+ctx+T), shared across the batch ---
+        T = max(min(seq_len, T_full - ctx + 1), 1)
+        W = ctx + T
+        max_s = T_full + 1 - W
+        s = int(torch.randint(0, max_s + 1, (1,)).item()) if max_s > 0 else 0
+
+        frames_win = frames[:, s:s + W].to(device)    # (B, W, C, H, W)
+        actions_win = actions[:, s:s + W - 1]          # (B, W-1)
+
+        # --- Encode with grad; deterministic h = mu ---
+        h_all, _ = ae.encoder.forward_all(frames_win)  # (B, W, D)
+        D = h_all.shape[-1]
+        h_flat = h_all.reshape(B_size * W, D)
+
+        # --- Reconstruction anchor ---
+        rec_idx = torch.arange(0, W, decode_stride, device=device)
+        h_rec = h_all[:, rec_idx].reshape(B_size * len(rec_idx), D)
+        s_psi = ae.f_psi(h_rec)
+        recon_pred = ae.decoder(s_psi[:, :q_dim])
+        recon_target = frames_win[:, rec_idx].reshape(
+            B_size * len(rec_idx), *frames_win.shape[2:]
+        )
+        recon = F.mse_loss(recon_pred, recon_target)
+
+        # --- phi over the whole window, with logdet regulariser ---
+        s_flat, log_det_flat = dyn.phi.forward_with_logdet(h_flat)
+        q_all = s_flat[:, :q_dim].reshape(B_size, W, q_dim)
+        p_all = s_flat[:, q_dim:].reshape(B_size, W, q_dim)
+        logdet_metric = log_det_flat.detach().pow(2).mean()  # save before backward
+        logdet_reg = logdet_weight * log_det_flat.pow(2).mean()
+
+        # --- Teacher-forced h-space step at every t (stop-grad targets) ---
+        T_tf = W - 1
+        q_tf = q_all[:, :T_tf].reshape(B_size * T_tf, q_dim)
+        p_tf = p_all[:, :T_tf].reshape(B_size * T_tf, q_dim)
+        a_tf = actions_win.reshape(B_size * T_tf, 1)
+        q_tf_next, p_tf_next = dyn.controlled_step(q_tf, p_tf, a_tf)
+        h_tf_pred = dyn.decode(q_tf_next, p_tf_next)
+        tf_loss = F.mse_loss(h_tf_pred, h_all[:, 1:].reshape(B_size * T_tf, D).detach())
+
+        # --- Closed-loop rollout from the end of context (local index ctx-1) ---
+        k = ctx - 1
+        q, p = q_all[:, k], p_all[:, k]
+        q_k_log, p_k_log = q.detach(), p.detach()  # save before graph is freed
+        qs_steps, ps_steps = [], []
+        for t in range(T):
+            q, p = dyn.controlled_step(q, p, actions_win[:, k + t:k + t + 1])
+            qs_steps.append(q)
+            ps_steps.append(p)
+        q_traj = torch.stack(qs_steps, dim=1)  # (B, T, q_dim)
+        p_traj = torch.stack(ps_steps, dim=1)
+        h_cl_pred = dyn.decode(
+            q_traj.reshape(B_size * T, q_dim), p_traj.reshape(B_size * T, q_dim)
+        ).reshape(B_size, T, D)
+
+        step_weights = closed_loop_gamma ** torch.arange(
+            T, device=device, dtype=h_cl_pred.dtype
+        )
+
+        # h-space closed-loop (stop-grad targets), every step
+        h_cl_target = h_all[:, k + 1:k + 1 + T].detach()
+        per_step_h = (h_cl_pred - h_cl_target).pow(2).mean(dim=(0, 2))  # (T,)
+        cl_h = (per_step_h * step_weights).sum() / step_weights.sum()
+
+        # Pixel closed-loop — the dreaming objective
+        pix_idx = torch.arange(0, T, decode_stride, device=device)
+        h_pix = h_cl_pred[:, pix_idx].reshape(B_size * len(pix_idx), D)
+        s_pix = ae.f_psi(h_pix)
+        frames_cl_pred = ae.decoder(s_pix[:, :q_dim]).reshape(
+            B_size, len(pix_idx), *frames_win.shape[2:]
+        )
+        frames_cl_target = frames_win[:, k + 1:k + 1 + T][:, pix_idx]
+        per_step_pix = (frames_cl_pred - frames_cl_target).pow(2).mean(dim=(0, 2, 3, 4))
+        w_pix = step_weights[pix_idx]
+        pix_cl = (per_step_pix * w_pix).sum() / w_pix.sum()
+
+        loss = (
+            recon_weight * recon
+            + logdet_reg
+            + h_tf_weight * tf_loss
+            + h_cl_weight * cl_h
+            + pixel_cl_weight * pix_cl
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(world_model.parameters(), grad_clip)
+        optimizer.step()
+
+        # Accumulate as tensors — .item() per batch forces a GPU sync each time;
+        # a single sync at epoch end is enough.
+        total_loss = total_loss + loss.detach()
+        total_recon = total_recon + recon.detach()
+        total_pix_cl = total_pix_cl + pix_cl.detach()
+        total_tf = total_tf + tf_loss.detach()
+        total_cl_h = total_cl_h + cl_h.detach()
+        total_logdet = total_logdet + logdet_metric
+        with torch.no_grad():
+            q_var, p_var = _log_latent_variance(
+                torch.cat([q_k_log.unsqueeze(1), q_traj.detach()], dim=1),
+                torch.cat([p_k_log.unsqueeze(1), p_traj.detach()], dim=1),
+            )
+            total_q_var = total_q_var + q_var
+            total_p_var = total_p_var + p_var
+
+    n = len(loader)
+    return {
+        "phase3/loss": float(total_loss) / n,
+        "phase3/recon": float(total_recon) / n,
+        "phase3/cl_pixel": float(total_pix_cl) / n,
+        "phase3/tf_h": float(total_tf) / n,
+        "phase3/cl_h": float(total_cl_h) / n,
+        "phase3/logdet_reg": float(total_logdet) / n,
+        "phase3/q_var": float(total_q_var) / n,
+        "phase3/p_var": float(total_p_var) / n,
+    }
+
+
+@torch.no_grad()
+def _eval_loss_phase3(
+    world_model: WorldModel,
+    val_trajs: list,
+    device: torch.device,
+    dec_chunk: int = 256,
+) -> dict[str, float]:
+    """Pixel-space closed-loop rollout loss over the full horizon.
+
+    Mirrors _eval_loss_phase2's closed-loop rollout (full T_full - 1 steps,
+    all trajectories rolled together, fixed horizon so the metric is
+    comparable across epochs) but scores in pixel space through f_psi +
+    decoder — the quantity Phase 3 actually optimises. Decoding is chunked to
+    bound decoder activation memory.
+    """
+    world_model.eval()
+    ae, dyn = world_model.autoencoder, world_model.dynamics
+    q_dim = dyn.latent_dim // 2
+
+    h_all, actions_all = _encode_val_h(ae, val_trajs, device)
+    N = h_all.shape[0]
+    T_full = actions_all.shape[1]
+    n_steps = T_full - 1
+    if n_steps <= 0:
+        return {}
+
+    q, p = dyn.encode(h_all[:, 1])
+    qs_steps, ps_steps = [], []
+    for t in range(n_steps):
+        q, p = dyn.controlled_step(q, p, actions_all[:, 1 + t: 2 + t])
+        qs_steps.append(q)
+        ps_steps.append(p)
+    q_traj = torch.stack(qs_steps, dim=1).reshape(N * n_steps, q_dim)
+    p_traj = torch.stack(ps_steps, dim=1).reshape(N * n_steps, q_dim)
+    h_cl = dyn.decode(q_traj, p_traj)  # (N * n_steps, D)
+
+    gt = torch.stack([t[0] for t in val_trajs])[:, 2:2 + n_steps]  # CPU (N, n, C, H, W)
+    gt_flat = gt.reshape(N * n_steps, *gt.shape[2:])
+
+    total_sq = 0.0
+    for i in range(0, N * n_steps, dec_chunk):
+        s_psi = ae.f_psi(h_cl[i:i + dec_chunk])
+        pred = ae.decoder(s_psi[:, :q_dim])
+        total_sq += F.mse_loss(
+            pred, gt_flat[i:i + dec_chunk].to(device), reduction="sum"
+        ).item()
+    return {"phase3/val_pixel_cl": total_sq / gt_flat.numel()}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
 @click.group()
 def cli():
-    """Offline Pendulum world-model training (two phases)."""
+    """Offline Pendulum world-model training (three phases)."""
     pass
 
 
@@ -2254,6 +2506,408 @@ def phase2_cmd(**kwargs):
         ):
             world_model.save(run_dir, "best", hparams, metrics, epoch)
             best_loss = metrics["phase2/dynamics"]
+
+    world_model.save(run_dir, "final", hparams, metrics, epoch)
+
+    print(f"\nTo run Phase 3:\n  uv run python experiments/pendulum_offline.py phase3 --phase2-run {run_dir}")
+
+    writer.close()
+    print("\nDone. Run: tensorboard --logdir runs")
+    os._exit(0)
+
+
+@cli.command("phase3")
+# input — everything (arch, data params, both sets of weights) comes from the
+# Phase 2 checkpoint; the episode cache is found via the Phase 1 run recorded
+# in its hparams
+@click.option("--phase2-run", type=str, required=True,
+              help="Path to a Phase 2 run directory; loads best.pt (full world model: "
+                   "autoencoder + dynamics weights and configs)")
+@click.option("--phase2-checkpoint", type=str, default=None,
+              help="Override the Phase 2 checkpoint (default: {phase2-run}/best.pt, "
+                   "falling back to final.pt)")
+@click.option("--episode-cache", type=str, default=None,
+              help="Override the episode cache path (default: episodes_cache.pt in the "
+                   "Phase 1 run recorded in the Phase 2 checkpoint's hparams)")
+# training
+@click.option("--epochs", type=int, default=1000, show_default=True)
+@click.option("--batch-size", type=int, default=8, show_default=True,
+              help="May need lowering at long curriculum horizons — unlike Phase 2, the "
+                   "encoder and decoder graphs are alive through the whole window")
+@click.option("--lr", type=float, default=1e-5, show_default=True,
+              help="Finetuning LR for f_psi/decoder/phi/H — deliberately much lower than "
+                   "Phases 1-2 so end-to-end co-adaptation refines rather than wrecks "
+                   "the structure each phase already learned")
+@click.option("--encoder-lr", type=float, default=None,
+              help="LR for the encoder (default: same as --lr)")
+@click.option("--structural-lr", type=float, default=1e-4, show_default=True,
+              help="LR for the R/B structure matrices (learn-structure checkpoints only)")
+@click.option("--freeze-encoder", is_flag=True, default=False, show_default=True,
+              help="Keep the Phase-1 encoder frozen; finetunes decoder/flows/dynamics "
+                   "only (useful when the fold/Markov probes say the representation "
+                   "is fine and the win is decoder drift-tolerance)")
+@click.option("--freeze-physics", is_flag=True, default=False, show_default=True,
+              help="Freeze H and R/B; finetunes only encoder/f_psi/decoder/phi, provably "
+                   "preserving the learned energy landscape and dissipation")
+@click.option("--grad-clip", type=float, default=1.0, show_default=True)
+# loss weights
+@click.option("--recon-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the Phase-1-style reconstruction anchor (collapse guard; "
+                   "0 disables at your own risk)")
+@click.option("--pixel-cl-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the pixel-space closed-loop (dreaming) loss")
+@click.option("--h-tf-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the h-space teacher-forced loss (stop-grad targets)")
+@click.option("--h-cl-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the h-space closed-loop loss (stop-grad targets)")
+@click.option("--logdet-weight", type=float, default=1e-3, show_default=True,
+              help="Weight on log|det J_Phi|^2 regulariser; keeps flow near-volume-preserving")
+@click.option("--closed-loop-gamma", type=float, default=1.0, show_default=True,
+              help="Exponential discount over closed-loop rollout steps (both h-space "
+                   "and pixel), as in Phase 2")
+@click.option("--decode-stride", type=int, default=1, show_default=True,
+              help="Decode only every Nth window frame (recon) and rollout step "
+                   "(pixel loss) to bound decoder memory at long horizons; h-space "
+                   "losses still cover every step")
+# curriculum
+@click.option("--seed-ctx-len", type=int, default=3, show_default=True,
+              help="Frames of context encoded before each closed-loop seed (as Phase 2)")
+@click.option("--seq-len-start", type=int, default=5, show_default=True,
+              help="Initial closed-loop rollout length for curriculum")
+@click.option("--seq-len-advance-threshold", type=float, default=2e-3, show_default=True,
+              help="Pixel closed-loop EMA loss below which rollout length advances by 1 "
+                   "(pixel MSE scale — not comparable to Phase 2's h-space threshold)")
+@click.option("--ema-alpha", type=float, default=0.99, show_default=True)
+@click.option("--convergence-patience", type=int, default=0, show_default=True,
+              help="Epochs of stable EMA before stopping; 0 disables")
+@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True)
+# logging
+@click.option("--log-every", type=int, default=5, show_default=True)
+@click.option("--val-every", type=int, default=10, show_default=True,
+              help="Epochs between validation logs (0 to disable)")
+@click.option("--n-val-episodes", type=int, default=-1, show_default=True,
+              help="Val episodes per type (-1 = phase1 n_episodes // 2)")
+@click.option("--val-max-steps", type=int, default=0, show_default=True,
+              help="Steps per val episode (0 = 2x phase1 max_steps)")
+@click.option("--val-context-frames", type=int, default=5, show_default=True,
+              help="Context frames fed to encoder before dreaming rollout")
+@click.option("--checkpoint-every", type=int, default=10, show_default=True)
+def phase3_cmd(**kwargs):
+    """Phase 3: finetune the whole world model end-to-end through the dream pipeline."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    print(f"Device: {device}")
+
+    run2 = Path(kwargs["phase2_run"])
+    if kwargs["phase2_checkpoint"]:
+        phase2_ckpt = Path(kwargs["phase2_checkpoint"])
+    else:
+        phase2_ckpt = run2 / "best.pt"
+        if not phase2_ckpt.exists():
+            phase2_ckpt = run2 / "final.pt"
+    if not phase2_ckpt.exists():
+        raise click.UsageError(
+            f"No Phase 2 checkpoint found in {run2} (expected best.pt or final.pt)."
+        )
+
+    # Peek at the checkpoint payload for the Phase 1 run path (episode cache
+    # default) and to fail early on a Phase 1-only checkpoint.
+    payload = torch.load(phase2_ckpt, map_location="cpu", weights_only=True)
+    if payload.get("dynamics") is None:
+        raise click.UsageError(
+            f"{phase2_ckpt} has no dynamics weights (Phase 1-only checkpoint); "
+            "Phase 3 needs a complete Phase 2 world model."
+        )
+    phase1_run = (payload.get("hparams") or {}).get("phase1_run")
+    del payload
+
+    if kwargs["episode_cache"]:
+        episode_cache_path = Path(kwargs["episode_cache"])
+    elif phase1_run:
+        episode_cache_path = Path(phase1_run) / "episodes_cache.pt"
+    else:
+        raise click.UsageError(
+            f"{phase2_ckpt} records no phase1_run in its hparams; "
+            "pass --episode-cache explicitly."
+        )
+    if not episode_cache_path.exists():
+        raise click.UsageError(
+            f"Episode cache not found at {episode_cache_path}. "
+            "Pass --episode-cache explicitly."
+        )
+
+    writer = SummaryWriter(comment="_pendulum_offline_phase3")
+    run_dir = make_run_dir("pendulum_offline_phase3")
+
+    print(f"Loading Phase 2 checkpoint from {phase2_ckpt}...")
+    world_model = load_world_model(phase2_ckpt, device)
+    phase1_model = world_model.autoencoder
+    dyn_model = world_model.dynamics
+    data_cfg = world_model.data_config
+    print("World-model config: " + ", ".join(
+        f"{k}={v}" for k, v in {**phase1_model.config, **dyn_model.config, **data_cfg}.items()
+    ))
+
+    print(f"Loading episode cache from {episode_cache_path}...")
+    episodes = torch.load(episode_cache_path, weights_only=False)
+
+    # Collect val episodes (only if validation logs are enabled)
+    train_sample_trajs = []
+    val_energy, val_random, val_spin = [], [], []
+    energy_grid_episodes = []
+    if kwargs["val_every"] > 0:
+        n_val = kwargs["n_val_episodes"]
+        if n_val < 0:
+            n_val = data_cfg.get("n_episodes", 200) // 2
+        val_steps = kwargs["val_max_steps"] or data_cfg.get("max_steps", 200) * 2
+        img_size = data_cfg.get("img_size", 64)
+        damping = data_cfg.get("damping", 0.0)
+        print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
+        val_energy = collect_val_trajectories(
+            n_episodes=n_val, img_size=img_size,
+            max_steps=val_steps, energy_k=data_cfg.get("energy_k", 1.0),
+            damping=damping,
+        )
+        val_random = collect_random_trajectories(
+            n_episodes=n_val, img_size=img_size,
+            max_steps=val_steps, damping=damping,
+        )
+        val_spin = collect_spin_trajectories(
+            n_episodes=n_val, img_size=img_size,
+            max_steps=val_steps, damping=damping,
+        )
+        print("Collecting 3 training-distribution episodes for video logging...")
+        train_sample_trajs = collect_data(
+            n_episodes=3,
+            img_size=img_size,
+            epsilon=data_cfg.get("epsilon", 0.1),
+            energy_k=data_cfg.get("energy_k", 1.0),
+            max_steps=data_cfg.get("max_steps", 200),
+            damping=damping,
+        )
+        print("Collecting grid episodes for energy-landscape logging...")
+        energy_grid_episodes = _collect_energy_grid_episodes(
+            img_size=img_size, damping=damping, context_frames=kwargs["val_context_frames"],
+        )
+
+    episode_dataset = PendulumDataset(episodes)
+    episode_loader = DataLoader(
+        episode_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
+        pin_memory=device.type == "cuda",
+    )
+    print(f"Episode dataset: {len(episode_dataset)} episodes")
+
+    # Freezing + per-module param groups. requires_grad_(False) (not just
+    # optimizer exclusion) so autograd skips the frozen subgraphs entirely.
+    if kwargs["freeze_encoder"]:
+        phase1_model.encoder.requires_grad_(False)
+    if kwargs["freeze_physics"]:
+        dyn_model.hamiltonian.requires_grad_(False)
+        if dyn_model.learn_structure:
+            for prm in dyn_model.structural_parameters():
+                prm.requires_grad_(False)
+
+    encoder_lr = kwargs["encoder_lr"] if kwargs["encoder_lr"] is not None else kwargs["lr"]
+    # next_frame_decoder is deliberately absent: no Phase 3 loss touches it.
+    groups = []
+    if not kwargs["freeze_encoder"]:
+        groups.append({"params": list(phase1_model.encoder.parameters()), "lr": encoder_lr})
+    groups.append({
+        "params": (
+            list(phase1_model.f_psi.parameters())
+            + list(phase1_model.decoder.parameters())
+            + list(dyn_model.phi.parameters())
+        ),
+        "lr": kwargs["lr"],
+    })
+    if not kwargs["freeze_physics"]:
+        groups.append({"params": list(dyn_model.hamiltonian.parameters()), "lr": kwargs["lr"]})
+        if dyn_model.learn_structure:
+            groups.append({
+                "params": dyn_model.structural_parameters(),
+                "lr": kwargs["structural_lr"],
+            })
+    optimizer = torch.optim.Adam(groups)
+    n_trainable = sum(p.numel() for g in groups for p in g["params"])
+    print(f"Phase 3 trainable parameters: {n_trainable:,}")
+
+    hparams = {
+        **kwargs,
+        "phase1_config": {**phase1_model.config, **data_cfg},
+        "phase2_config": dict(dyn_model.config),
+    }
+    _log_hparams_text(writer, hparams)
+    _log_hparams_table(writer, hparams, {})
+
+    episode_len = episodes[0][1].shape[0]  # actions per episode
+    full_seq_len = episode_len - kwargs["seed_ctx_len"] + 1
+    seq_len = kwargs["seq_len_start"]
+    ema_loss = None
+    ema_cl = None   # EMA of the PIXEL closed-loop loss — gates seq_len curriculum
+    best_loss = float("inf")
+    converge_streak = 0
+
+    print("\n=== Phase 3: end-to-end finetuning ===")
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 3"):
+        metrics = _train_epoch_phase3(
+            world_model=world_model,
+            loader=episode_loader,
+            optimizer=optimizer,
+            grad_clip=kwargs["grad_clip"],
+            device=device,
+            seq_len=seq_len,
+            seed_ctx_len=kwargs["seed_ctx_len"],
+            logdet_weight=kwargs["logdet_weight"],
+            recon_weight=kwargs["recon_weight"],
+            pixel_cl_weight=kwargs["pixel_cl_weight"],
+            h_tf_weight=kwargs["h_tf_weight"],
+            h_cl_weight=kwargs["h_cl_weight"],
+            closed_loop_gamma=kwargs["closed_loop_gamma"],
+            decode_stride=kwargs["decode_stride"],
+        )
+
+        alpha = kwargs["ema_alpha"]
+        prev_ema = ema_loss
+        ema_loss = (
+            metrics["phase3/loss"]
+            if ema_loss is None
+            else alpha * ema_loss + (1.0 - alpha) * metrics["phase3/loss"]
+        )
+        ema_cl = (
+            metrics["phase3/cl_pixel"]
+            if ema_cl is None
+            else alpha * ema_cl + (1.0 - alpha) * metrics["phase3/cl_pixel"]
+        )
+
+        if prev_ema is not None and kwargs["convergence_patience"] > 0:
+            rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
+            if rel_change < kwargs["convergence_threshold"]:
+                converge_streak += 1
+                if converge_streak >= kwargs["convergence_patience"]:
+                    tqdm.write(
+                        f"  Phase 3 converged at epoch {epoch + 1}"
+                        f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+                    )
+                    break
+            else:
+                converge_streak = 0
+
+        # Gate seq_len curriculum on the pixel closed-loop EMA — the loss whose
+        # horizon actually grows with seq_len.
+        if ema_cl < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
+            seq_len += 1
+
+        if (epoch + 1) % kwargs["log_every"] == 0:
+            for k, v in metrics.items():
+                writer.add_scalar(k, v, epoch)
+            writer.add_scalar("phase3/seq_len", seq_len, epoch)
+            writer.add_scalar("phase3/ema_loss", ema_loss, epoch)
+            writer.add_scalar("phase3/ema_cl_pixel", ema_cl, epoch)
+            if dyn_model.learn_structure:
+                writer.add_scalar(
+                    "phase3/structure/B_norm",
+                    dyn_model.get_B().norm().item(),
+                    epoch,
+                )
+            tqdm.write(
+                f"  epoch {epoch + 1:4d}"
+                f"  seq_len={seq_len:3d}"
+                f"  loss={metrics['phase3/loss']:.4f}"
+                f"  recon={metrics['phase3/recon']:.4f}"
+                f"  cl_pix={metrics['phase3/cl_pixel']:.4f}"
+                f"  ema_cl_pix={ema_cl:.4f}"
+                f"  tf_h={metrics['phase3/tf_h']:.4f}"
+                f"  cl_h={metrics['phase3/cl_h']:.4f}"
+                f"  logdet={metrics['phase3/logdet_reg']:.4f}"
+            )
+
+        if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
+            # Full Phase-2 diagnostic suite: end-to-end co-adaptation can trade
+            # the learned physics for pixel accuracy, and these are how you see
+            # it happening (energy-landscape r, dissipation r, R structure).
+            _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
+            energy_fig = _plot_learned_energy_landscape(
+                world_model, energy_grid_episodes, device=device,
+            )
+            writer.add_figure("val/energy_landscape", energy_fig, epoch)
+            plt.close(energy_fig)
+            if dyn_model._has_dissipation:
+                dissipation_fig = _plot_dissipation_landscape(
+                    world_model,
+                    energy_grid_episodes,
+                    damping=data_cfg.get("damping", 0.0),
+                    drag=data_cfg.get("drag", _DRAG_COEFF),
+                    device=device,
+                )
+                writer.add_figure("val/dissipation_landscape", dissipation_fig, epoch)
+                plt.close(dissipation_fig)
+            policy_val_trajs = (
+                (val_energy, "energy_pump"),
+                (val_random, "random"),
+                (val_spin, "spin"),
+            )
+            for val_trajs, label in policy_val_trajs:
+                if not val_trajs:
+                    continue
+                val_metrics = {
+                    **_eval_loss_phase1(phase1_model, val_trajs, device),
+                    **_eval_loss_phase2(world_model, val_trajs, device),
+                    **_eval_loss_phase3(world_model, val_trajs, device),
+                }
+                for k, v in val_metrics.items():
+                    writer.add_scalar(f"{k}/{label}", v, epoch)
+                _log_phase_space_regression_phase2(
+                    world_model=world_model,
+                    val_trajs=val_trajs,
+                    device=device,
+                    writer=writer,
+                    epoch=epoch,
+                    tag=f"val/phase_space_regression/{label}",
+                )
+                _log_dreamed_video_phase2(
+                    world_model=world_model,
+                    val_traj=val_trajs[0],
+                    writer=writer,
+                    epoch=epoch,
+                    seq_len=seq_len,
+                    context_frames=kwargs["val_context_frames"],
+                    tag=f"val/dreamed_phase3/{label}",
+                )
+            # Representation-drift probes: with the encoder unfrozen these are
+            # the direct read on whether Phase 3 is fixing the Markov mismatch
+            # (fold scores dropping) or collapsing h (latent R² degrading).
+            scatter_sets = [(vt, label) for vt, label in policy_val_trajs if len(vt) >= 2]
+            if scatter_sets:
+                _log_latent_scatter_phase1(
+                    model=phase1_model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+                _log_latent_distribution_phase1(
+                    model=phase1_model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+            _log_markov_pairwise_probe_phase1(
+                model=phase1_model, val_traj_sets=policy_val_trajs,
+                device=device, writer=writer, epoch=epoch,
+            )
+            for i, train_traj in enumerate(train_sample_trajs):
+                _log_dreamed_video_phase2(
+                    world_model=world_model,
+                    val_traj=train_traj,
+                    writer=writer,
+                    epoch=epoch,
+                    seq_len=seq_len,
+                    context_frames=kwargs["val_context_frames"],
+                    tag=f"train/dreamed_phase3/sample_{i}",
+                )
+
+        if (
+            kwargs["checkpoint_every"] > 0
+            and (epoch + 1) % kwargs["checkpoint_every"] == 0
+            and metrics["phase3/loss"] < best_loss
+        ):
+            world_model.save(run_dir, "best", hparams, metrics, epoch)
+            best_loss = metrics["phase3/loss"]
 
     world_model.save(run_dir, "final", hparams, metrics, epoch)
 
