@@ -63,6 +63,7 @@ from data.pendulum import (
     collect_spin_trajectories,
     collect_val_trajectories,
     collect_zero_trajectories_targeted,
+    _DRAG_COEFF,
     _G,
     _MAX_SPEED,
 )
@@ -1218,7 +1219,14 @@ def _train_epoch_phase2(
         if structural_reg_weight > 0 and dyn_model.learn_structure:
             # J is a fixed buffer in HamiltonianFlowModel — only R is learned,
             # so penalizing ‖J‖² would just add a constant 2·q_dim to the loss.
-            struct_reg = dyn_model.get_R_pp().pow(2).sum()
+            if dyn_model.state_dep_r:
+                # Penalize R at the batch's own phase-space points (detached so
+                # the penalty shapes r_net, not phi), mean over samples so the
+                # weight is comparable to the constant-R Frobenius penalty.
+                z_r = torch.cat([q_all, p_all], dim=-1).reshape(-1, D).detach()
+                struct_reg = dyn_model.get_R_pp(z_r).pow(2).sum(dim=(-2, -1)).mean()
+            else:
+                struct_reg = dyn_model.get_R_pp().pow(2).sum()
             loss = loss + structural_reg_weight * struct_reg
             total_struct_reg = total_struct_reg + struct_reg.detach()
 
@@ -1349,21 +1357,90 @@ def _log_structural_matrices_phase2(
     writer: SummaryWriter,
     epoch: int,
 ) -> None:
+    """With state-dependent R, the logged R is the z = 0 baseline (r_net bias)."""
     J = dyn_model.get_J().cpu()
     R = dyn_model.get_R().cpu()
+    R_name = "R(z=0)" if dyn_model.state_dep_r else "R"
     writer.add_scalar("phase2/structure/J_frob", J.pow(2).sum().sqrt().item(), epoch)
     writer.add_scalar("phase2/structure/R_frob", R.pow(2).sum().sqrt().item(), epoch)
     writer.add_histogram("phase2/structure/R_eigenvalues", torch.linalg.eigvalsh(R), epoch)
-    for name, mat in (("J", J), ("R", R)):
+    for name, title, mat in (("J", "J", J), ("R", R_name, R)):
         fig, ax = plt.subplots(figsize=(4, 4))
         m = mat.numpy()
         vmax = max(abs(m.max()), abs(m.min()), 1e-6)
         im = ax.imshow(m, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(f"{name} (epoch {epoch + 1})")
+        ax.set_title(f"{title} (epoch {epoch + 1})")
         fig.tight_layout()
         writer.add_figure(f"phase2/structure/{name}", fig, epoch)
         plt.close(fig)
+
+
+def _plot_dissipation_landscape(
+    model: WorldModel,
+    episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    damping: float,
+    drag: float,
+    device: torch.device | None = None,
+) -> plt.Figure:
+    """Compare the learned energy-dissipation rate against the true one on the phase-space grid.
+
+    The port-Hamiltonian energy balance gives the learned model's dissipation
+    rate at a state as −Ḣ = ∇ₚHᵀ R_pp(z) ∇ₚH (zero control).  The env's true
+    rate is damping·θ̇² + drag·|θ̇|³ — the drag term is what a constant R
+    cannot express, since its rate is forced to be quadratic in ∇ₚH.
+
+    Like the energy-landscape plot, H (hence its gradient and R's scale) is
+    only identified up to affine/scale factors, so the two panels use
+    independent color scales and agreement is summarized by Pearson r on the
+    log-rates (log because both rates span decades from the origin outward;
+    a tiny floor keeps the θ̇ ≈ 0 samples finite).
+    """
+    model.eval()
+    if device is None:
+        device = next(model.autoencoder.parameters()).device
+    dyn = model.dynamics
+
+    samples = _collect_grid_qp_samples(model, episodes, device=device)
+    q = samples["q"].to(device)
+    p = samples["p"].to(device)
+    with torch.enable_grad():
+        z = torch.cat([q, p], dim=-1).requires_grad_(True)
+        q_dim = dyn.latent_dim // 2
+        H_val = dyn.hamiltonian(z[:, :q_dim], z[:, q_dim:]).sum()
+        g_p = torch.autograd.grad(H_val, z)[0][:, q_dim:]
+    with torch.no_grad():
+        R_pp = dyn.get_R_pp(z.detach() if dyn.state_dep_r else None)
+        Rg = g_p @ R_pp if R_pp.dim() == 2 else (R_pp @ g_p.unsqueeze(-1)).squeeze(-1)
+        rate_learned = (g_p * Rg).sum(dim=-1).cpu().numpy()
+
+    theta = samples["theta"].numpy()
+    theta_dot = samples["theta_dot"].numpy()
+    rate_true = damping * theta_dot**2 + drag * np.abs(theta_dot) ** 3
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    for ax, rate, label in (
+        (axes[0], rate_true, "true rate: damping·θ̇² + drag·|θ̇|³"),
+        (axes[1], rate_learned, "learned rate: ∇ₚHᵀ R_pp(z) ∇ₚH"),
+    ):
+        sc = ax.scatter(theta, theta_dot, c=rate, cmap="magma", s=30)
+        fig.colorbar(sc, ax=ax, label="−Ḣ", pad=0.02)
+        ax.set_xlabel("θ (rad)")
+        ax.set_ylabel("θ̇ (rad/s)")
+        ax.set_title(label)
+
+    eps = 1e-8
+    log_true = np.log10(rate_true + eps)
+    log_learned = np.log10(np.maximum(rate_learned, 0.0) + eps)
+    r = np.corrcoef(log_true, log_learned)[0, 1] if np.ptp(rate_true) > 0 else float("nan")
+    axes[2].scatter(log_true, log_learned, s=10, alpha=0.6)
+    axes[2].set_xlabel("log₁₀ true rate")
+    axes[2].set_ylabel("log₁₀ learned rate")
+    axes[2].set_title(f"log-rate agreement, Pearson r={r:.3f}")
+
+    fig.suptitle("Energy-dissipation rate: true vs. learned R")
+    fig.tight_layout()
+    return fig
 
 
 @torch.no_grad()
@@ -1803,6 +1880,11 @@ def phase1_cmd(**kwargs):
               help="Use a separable Hamiltonian H = T(p) + V(q); required for --integrator leapfrog")
 @click.option("--learn-structure/--no-learn-structure", default=True, show_default=True,
               help="Learn R/B matrices; --no-learn-structure fixes R from the data damping, B=1")
+@click.option("--state-dep-r/--no-state-dep-r", default=False, show_default=True,
+              help="Parameterize the dissipation R as a function of the latent phase-space "
+                   "point z = (q, p) via a small MLP (R_pp(z) = L(z)L(z)ᵀ, PSD everywhere) "
+                   "instead of a constant matrix — needed for state-dependent dissipation "
+                   "like the env's quadratic drag. Requires --learn-structure.")
 @click.option("--integrator", type=click.Choice(["rk4", "leapfrog"]), default="leapfrog",
               show_default=True,
               help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
@@ -1975,6 +2057,7 @@ def phase2_cmd(**kwargs):
         damping=data_cfg.get("damping", 0.0),
         integrator=kwargs["integrator"],
         quadratic_t=kwargs["quadratic_t"],
+        state_dep_r=kwargs["state_dep_r"],
     ).to(device)
     print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
 
@@ -2000,7 +2083,7 @@ def phase2_cmd(**kwargs):
                 "lr": kwargs["lr"],
             },
             {
-                "params": [dyn_model.L_param, dyn_model.B],
+                "params": dyn_model.structural_parameters(),
                 "lr": kwargs["structural_lr"],
             },
         ])
@@ -2106,6 +2189,16 @@ def phase2_cmd(**kwargs):
             )
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
             plt.close(energy_fig)
+            if dyn_model._has_dissipation:
+                dissipation_fig = _plot_dissipation_landscape(
+                    world_model,
+                    energy_grid_episodes,
+                    damping=data_cfg.get("damping", 0.0),
+                    drag=data_cfg.get("drag", _DRAG_COEFF),
+                    device=device,
+                )
+                writer.add_figure("val/dissipation_landscape", dissipation_fig, epoch)
+                plt.close(dissipation_fig)
             for val_trajs, label in (
                 (val_energy, "energy_pump"),
                 (val_random, "random"),

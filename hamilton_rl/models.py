@@ -12,7 +12,8 @@ Two independently trained halves plus a wrapper that stitches them:
         phi                 normalizing flow h ↔ (q, p)
         hamiltonian         H(q, p), optionally separable T(p) + V(q)
         J/R/B               canonical symplectic J; learned or fixed dissipation
-                            and control matrices.  dz/dt = (J − R) ∇H(z) + B u
+                            (optionally state-dependent, R = R(z)) and control
+                            matrices.  dz/dt = (J − R(z)) ∇H(z) + B u
 
     WorldModel            autoencoder + dynamics; owns the dreaming stitch and
                           single-file checkpoint save/load.
@@ -540,7 +541,7 @@ class HamiltonianFlowModel(nn.Module):
     Completely separate from Phase 1 (LSTMAutoencoder). Takes precomputed
     LSTM encoder outputs h_t as input — no encoder or decoder.
 
-    The controlled ODE integrated with RK4: dz/dt = (J − R) ∇H(z) + B u
+    The controlled ODE integrated with RK4: dz/dt = (J − R(z)) ∇H(z) + B u
 
     Args:
         latent_dim:      dimension of h_t (= LSTMAutoencoder.latent_dim)
@@ -551,6 +552,13 @@ class HamiltonianFlowModel(nn.Module):
         damping:         diagonal dissipation for fixed R (only when not learn_structure)
         quadratic_t:     if True (requires separable), kinetic energy is a PSD
                          quadratic form T(p) = ½ pᵀM⁻¹p with learned constant mass
+        state_dep_r:     if True (requires learn_structure), the dissipation
+                         R_pp = L(z) L(z)ᵀ is a function of the phase-space
+                         point z = (q, p) via a small MLP, instead of a
+                         constant matrix.  A constant R can only express
+                         linear (viscous) damping ṗ ∝ −p; state dependence is
+                         needed for e.g. the env's quadratic drag ṗ ∝ −p|p|,
+                         whose effective damping coefficient grows with speed.
     """
 
     def __init__(
@@ -563,6 +571,7 @@ class HamiltonianFlowModel(nn.Module):
         damping: float = 0.0,
         integrator: str = "rk4",
         quadratic_t: bool = False,
+        state_dep_r: bool = False,
     ):
         super().__init__()
         if integrator not in ("rk4", "leapfrog"):
@@ -572,11 +581,14 @@ class HamiltonianFlowModel(nn.Module):
                 "leapfrog requires a separable Hamiltonian H = T(p) + V(q); "
                 "pass separable=True or use integrator='rk4'."
             )
+        if state_dep_r and not learn_structure:
+            raise ValueError("state_dep_r requires learn_structure=True")
         self.latent_dim = latent_dim
         self.dt = dt
         self.learn_structure = learn_structure
         self.separable = separable
         self.integrator = integrator
+        self.state_dep_r = state_dep_r
         self.config = {
             "latent_dim": latent_dim,
             "control_dim": control_dim,
@@ -586,6 +598,7 @@ class HamiltonianFlowModel(nn.Module):
             "damping": damping,
             "integrator": integrator,
             "quadratic_t": quadratic_t,
+            "state_dep_r": state_dep_r,
         }
         q_dim = latent_dim // 2
 
@@ -610,8 +623,27 @@ class HamiltonianFlowModel(nn.Module):
             # would break the kinematic identity q̇ = ∂H/∂p — the very thing that
             # makes q "position" — and physical (Rayleigh) damping acts only on
             # momenta, mirroring the fixed-structure branch below.
-            self.L_param = nn.Parameter(torch.zeros(q_dim, q_dim))
-            nn.init.normal_(self.L_param, std=1e-2)
+            if state_dep_r:
+                # L(z): small MLP z = (q, p) → lower-triangular entries, so
+                # R_pp(z) = L(z) L(z)ᵀ is PSD at every state.  The output layer
+                # is zero-initialised: the bias alone then plays the role of
+                # the constant L_param (softplus(0)·I diagonal), so training
+                # starts from exactly the constant-R model and the weights
+                # learn only the state-dependent deviation.
+                n_tril = q_dim * (q_dim + 1) // 2
+                self.r_net = nn.Sequential(
+                    nn.Linear(latent_dim, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, n_tril),
+                )
+                nn.init.zeros_(self.r_net[-1].weight)
+                nn.init.zeros_(self.r_net[-1].bias)
+                self.register_buffer(
+                    "_tril_idx", torch.tril_indices(q_dim, q_dim), persistent=False
+                )
+            else:
+                self.L_param = nn.Parameter(torch.zeros(q_dim, q_dim))
+                nn.init.normal_(self.L_param, std=1e-2)
             self.B = nn.Parameter(torch.zeros(q_dim, control_dim))
             nn.init.normal_(self.B, std=1e-2)
             self._has_dissipation = True
@@ -627,26 +659,48 @@ class HamiltonianFlowModel(nn.Module):
     def get_J(self) -> torch.Tensor:
         return self.J_fixed
 
-    def get_L(self) -> torch.Tensor:
-        """(q_dim, q_dim) Cholesky factor of the momentum-block dissipation."""
-        L_lower = self.L_param.tril(-1)
-        diag_pos = F.softplus(self.L_param.diagonal())
-        return L_lower + torch.diag(diag_pos)
+    def get_L(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Cholesky factor of the momentum-block dissipation.
 
-    def get_R_pp(self) -> torch.Tensor:
-        """(q_dim, q_dim) momentum-block of R — the only part that can be nonzero."""
+        Constant R: (q_dim, q_dim), z is ignored.  State-dependent R: pass the
+        phase-space points z = cat(q, p) of shape (B, latent_dim) to get
+        (B, q_dim, q_dim); z=None evaluates at z = 0 (the constant baseline
+        carried by the r_net output bias) and returns (q_dim, q_dim).
+        """
+        if not self.state_dep_r:
+            L_lower = self.L_param.tril(-1)
+            diag_pos = F.softplus(self.L_param.diagonal())
+            return L_lower + torch.diag(diag_pos)
+        squeeze = z is None
+        if z is None:
+            z = self.J_fixed.new_zeros(1, self.latent_dim)
+        q_dim = self.latent_dim // 2
+        entries = self.r_net(z)  # (B, q_dim*(q_dim+1)//2)
+        L = entries.new_zeros(z.shape[0], q_dim, q_dim)
+        L[:, self._tril_idx[0], self._tril_idx[1]] = entries
+        diag_pos = F.softplus(L.diagonal(dim1=-2, dim2=-1))
+        L = L.tril(-1) + torch.diag_embed(diag_pos)
+        return L.squeeze(0) if squeeze else L
+
+    def get_R_pp(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Momentum-block of R — the only part that can be nonzero.
+
+        (q_dim, q_dim), or (B, q_dim, q_dim) for state-dependent R with z given
+        (see get_L for the z convention).
+        """
         q_dim = self.latent_dim // 2
         if not self.learn_structure:
             return self.R_fixed[q_dim:, q_dim:]
-        L = self.get_L()
-        return L @ L.T
+        L = self.get_L(z)
+        return L @ L.transpose(-2, -1)
 
-    def get_R(self) -> torch.Tensor:
+    def get_R(self, z: torch.Tensor | None = None) -> torch.Tensor:
         if not self.learn_structure:
             return self.R_fixed
         q_dim = self.latent_dim // 2
-        R = self.J_fixed.new_zeros(self.latent_dim, self.latent_dim)
-        R[q_dim:, q_dim:] = self.get_R_pp()
+        R_pp = self.get_R_pp(z)
+        R = R_pp.new_zeros(*R_pp.shape[:-2], self.latent_dim, self.latent_dim)
+        R[..., q_dim:, q_dim:] = R_pp
         return R
 
     def get_B(self) -> torch.Tensor:
@@ -654,8 +708,19 @@ class HamiltonianFlowModel(nn.Module):
             return self.B_fixed
         return self.B
 
-    def get_J_minus_R(self) -> torch.Tensor:
-        return self.get_J() - self.get_R()
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """The learned structure parameters (R and B) — for the structural_lr group."""
+        r_params = (
+            list(self.r_net.parameters()) if self.state_dep_r else [self.L_param]
+        )
+        return r_params + [self.B]
+
+    def _apply_R_pp(self, z: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """R_pp(z) @ v per sample; z = cat(q, p) is only consulted when R is state-dependent."""
+        R_pp = self.get_R_pp(z if self.state_dep_r else None)
+        if R_pp.dim() == 2:
+            return v @ R_pp  # R_pp symmetric
+        return (R_pp @ v.unsqueeze(-1)).squeeze(-1)
 
     # ── Dynamics ────────────────────────────────────────────────────────────
 
@@ -664,23 +729,32 @@ class HamiltonianFlowModel(nn.Module):
         self,
         q: torch.Tensor,
         p: torch.Tensor,
-        M: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(J − R(z)) ∇H at z = (q, p), written out blockwise for canonical J:
+
+            q̇ = ∂H/∂p,   ṗ = −∂H/∂q − R_pp(z) ∂H/∂p
+
+        R is evaluated at the *current* state, so each RK4 stage sees the
+        dissipation appropriate to its own stage point.
+        """
         half = self.latent_dim // 2
         z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
         H_val = self.hamiltonian(z_[:, :half], z_[:, half:]).sum()
         grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
-        dz = torch.einsum("ij,bj->bi", M, grad_H)
-        return dz[:, :half], dz[:, half:]
+        g_q, g_p = grad_H[:, :half], grad_H[:, half:]
+        dq = g_p
+        dp = -g_q
+        if self._has_dissipation:
+            dp = dp - self._apply_R_pp(z_, g_p)
+        return dq, dp
 
     def _controlled_dynamics(
         self,
         q: torch.Tensor,
         p: torch.Tensor,
         u: torch.Tensor,
-        M: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        dq, dp = self._dynamics(q, p, M)
+        dq, dp = self._dynamics(q, p)
         Bu = u @ self.get_B().T
         dp = dp + Bu
         return dq, dp
@@ -709,12 +783,11 @@ class HamiltonianFlowModel(nn.Module):
     def _rk4_step(
         self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Classic 4-stage explicit RK4 on the full field (J − R)∇H + Bu."""
-        M = self.get_J_minus_R()
-        dq1, dp1 = self._controlled_dynamics(q, p, u, M)
-        dq2, dp2 = self._controlled_dynamics(q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u, M)
-        dq3, dp3 = self._controlled_dynamics(q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u, M)
-        dq4, dp4 = self._controlled_dynamics(q + dt * dq3, p + dt * dp3, u, M)
+        """Classic 4-stage explicit RK4 on the full field (J − R(z))∇H + Bu."""
+        dq1, dp1 = self._controlled_dynamics(q, p, u)
+        dq2, dp2 = self._controlled_dynamics(q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u)
+        dq3, dp3 = self._controlled_dynamics(q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u)
+        dq4, dp4 = self._controlled_dynamics(q + dt * dq3, p + dt * dp3, u)
         q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
         p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
         return q_next, p_next
@@ -755,18 +828,36 @@ class HamiltonianFlowModel(nn.Module):
         R acts only on the momentum block, so q is untouched and ṗ = −R_pp ∂H/∂p.
         Only called from the leapfrog path (separable H), so ∂H/∂p = ∇T(p).
 
-        With a quadratic kinetic energy the flow is linear, ṗ = −R_pp M⁻¹ p, and
-        is integrated EXACTLY via a matrix exponential — tau < 0 then gives the
-        exact anti-damping inverse, keeping the damped step exactly reversible.
-        (This also matches the env's exponential damping θ̇ *= exp(−c·dt).)
-        With an MLP kinetic the flow is nonlinear; falls back to explicit Euler,
-        whose tau < 0 step inverts the forward one only to O(tau²).
+        With a constant R and a quadratic kinetic energy the flow is linear,
+        ṗ = −R_pp M⁻¹ p, and is integrated EXACTLY via a matrix exponential —
+        tau < 0 then gives the exact anti-damping inverse, keeping the damped
+        step exactly reversible.  (This also matches the env's exponential
+        damping θ̇ *= exp(−c·dt).)
+
+        With a state-dependent R (still quadratic kinetic) R_pp(z) is frozen at
+        the substep's entry state and the same matrix-exp flow is applied.
+        This is only O(tau²)-accurate in R's state variation, but — unlike an
+        explicit Euler step — remains strictly dissipative for tau > 0 no
+        matter how large R_pp(z) gets, since exp(−tau A) never overshoots
+        through zero.  The tau < 0 substep freezes R at *its* entry state
+        (the damped endpoint), so the inverse is exact only for constant R and
+        O(tau²) otherwise — same order as the MLP-kinetic fallback below.
+
+        With an MLP kinetic the flow is nonlinear; falls back to explicit
+        Euler, whose tau < 0 step inverts the forward one only to O(tau²).
         """
         kin = self.hamiltonian.kinetic
+        z = torch.cat([q, p], dim=-1) if self.state_dep_r else None
+        R_pp = self.get_R_pp(z)
         if isinstance(kin, QuadraticKinetic):
-            A = self.get_R_pp() @ kin.M_inv()
-            return q, p @ torch.matrix_exp(-tau * A).T
-        return q, p - tau * self._grad_T(p) @ self.get_R_pp()  # R_pp symmetric
+            A = R_pp @ kin.M_inv()  # (d, d) or (B, d, d)
+            if A.dim() == 2:
+                return q, p @ torch.matrix_exp(-tau * A).T
+            return q, (torch.matrix_exp(-tau * A) @ p.unsqueeze(-1)).squeeze(-1)
+        g_T = self._grad_T(p)
+        if R_pp.dim() == 2:
+            return q, p - tau * g_T @ R_pp  # R_pp symmetric
+        return q, p - tau * (R_pp @ g_T.unsqueeze(-1)).squeeze(-1)
 
     def _leapfrog_step(
         self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
