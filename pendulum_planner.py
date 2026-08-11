@@ -42,9 +42,10 @@ animated phase-space (theta, theta_dot) comparison: the ground-truth
 trajectory vs. the *actual* physical trajectory of the pendulum under the
 learned controller's actions (both read directly from the real simulator
 state, `env.unwrapped.state`) — the dashed preview lines are the only place
-each side's own model of dynamics (analytic vs. learned, the latter mapped
-to physical coordinates via a linear probe h -> (cos theta, sin theta,
-theta_dot), fit once per checkpoint) shows up.
+each side's own model of dynamics (analytic vs. learned, the latter decoded
+to pixels and mapped to physical coordinates by the CV extractor — soft
+rod-direction centroid + finite-difference velocity, see
+`frames_to_direction`) shows up.
 """
 
 from __future__ import annotations
@@ -338,6 +339,25 @@ def frames_to_direction(frames: torch.Tensor) -> torch.Tensor:
     return v / (v.norm(dim=-1, keepdim=True) + 1e-8)
 
 
+def implied_theta(v: torch.Tensor) -> torch.Tensor:
+    """(B, 2) image-coord direction vectors → (B,) pendulum angles in [-pi, pi]."""
+    return torch.atan2(-v[:, 0], -v[:, 1])
+
+
+def implied_theta_dot(v: torch.Tensor, v_prev: torch.Tensor) -> torch.Tensor:
+    """Wrap-safe finite-difference angular velocity between consecutive directions.
+
+    atan2(cross, dot) of successive unit vectors is the signed angle
+    increment (sign matches theta by the same calibration as
+    `frames_to_direction`); max representable speed is pi/_DT (~62 rad/s),
+    far above anything physical here. Clamped to the display-sanity bound
+    like every other velocity estimate in this app.
+    """
+    cross = v[:, 0] * v_prev[:, 1] - v[:, 1] * v_prev[:, 0]
+    dot = (v * v_prev).sum(dim=-1)
+    return (torch.atan2(cross, dot) / _DT).clamp(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)
+
+
 def _latent_cv_cost_fn(dynamics, autoencoder, q0, p0, v_prev0, action_weight):
     """Imagined-rollout cost via computer vision on the decoded frames.
 
@@ -369,14 +389,8 @@ def _latent_cv_cost_fn(dynamics, autoencoder, q0, p0, v_prev0, action_weight):
             h = dynamics.decode(q, p)
             frame = autoencoder.decode_latent(h)  # (K, C, H, W)
             v = frames_to_direction(frame)
-            theta_hat = torch.atan2(-v[:, 0], -v[:, 1])
-            # Wrap-safe angle increment between consecutive implied
-            # directions; sign matches theta by the same calibration as
-            # frames_to_direction. Max representable speed is pi/_DT
-            # (~62 rad/s), far above anything physical here.
-            cross = v[:, 0] * v_prev[:, 1] - v[:, 1] * v_prev[:, 0]
-            dot = (v * v_prev).sum(dim=-1)
-            theta_dot_hat = (torch.atan2(cross, dot) / _DT).clamp(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)
+            theta_hat = implied_theta(v)
+            theta_dot_hat = implied_theta_dot(v, v_prev)
             v_prev = v
             total = total + theta_hat**2 + 0.1 * theta_dot_hat**2 + action_weight * u.squeeze(-1) ** 2
         return total
@@ -474,20 +488,24 @@ def run_latent_mppi(
             plan_actions.append(mean.clone().cpu())
 
             # Roll the chosen (noise-free) plan forward once, purely to show
-            # "what does the controller currently intend to do" — never executed.
+            # "what does the controller currently intend to do" — never
+            # executed. Physical coordinates are read off each imagined step
+            # by decoding it to pixels and running the CV extractor (see
+            # frames_to_direction), not the linear probe: only one decoder
+            # pass per horizon step here (vs. per-candidate in the pixel/CV
+            # costs), and it keeps the preview honest about what the decoder
+            # actually imagines rather than what the probe extrapolates.
             pq, pp = q.clone(), p.clone()
+            v_prev = frames_to_direction(context[-1].unsqueeze(0).to(device))
             plan_t, plan_td = [], []
             for t in range(cfg.horizon):
                 pq, pp = dynamics.controlled_step(pq, pp, mean[t : t + 1, :])
                 h_p = dynamics.decode(pq, pp)
-                st_p = (h_p @ A).squeeze(0)
-                plan_t.append(float(angle_normalize(torch.atan2(st_p[1], st_p[0]))))
-                # atan2 is scale-invariant, so theta stays plausible-looking
-                # even if the linear probe's raw output has blown up under
-                # extrapolation this far into pure imagination — theta_dot has
-                # no such protection, so clamp it to the same display-sanity
-                # bound used by the MPPI cost function.
-                plan_td.append(float(st_p[2].clamp(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)))
+                frame_p = autoencoder.decode_latent(h_p)  # (1, C, H, W)
+                v_p = frames_to_direction(frame_p)
+                plan_t.append(float(implied_theta(v_p)))
+                plan_td.append(float(implied_theta_dot(v_p, v_prev)))
+                v_prev = v_p
             plan_thetas.append(plan_t)
             plan_theta_dots.append(plan_td)
 
