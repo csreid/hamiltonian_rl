@@ -323,6 +323,32 @@ def _grid_seeds(
 
 # ── Data collection ──────────────────────────────────────────────────────────
 
+# Zero-action steps at the start of each grid-seeded episode. The covering
+# grid is treated as *targets* reached this many steps in (backward-solved
+# via ``_seeds_reaching_targets``, exactly as in
+# ``collect_zero_trajectories_targeted``) rather than as raw initial states:
+# a raw high-energy seed near theta=0 swings away within a few steps, and a
+# causal encoder has no motion context at t=0 anyway, so direct seeding
+# leaves that corner of the grid unrepresented at any encodable timestep.
+# Matches the energy-landscape drawer's default context (context_frames=5,
+# i.e. 4 steps of motion).
+_GRID_WARMUP_STEPS = 4
+
+
+def _targeted_grid_seeds(
+    n_episodes: int,
+    warmup_steps: int,
+    damping: float,
+    drag: float,
+    max_vel: float = _MAX_SPEED,
+) -> np.ndarray:
+    """Backward-solved seeds whose zero-action state at step ``warmup_steps``
+    covers the standard grid (see ``collect_zero_trajectories_targeted``)."""
+    targets = _grid_seeds(n_episodes, min_theta_dot=-max_vel, max_theta_dot=max_vel)
+    return _seeds_reaching_targets(
+        targets, max_steps=warmup_steps, damping=damping, drag=drag
+    )
+
 
 def _collect_episodes(
     n_episodes: int,
@@ -332,8 +358,14 @@ def _collect_episodes(
     energy_k: float,
     desc: str,
     damping: float = 0.0,
+    warmup_steps: int = _GRID_WARMUP_STEPS,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Shared episode collection loop.
+
+    The first ``warmup_steps`` actions of every episode are zero, and the
+    seed is backward-solved so the episode passes exactly through its grid
+    point at the end of that warmup (see ``_targeted_grid_seeds``); the
+    policy takes over afterwards.
 
     Returns a list of (frames, actions, states) tuples:
         frames  : (T+1, 3, img_size, img_size) float32 [0,1]
@@ -342,7 +374,8 @@ def _collect_episodes(
     """
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
-    seeds = _grid_seeds(n_episodes)
+    warmup = min(warmup_steps, max_steps)
+    seeds = _targeted_grid_seeds(n_episodes, warmup, damping=damping, drag=env.drag)
 
     try:
         for i in tqdm(range(n_episodes), desc=desc):
@@ -356,10 +389,12 @@ def _collect_episodes(
             actions = []
             states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
-            for _ in range(max_steps):
+            for t in range(max_steps):
                 theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
 
-                if random.random() < epsilon:
+                if t < warmup:
+                    action = 0.0
+                elif random.random() < epsilon:
                     action = float(np.random.uniform(-2.0, 2.0))
                 elif abs(theta) < _UPRIGHT_THRESHOLD:
                     action = _pd_action(theta, theta_dot, kp, kd)
@@ -464,11 +499,17 @@ def _collect_spin_episodes(
     img_size: int,
     max_steps: int,
     damping: float = 0.0,
+    warmup_steps: int = _GRID_WARMUP_STEPS,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Collect episodes with a spin-maximising controller (maximises |theta_dot|)."""
+    """Collect episodes with a spin-maximising controller (maximises |theta_dot|).
+
+    Grid-targeted seeding with a zero-action warmup, same as
+    ``_collect_episodes``.
+    """
     env = PendulumPixelEnv(img_size=img_size, damping=damping)
     episodes = []
-    seeds = _grid_seeds(n_episodes)
+    warmup = min(warmup_steps, max_steps)
+    seeds = _targeted_grid_seeds(n_episodes, warmup, damping=damping, drag=env.drag)
 
     try:
         for i in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
@@ -479,9 +520,9 @@ def _collect_spin_episodes(
             actions = []
             states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
-            for _ in range(max_steps):
+            for t in range(max_steps):
                 theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
-                action = _spin_action(theta_dot)
+                action = 0.0 if t < warmup else _spin_action(theta_dot)
                 obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
                 theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
                 frames.append(torch.from_numpy(obs).float() / 255.0)
@@ -654,8 +695,9 @@ def collect_zero_trajectories_targeted(
     high-energy corner near theta=0 — with no special-casing needed.
     ``max_vel`` just sets how wide a range of target velocities to cover.
     """
-    targets = _grid_seeds(n_episodes, min_theta_dot=-max_vel, max_theta_dot=max_vel)
-    seeds = _seeds_reaching_targets(targets, max_steps=max_steps, damping=damping, drag=drag)
+    seeds = _targeted_grid_seeds(
+        n_episodes, max_steps, damping=damping, drag=drag, max_vel=max_vel
+    )
     return _collect_zero_episodes(
         n_episodes=n_episodes,
         img_size=img_size,
