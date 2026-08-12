@@ -180,6 +180,7 @@ def _collect_energy_grid_episodes(
     resolution: int = 20,
     img_size: int = 64,
     damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
     context_frames: int = 5,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Collect the zero-action grid-seeded episodes for the energy-landscape plot.
@@ -208,6 +209,7 @@ def _collect_energy_grid_episodes(
         img_size=img_size,
         max_steps=context_frames - 1,
         damping=damping,
+        drag=drag,
     )
 
 
@@ -241,7 +243,9 @@ def _collect_grid_qp_samples(
     final_state = states[:, -1]
     theta = torch.atan2(final_state[:, 1], final_state[:, 0])
     theta_dot = final_state[:, 2]
-    H_true = 0.5 * theta_dot**2 + _G * (1.0 + torch.cos(theta))
+    # Canonical convention matching the env's EOM (ṗ = 1.5·g·sin θ, see
+    # data/pendulum.py): T = θ̇²/2 pairs with V = 1.5·g·(1 + cos θ).
+    H_true = 0.5 * theta_dot**2 + 1.5 * _G * (1.0 + torch.cos(theta))
 
     return {"q": q.cpu(), "p": p.cpu(), "H_true": H_true, "theta": theta, "theta_dot": theta_dot}
 
@@ -304,7 +308,7 @@ def _plot_learned_energy_landscape(
     theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
     theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
     grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
-    H_true_dense = (0.5 * grid_theta_dot**2 + _G * (1.0 + torch.cos(grid_theta))).numpy()
+    H_true_dense = (0.5 * grid_theta_dot**2 + 1.5 * _G * (1.0 + torch.cos(grid_theta))).numpy()
 
     H_learned_dense = griddata(
         points=np.stack([theta, theta_dot], axis=-1),
@@ -2279,7 +2283,9 @@ def phase2_cmd(**kwargs):
         )
         print("Collecting grid episodes for energy-landscape logging...")
         energy_grid_episodes = _collect_energy_grid_episodes(
-            img_size=img_size, damping=damping, context_frames=kwargs["val_context_frames"],
+            img_size=img_size, damping=damping,
+            drag=data_cfg.get("drag", _DRAG_COEFF),
+            context_frames=kwargs["val_context_frames"],
         )
 
     latent_dim = phase1_model.config["latent_dim"]
@@ -2687,7 +2693,9 @@ def phase3_cmd(**kwargs):
         )
         print("Collecting grid episodes for energy-landscape logging...")
         energy_grid_episodes = _collect_energy_grid_episodes(
-            img_size=img_size, damping=damping, context_frames=kwargs["val_context_frames"],
+            img_size=img_size, damping=damping,
+            drag=data_cfg.get("drag", _DRAG_COEFF),
+            context_frames=kwargs["val_context_frames"],
         )
 
     episode_dataset = PendulumDataset(episodes)

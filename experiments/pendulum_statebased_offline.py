@@ -300,10 +300,14 @@ def _train_epoch(
 
 
 def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
-    """H = 0.5 θ̇² + g (1 + cos θ) from (T, 2) states."""
+    """H = 0.5 θ̇² + 1.5 g (1 + cos θ) from (T, 2) states.
+
+    The 1.5·g potential matches the env's EOM ṗ = 1.5·g·sin θ under the
+    canonical convention T = θ̇²/2 (see data/pendulum.py).
+    """
     theta = states[:, 0].numpy()
     theta_dot = states[:, 1].numpy()
-    return 0.5 * theta_dot**2 + _G * (1.0 + np.cos(theta))
+    return 0.5 * theta_dot**2 + 1.5 * _G * (1.0 + np.cos(theta))
 
 
 @torch.no_grad()
