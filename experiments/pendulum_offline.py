@@ -1099,6 +1099,60 @@ def _log_cnn_feature_fold_probe_phase1(
 # ---------------------------------------------------------------------------
 
 
+@torch.enable_grad()
+def _energy_balance_loss(
+    dyn_model: HamiltonianFlowModel,
+    q_all: torch.Tensor,
+    p_all: torch.Tensor,
+    actions_win: torch.Tensor,
+) -> torch.Tensor:
+    """Port-Hamiltonian energy-balance consistency along encoded real trajectories.
+
+    Chain rule plus antisymmetry of J gives, along any trajectory of the model
+    class dz/dt = (J - R(z)) ∇H + B u:
+
+        dH/dt = -∇ₚHᵀ R_pp(z) ∇ₚH + ∇ₚHᵀ B u
+
+    This is an identity of the model class, so the true (H, R, B) must satisfy
+    it along the *data*. The loss penalises the discrete mismatch between
+    H(z_{t+1}) - H(z_t) and dt times the trapezoid of the right-hand side over
+    the frame gap (u_t zero-order-held across it). Every unit of energy H
+    loses along real trajectories must then be invoiced to the model's own
+    dissipation R_pp(z), and every unit gained to the input power — so H and R
+    cannot buy rollout contraction with decay the data doesn't show. The
+    identity holds for any PSD R(z): state-dependent (drag-like) damping is
+    constrained exactly, not approximated.
+
+    z is detached, so the balance shapes H, R, and B only; if it also reached
+    phi, the coordinates could warp to make the books balance instead of the
+    physics. It is a consistency constraint, not conservation — H ≡ const
+    satisfies it trivially — so it supplements the prediction losses and can
+    never replace them.
+
+    q_all/p_all: (B, W, q_dim) encoded states; actions_win: (B, W-1) controls.
+    """
+    B_size, W, q_dim = q_all.shape
+    z = torch.cat([q_all, p_all], dim=-1).reshape(B_size * W, 2 * q_dim).detach()
+    z = z.requires_grad_(True)
+    H = dyn_model.hamiltonian(z[:, :q_dim], z[:, q_dim:])  # (B*W,)
+    grad_H = torch.autograd.grad(H.sum(), z, create_graph=True)[0]
+    g_p = grad_H[:, q_dim:]
+    if dyn_model._has_dissipation:
+        diss = -(g_p * dyn_model._apply_R_pp(z, g_p)).sum(-1)
+    else:
+        diss = torch.zeros_like(H)
+    H = H.reshape(B_size, W)
+    diss = diss.reshape(B_size, W)
+    g_p = g_p.reshape(B_size, W, q_dim)
+    # B u enters only the p block, so its power is ∇ₚHᵀBu.
+    Bu = actions_win.reshape(B_size, W - 1, -1) @ dyn_model.get_B().T  # (B, W-1, q_dim)
+    power_left = diss[:, :-1] + (g_p[:, :-1] * Bu).sum(-1)
+    power_right = diss[:, 1:] + (g_p[:, 1:] * Bu).sum(-1)
+    lhs = H[:, 1:] - H[:, :-1]
+    rhs = 0.5 * dyn_model.dt * (power_left + power_right)
+    return F.mse_loss(lhs, rhs)
+
+
 def _train_epoch_phase2(
     dyn_model: HamiltonianFlowModel,
     encoder: torch.nn.Module,
@@ -1114,6 +1168,8 @@ def _train_epoch_phase2(
     closed_loop_weight: float = 1.0,
     closed_loop_gamma: float = 1.0,
     structural_reg_weight: float = 0.0,
+    energy_balance_weight: float = 0.0,
+    huber_delta: float = 0.0,
     h_noise_std: float = 0.0,
     h_noise_scale: torch.Tensor | None = None,
 ) -> dict[str, float]:
@@ -1150,6 +1206,19 @@ def _train_epoch_phase2(
     Logdet regulariser is applied over all ctx+T encoded timesteps in the
     window, so its strength stays constant as seq_len grows.
 
+    If huber_delta > 0, the per-element closed-loop error is a Huber loss
+    scaled by 2 so it equals the squared error for |e| <= delta (keeping
+    cl_loss and its EMA curriculum gate on the plain-MSE scale) but grows only
+    linearly beyond. Late rollout steps that have drifted out of phase then
+    stop dominating the batch gradient — pressure that otherwise rewards
+    contractive (spuriously damped) dynamics.
+
+    If energy_balance_weight > 0, adds the port-Hamiltonian energy-balance
+    consistency loss (see _energy_balance_loss) over the encoded window. With
+    h-noise augmentation active, the balance is evaluated on a clean no-grad
+    re-encoding: on jittered z, H's spread across the jitter joins the loss
+    floor, rewarding exactly the flattened H the term exists to prevent.
+
     If h_noise_std > 0, zero-mean Gaussian noise is added to the h values fed
     into phi (both teacher-forced and closed-loop seeds), while the prediction
     targets stay clean.  This is denoising-style augmentation: the model learns
@@ -1162,6 +1231,7 @@ def _train_epoch_phase2(
     encoder.eval()
     total_dynamics = total_tf = total_cl = total_logdet_reg = 0.0
     total_q_var = total_p_var = total_hamiltonian_l1 = total_grad_H_norm = total_struct_reg = 0.0
+    total_energy_balance = 0.0
     q_dim = dyn_model.latent_dim // 2
     ctx = seed_ctx_len
 
@@ -1231,12 +1301,34 @@ def _train_epoch_phase2(
             q_traj.reshape(B_size * T, q_dim), p_traj.reshape(B_size * T, q_dim)
         )
         h_cl_target = h_all[:, k + 1:k + 1 + T]
-        sq_err = (h_cl_pred.reshape(B_size, T, D) - h_cl_target).pow(2)
-        per_step_loss = sq_err.mean(dim=(0, 2))  # (T,) — mean over batch and latent dims
+        h_cl_pred = h_cl_pred.reshape(B_size, T, D)
+        if huber_delta > 0:
+            # 2x huber == squared error for |e| <= delta, linear beyond — same
+            # scale as plain MSE where the EMA curriculum gate operates.
+            elem_err = 2.0 * F.huber_loss(
+                h_cl_pred, h_cl_target, reduction="none", delta=huber_delta
+            )
+        else:
+            elem_err = (h_cl_pred - h_cl_target).pow(2)
+        per_step_loss = elem_err.mean(dim=(0, 2))  # (T,) — mean over batch and latent dims
         step_weights = closed_loop_gamma ** torch.arange(T, device=device, dtype=per_step_loss.dtype)
         cl_loss = (per_step_loss * step_weights).sum() / step_weights.sum()
 
         loss = logdet_reg + teacher_force_weight * tf_loss + closed_loop_weight * cl_loss
+
+        if energy_balance_weight > 0:
+            if h_noise_std > 0:
+                # Clean re-encode: the balance must see the data manifold, not
+                # the jitter (see docstring).
+                with torch.no_grad():
+                    s_clean = dyn_model.phi(h_all.reshape(B_size * W, D))
+                q_eb = s_clean[:, :q_dim].reshape(B_size, W, q_dim)
+                p_eb = s_clean[:, q_dim:].reshape(B_size, W, q_dim)
+            else:
+                q_eb, p_eb = q_all, p_all
+            eb_loss = _energy_balance_loss(dyn_model, q_eb, p_eb, actions_win)
+            loss = loss + energy_balance_weight * eb_loss
+            total_energy_balance = total_energy_balance + eb_loss.detach()
 
         if l1_weight > 0:
             l1_loss = sum(param.abs().sum() for param in dyn_model.hamiltonian.parameters())
@@ -1295,6 +1387,7 @@ def _train_epoch_phase2(
         "phase2/hamiltonian_l1": float(total_hamiltonian_l1) / n,
         "phase2/grad_H_norm": float(total_grad_H_norm) / n,
         "phase2/struct_reg": float(total_struct_reg) / n,
+        "phase2/energy_balance": float(total_energy_balance) / n,
     }
 
 
@@ -1597,6 +1690,8 @@ def _train_epoch_phase3(
     h_tf_weight: float,
     h_cl_weight: float,
     closed_loop_gamma: float,
+    energy_balance_weight: float = 0.0,
+    huber_delta: float = 0.0,
     decode_stride: int = 1,
 ) -> dict[str, float]:
     """End-to-end epoch: every module trains through the full dreaming pipeline.
@@ -1622,6 +1717,13 @@ def _train_epoch_phase3(
       logdet    same near-volume-preservation regulariser on phi as Phase 2.
 
     closed_loop_gamma discounts later rollout steps exactly as in Phase 2.
+    huber_delta > 0 switches the pixel closed-loop per-element error to a
+    2x-scaled Huber (== squared error below delta, linear above — same scale
+    as MSE where the EMA curriculum gate operates), so phase-drifted late
+    steps stop dominating the gradient; the h-space losses stay MSE (they are
+    stop-grad auxiliaries on a different error scale). energy_balance_weight
+    > 0 adds the port-Hamiltonian energy-balance consistency loss (see
+    _energy_balance_loss) on detached encoded states, shaping H/R/B only.
     decode_stride > 1 decodes only every decode_stride-th window frame (recon)
     and rollout step (pixel_cl) to bound decoder activation memory at long
     curriculum horizons; the h-space losses still cover every step.
@@ -1632,7 +1734,7 @@ def _train_epoch_phase3(
     q_dim = dyn.latent_dim // 2
     ctx = seed_ctx_len
     total_loss = total_recon = total_pix_cl = total_tf = total_cl_h = 0.0
-    total_logdet = total_q_var = total_p_var = 0.0
+    total_logdet = total_q_var = total_p_var = total_energy_balance = 0.0
 
     for frames, actions, _states in loader:
         actions = actions.to(device)  # (B, T_full)
@@ -1711,7 +1813,15 @@ def _train_epoch_phase3(
             B_size, len(pix_idx), *frames_win.shape[2:]
         )
         frames_cl_target = frames_win[:, k + 1:k + 1 + T][:, pix_idx]
-        per_step_pix = (frames_cl_pred - frames_cl_target).pow(2).mean(dim=(0, 2, 3, 4))
+        if huber_delta > 0:
+            # 2x huber == squared error for |e| <= delta, linear beyond — same
+            # scale as plain MSE where the EMA curriculum gate operates.
+            pix_err = 2.0 * F.huber_loss(
+                frames_cl_pred, frames_cl_target, reduction="none", delta=huber_delta
+            )
+        else:
+            pix_err = (frames_cl_pred - frames_cl_target).pow(2)
+        per_step_pix = pix_err.mean(dim=(0, 2, 3, 4))
         w_pix = step_weights[pix_idx]
         pix_cl = (per_step_pix * w_pix).sum() / w_pix.sum()
 
@@ -1722,6 +1832,11 @@ def _train_epoch_phase3(
             + h_cl_weight * cl_h
             + pixel_cl_weight * pix_cl
         )
+
+        if energy_balance_weight > 0:
+            eb_loss = _energy_balance_loss(dyn, q_all, p_all, actions_win)
+            loss = loss + energy_balance_weight * eb_loss
+            total_energy_balance = total_energy_balance + eb_loss.detach()
 
         optimizer.zero_grad()
         loss.backward()
@@ -1755,6 +1870,7 @@ def _train_epoch_phase3(
         "phase3/logdet_reg": float(total_logdet) / n,
         "phase3/q_var": float(total_q_var) / n,
         "phase3/p_var": float(total_p_var) / n,
+        "phase3/energy_balance": float(total_energy_balance) / n,
     }
 
 
@@ -2178,6 +2294,17 @@ def phase1_cmd(**kwargs):
                    "(weight = gamma**t, t=0 at the first post-seed step, normalised "
                    "to sum to 1). 1.0 = plain mean over all steps (no discounting); "
                    "<1.0 downweights later, more error-compounded steps.")
+@click.option("--huber-delta", type=float, default=0.2, show_default=True,
+              help="Huber threshold (h units) for the closed-loop per-element error: "
+                   "quadratic (= MSE scale) below delta, linear above, so phase-drifted "
+                   "late rollout steps stop dominating the gradient and rewarding "
+                   "contractive dynamics. 0 = plain MSE.")
+@click.option("--energy-balance-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the port-Hamiltonian energy-balance consistency loss: "
+                   "H's change along encoded real trajectories must match the "
+                   "dissipation -gradpH^T R(z) gradpH plus input power the model "
+                   "itself claims. Anchors H and R at every timestep independent of "
+                   "rollout horizon. 0 disables.")
 @click.option("--h-noise-std", type=float, default=0.0, show_default=True,
               help="Zero-mean Gaussian noise added to h inputs (augmentation; targets "
                    "stay clean), as a multiplier on each h-dim's spread across the cache. "
@@ -2393,6 +2520,8 @@ def phase2_cmd(**kwargs):
             closed_loop_weight=kwargs["closed_loop_weight"],
             closed_loop_gamma=kwargs["closed_loop_gamma"],
             structural_reg_weight=kwargs["structural_reg_weight"],
+            energy_balance_weight=kwargs["energy_balance_weight"],
+            huber_delta=kwargs["huber_delta"],
             h_noise_std=kwargs["h_noise_std"],
             h_noise_scale=h_noise_scale,
         )
@@ -2581,6 +2710,15 @@ def phase2_cmd(**kwargs):
 @click.option("--closed-loop-gamma", type=float, default=1.0, show_default=True,
               help="Exponential discount over closed-loop rollout steps (both h-space "
                    "and pixel), as in Phase 2")
+@click.option("--huber-delta", type=float, default=0.1, show_default=True,
+              help="Huber threshold (pixel units) for the pixel closed-loop per-element "
+                   "error: quadratic (= MSE scale) below delta, linear above, so "
+                   "phase-drifted late steps stop dominating the gradient; h-space "
+                   "losses stay MSE. 0 = plain MSE.")
+@click.option("--energy-balance-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the port-Hamiltonian energy-balance consistency loss "
+                   "(as Phase 2), on detached encoded states so it shapes H/R/B only. "
+                   "0 disables.")
 @click.option("--decode-stride", type=int, default=1, show_default=True,
               help="Decode only every Nth window frame (recon) and rollout step "
                    "(pixel loss) to bound decoder memory at long horizons; h-space "
@@ -2798,6 +2936,8 @@ def phase3_cmd(**kwargs):
             h_tf_weight=kwargs["h_tf_weight"],
             h_cl_weight=kwargs["h_cl_weight"],
             closed_loop_gamma=kwargs["closed_loop_gamma"],
+            energy_balance_weight=kwargs["energy_balance_weight"],
+            huber_delta=kwargs["huber_delta"],
             decode_stride=kwargs["decode_stride"],
         )
 
