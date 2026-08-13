@@ -12,6 +12,8 @@ from gymnasium import spaces
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from hamilton_rl.mppi import MPPIConfig, mppi_plan, shift_mean
+
 # Pendulum-v1 physical constants (gymnasium defaults)
 _G = 10.0
 _H_STAR = 20.0  # 2 * m * g * l  with m=l=1, g=10
@@ -555,6 +557,179 @@ def collect_spin_trajectories(
         max_steps=max_steps,
         damping=damping,
     )
+
+
+# ── Single switching-policy long rollout ──────────────────────────────────────
+#
+# Ground-truth MPPI cost, shared with pendulum_planner.py's
+# ``run_ground_truth_mppi`` (which imports ``_mppi_gt_cost_fn`` from here
+# rather than defining its own) so there is one definition of "what does it
+# mean to balance the pendulum" for both data collection and the planner demo.
+
+
+def _mppi_gt_cost_fn(
+    theta0: torch.Tensor,
+    theta_dot0: torch.Tensor,
+    damping: float,
+    action_weight: float,
+    drag: float = _DRAG_COEFF,
+):
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        K, H, _ = candidates.shape
+        theta = theta0.expand(K).clone()
+        theta_dot = theta_dot0.expand(K).clone()
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
+        for t in range(H):
+            u = candidates[:, t, 0]
+            theta, theta_dot = analytic_pendulum_step(theta, theta_dot, u, damping=damping, drag=drag)
+            total = total + angle_normalize(theta) ** 2 + 0.1 * theta_dot**2 + action_weight * u**2
+        return total
+
+    return cost_fn
+
+
+_BALANCE_MPPI_CFG = MPPIConfig(
+    horizon=20, n_samples=256, n_iterations=1, noise_std=1.0, temperature=1.0,
+    action_low=-2.0, action_high=2.0,
+)
+_BALANCE_ACTION_WEIGHT = 0.001
+
+
+class _MPPIBalancePolicy:
+    """Closed-loop receding-horizon MPPI controller, warm-started across steps.
+
+    Plans against the same ground-truth analytic dynamics the real env
+    steps with (see module docstring above ``analytic_pendulum_step``), so
+    it needs no learned model to drive the "try to balance" phase of
+    ``_collect_switching_rollout``.
+    """
+
+    def __init__(self, damping: float, drag: float):
+        self.damping = damping
+        self.drag = drag
+        self.mean = torch.zeros(_BALANCE_MPPI_CFG.horizon, 1)
+
+    def act(self, theta: float, theta_dot: float) -> float:
+        cost_fn = _mppi_gt_cost_fn(
+            torch.tensor(float(theta)), torch.tensor(float(theta_dot)),
+            self.damping, _BALANCE_ACTION_WEIGHT, drag=self.drag,
+        )
+        self.mean = mppi_plan(self.mean, cost_fn, _BALANCE_MPPI_CFG)
+        u0 = float(self.mean[0, 0].clamp(_BALANCE_MPPI_CFG.action_low, _BALANCE_MPPI_CFG.action_high))
+        self.mean = shift_mean(self.mean)
+        return u0
+
+
+# Order matters only in that it determines which quarter of the rollout each
+# behavior occupies; equal-length blocks, MPPI-balance placed after both spin
+# directions so it always gets to recover from whichever spin state it's left in.
+_SWITCHING_PHASES = ("spin_cw", "spin_ccw", "balance", "random")
+
+
+def _switching_phase_action(
+    phase: str, theta: float, theta_dot: float, balance_policy: _MPPIBalancePolicy
+) -> float:
+    if phase == "spin_cw":
+        return 2.0
+    if phase == "spin_ccw":
+        return -2.0
+    if phase == "balance":
+        return balance_policy.act(theta, theta_dot)
+    return float(np.random.uniform(-2.0, 2.0))  # random
+
+
+def _collect_switching_rollout(
+    n_steps: int,
+    img_size: int,
+    damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One continuous rollout of ``n_steps`` that cycles through four behaviors
+    in equal-length blocks: constant max-torque CW spin, constant max-torque
+    CCW spin, an MPPI controller balancing at the upright, and uniform-random
+    actions (see ``_SWITCHING_PHASES``).
+
+    Unlike the per-episode collectors above, there is exactly one reset —
+    every step after the first carries real motion history, so any window
+    later sliced out of the middle of this rollout (see
+    ``collect_switching_data``) has genuine causal context for the encoder
+    without needing the zero-action warmup those collectors rely on.
+
+    Returns the same (frames, actions, states) shapes as ``_collect_episodes``,
+    but for the full ``n_steps``-long trajectory rather than one episode.
+    """
+    env = PendulumPixelEnv(img_size=img_size, damping=damping, drag=drag)
+    balance_policy = _MPPIBalancePolicy(damping=damping, drag=drag)
+    n_phases = len(_SWITCHING_PHASES)
+    block = max(1, n_steps // n_phases)
+
+    try:
+        env.reset()
+        theta0 = float(np.random.uniform(-np.pi, np.pi))
+        theta_dot0 = float(np.random.uniform(-_MAX_SPEED, _MAX_SPEED))
+        obs = env.set_state(theta0, theta_dot0)
+
+        frames = [torch.from_numpy(obs).float() / 255.0]
+        actions = []
+        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+
+        for t in tqdm(range(n_steps), desc="Collecting switching rollout"):
+            phase = _SWITCHING_PHASES[min(t // block, n_phases - 1)]
+            theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
+            action = _switching_phase_action(phase, theta, theta_dot, balance_policy)
+
+            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+            theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
+            frames.append(torch.from_numpy(obs).float() / 255.0)
+            actions.append(action)
+            states.append(
+                np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32)
+            )
+    finally:
+        env.close()
+
+    return (
+        torch.stack(frames),  # (n_steps+1, 3, H, W)
+        torch.tensor(actions, dtype=torch.float32),  # (n_steps,)
+        torch.from_numpy(np.stack(states)),  # (n_steps+1, 3)
+    )
+
+
+def collect_switching_data(
+    n_episodes: int,
+    img_size: int,
+    max_steps: int,
+    rollout_steps: int,
+    damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Collect training episodes by randomly windowing a single long rollout.
+
+    Rather than many independent short rollouts, this collects one
+    ``rollout_steps``-long trajectory whose policy cycles through spin-CW,
+    spin-CCW, MPPI-balance and random blocks (``_collect_switching_rollout``),
+    then slices ``n_episodes`` windows of length ``max_steps`` out of it at
+    random offsets — cheap because it's the same underlying rollout, and
+    every window (other than ones very close to t=0) carries real motion
+    history instead of a cold start.
+    """
+    if rollout_steps < max_steps:
+        raise ValueError(f"rollout_steps ({rollout_steps}) must be >= max_steps ({max_steps})")
+
+    frames, actions, states = _collect_switching_rollout(
+        n_steps=rollout_steps, img_size=img_size, damping=damping, drag=drag,
+    )
+
+    max_offset = rollout_steps - max_steps
+    episodes = []
+    for _ in range(n_episodes):
+        start = random.randint(0, max_offset)
+        episodes.append((
+            frames[start : start + max_steps + 1],
+            actions[start : start + max_steps],
+            states[start : start + max_steps + 1],
+        ))
+    return episodes
 
 
 def _seeds_reaching_targets(

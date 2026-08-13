@@ -69,6 +69,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data.pendulum import (
     _DT,
     PendulumPixelEnv,
+    _mppi_gt_cost_fn,
     analytic_pendulum_step,
     angle_normalize,
     collect_random_trajectories,
@@ -145,21 +146,6 @@ def fit_h_state_regression(
 # ── Ground-truth MPPI ────────────────────────────────────────────────────────
 
 
-def _gt_rollout_cost_fn(theta0, theta_dot0, damping, action_weight):
-    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
-        K, H, _ = candidates.shape
-        theta = theta0.expand(K).clone()
-        theta_dot = theta_dot0.expand(K).clone()
-        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
-        for t in range(H):
-            u = candidates[:, t, 0]
-            theta, theta_dot = analytic_pendulum_step(theta, theta_dot, u, damping=damping)
-            total = total + angle_normalize(theta) ** 2 + 0.1 * theta_dot**2 + action_weight * u**2
-        return total
-
-    return cost_fn
-
-
 @torch.no_grad()
 def run_ground_truth_mppi(
     theta0: float,
@@ -194,7 +180,7 @@ def run_ground_truth_mppi(
     plan_thetas, plan_theta_dots = [], []
     try:
         for step in range(total_steps):
-            cost_fn = _gt_rollout_cost_fn(theta_cur, theta_dot_cur, damping, action_weight)
+            cost_fn = _mppi_gt_cost_fn(theta_cur, theta_dot_cur, damping, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
 
             # Roll the chosen (noise-free) plan forward once, purely to show

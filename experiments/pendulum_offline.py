@@ -84,6 +84,7 @@ from data.pendulum import (
     collect_data,
     collect_random_trajectories,
     collect_spin_trajectories,
+    collect_switching_data,
     collect_val_trajectories,
     collect_zero_trajectories_targeted,
     _DRAG_COEFF,
@@ -1948,6 +1949,10 @@ def cli():
               help="Gain for energy-pumping controller")
 @click.option("--max-steps", type=int, default=200, show_default=True,
               help="Number of steps per episode")
+@click.option("--rollout-steps", type=int, default=2000, show_default=True,
+              help="Length of the single switching-policy rollout that training "
+                   "episodes are randomly windowed from (see collect_switching_data); "
+                   "must be >= --max-steps")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
 # model architecture
@@ -2012,37 +2017,21 @@ def phase1_cmd(**kwargs):
     n_val = n_val_episodes if kwargs["val_every"] > 0 else 0
     val_steps = kwargs["val_max_steps"] or kwargs["max_steps"] * 2
 
-    # Mix three collection policies for training, same as the val split below —
-    # an epsilon-random/energy-pumping controller alone traces a near-1D energy
-    # band and under-covers the phase space.
-    n_energy = kwargs["n_episodes"] // 3
-    n_random = kwargs["n_episodes"] // 3
-    n_spin = kwargs["n_episodes"] - n_energy - n_random
+    # Train episodes are random-offset windows of a single long rollout whose
+    # policy cycles through spin-CW, spin-CCW, MPPI-balance and random blocks
+    # (see collect_switching_data) — one continuous trajectory rather than
+    # many independent short ones, so windows sliced from its interior carry
+    # real motion history instead of a cold start.
     print(
-        f"\nCollecting {kwargs['n_episodes']} train episodes "
-        f"({n_energy} energy-pump, {n_random} random, {n_spin} spin)..."
+        f"\nCollecting a {kwargs['rollout_steps']}-step switching rollout and "
+        f"windowing {kwargs['n_episodes']} train episodes ({kwargs['max_steps']} steps each)..."
     )
-    episodes = (
-        collect_data(
-            n_episodes=n_energy,
-            img_size=kwargs["img_size"],
-            epsilon=kwargs["epsilon"],
-            energy_k=kwargs["energy_k"],
-            max_steps=kwargs["max_steps"],
-            damping=kwargs["damping"],
-        )
-        + collect_random_trajectories(
-            n_episodes=n_random,
-            img_size=kwargs["img_size"],
-            max_steps=kwargs["max_steps"],
-            damping=kwargs["damping"],
-        )
-        + collect_spin_trajectories(
-            n_episodes=n_spin,
-            img_size=kwargs["img_size"],
-            max_steps=kwargs["max_steps"],
-            damping=kwargs["damping"],
-        )
+    episodes = collect_switching_data(
+        n_episodes=kwargs["n_episodes"],
+        img_size=kwargs["img_size"],
+        max_steps=kwargs["max_steps"],
+        rollout_steps=kwargs["rollout_steps"],
+        damping=kwargs["damping"],
     )
 
     # Save the raw training episodes (frames, actions, ground-truth state) right
