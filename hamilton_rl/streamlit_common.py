@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw
 
 # ── Checkpoint picking ──────────────────────────────────────────────────────
 
-_NON_CHECKPOINT_STEMS = {"h_cache", "episodes_cache"}
+_NON_CHECKPOINT_STEMS = {"h_cache", "episodes_cache", "rollout_cache"}
 _TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})$")
 
 

@@ -424,35 +424,6 @@ def _collect_episodes(
     return episodes
 
 
-def collect_data(
-    n_episodes: int,
-    img_size: int,
-    epsilon: float = 0.1,
-    max_steps: int = 200,
-    energy_k: float = 1.0,
-    damping: float = 0.0,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Collect Pendulum episodes for world-model training.
-
-    Policy (per step):
-      - With probability ``epsilon``: random action from U(-2, 2).
-      - Otherwise, if |theta| < upright_threshold: PD controller with
-        random gains (kp, kd drawn fresh each episode for coverage).
-      - Otherwise: energy-pumping law.
-    """
-    episodes = _collect_episodes(
-        n_episodes=n_episodes,
-        img_size=img_size,
-        epsilon=epsilon,
-        max_steps=max_steps,
-        energy_k=energy_k,
-        desc="Collecting data",
-        damping=damping,
-    )
-    print(f"  Collected {n_episodes} episodes ({max_steps} steps each).")
-    return episodes
-
-
 def collect_val_trajectories(
     n_episodes: int,
     img_size: int,
@@ -638,7 +609,7 @@ def _switching_phase_action(
     return float(np.random.uniform(-2.0, 2.0))  # random
 
 
-def _collect_switching_rollout(
+def collect_switching_rollout(
     n_steps: int,
     img_size: int,
     damping: float = 0.0,
@@ -652,7 +623,7 @@ def _collect_switching_rollout(
     Unlike the per-episode collectors above, there is exactly one reset —
     every step after the first carries real motion history, so any window
     later sliced out of the middle of this rollout (see
-    ``collect_switching_data``) has genuine causal context for the encoder
+    ``PendulumRolloutDataset``) has genuine causal context for the encoder
     without needing the zero-action warmup those collectors rely on.
 
     Returns the same (frames, actions, states) shapes as ``_collect_episodes``,
@@ -695,41 +666,51 @@ def _collect_switching_rollout(
     )
 
 
-def collect_switching_data(
-    n_episodes: int,
-    img_size: int,
-    max_steps: int,
-    rollout_steps: int,
-    damping: float = 0.0,
-    drag: float = _DRAG_COEFF,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Collect training episodes by randomly windowing a single long rollout.
+class PendulumRolloutDataset(Dataset):
+    """Random windows of one long switching rollout — no fixed episodes.
 
-    Rather than many independent short rollouts, this collects one
-    ``rollout_steps``-long trajectory whose policy cycles through spin-CW,
-    spin-CCW, MPPI-balance and random blocks (``_collect_switching_rollout``),
-    then slices ``n_episodes`` windows of length ``max_steps`` out of it at
-    random offsets — cheap because it's the same underlying rollout, and
-    every window (other than ones very close to t=0) carries real motion
-    history instead of a cold start.
+    Holds a single (frames, actions, states) trajectory (see
+    ``collect_switching_rollout``) and draws a *fresh* random offset on every
+    ``__getitem__`` — the index is ignored, so each epoch trains on a new set
+    of windows rather than a frozen slicing. ``n_windows`` only sets the
+    nominal epoch size for the DataLoader.
+
+    Each item matches one old "episode" shape-for-shape:
+        frames  : (window_len+1, 3, H, W) float32 [0,1]
+        actions : (window_len,)  float32
+        states  : (window_len+1, 3) float32
     """
-    if rollout_steps < max_steps:
-        raise ValueError(f"rollout_steps ({rollout_steps}) must be >= max_steps ({max_steps})")
 
-    frames, actions, states = _collect_switching_rollout(
-        n_steps=rollout_steps, img_size=img_size, damping=damping, drag=drag,
-    )
+    def __init__(
+        self,
+        rollout: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        window_len: int,
+        n_windows: int,
+    ):
+        frames, actions, states = rollout
+        rollout_steps = actions.shape[0]
+        if rollout_steps < window_len:
+            raise ValueError(
+                f"rollout has {rollout_steps} steps but window_len is {window_len}"
+            )
+        self.frames = frames
+        self.actions = actions
+        self.states = states
+        self.window_len = window_len
+        self.n_windows = n_windows
+        self.max_offset = rollout_steps - window_len
 
-    max_offset = rollout_steps - max_steps
-    episodes = []
-    for _ in range(n_episodes):
-        start = random.randint(0, max_offset)
-        episodes.append((
-            frames[start : start + max_steps + 1],
-            actions[start : start + max_steps],
-            states[start : start + max_steps + 1],
-        ))
-    return episodes
+    def __len__(self):
+        return self.n_windows
+
+    def __getitem__(self, idx):
+        start = random.randint(0, self.max_offset)
+        end = start + self.window_len
+        return (
+            self.frames[start : end + 1],
+            self.actions[start:end],
+            self.states[start : end + 1],
+        )
 
 
 def _seeds_reaching_targets(
@@ -1064,23 +1045,3 @@ class PendulumStateDataset(Dataset):
         return self.states[idx], self.actions[idx]
 
 
-class PendulumDataset(Dataset):
-    """Episode-level dataset. Each item is a full episode.
-
-    frames  : (T+1, 3, img_size, img_size) float32 [0,1]
-    actions : (T,)  float32
-    states  : (T+1, 3) float32 — (cos(theta), sin(theta), theta_dot)
-    """
-
-    def __init__(
-        self, episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-    ):
-        self.frames = torch.stack([e[0] for e in episodes])  # (N, T+1, 3, H, W)
-        self.actions = torch.stack([e[1] for e in episodes])  # (N, T)
-        self.states = torch.stack([e[2] for e in episodes])  # (N, T+1, 3)
-
-    def __len__(self):
-        return len(self.frames)
-
-    def __getitem__(self, idx):
-        return self.frames[idx], self.actions[idx], self.states[idx]

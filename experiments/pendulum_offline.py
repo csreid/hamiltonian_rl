@@ -3,14 +3,16 @@
 Phase 1 (phase1 subcommand):
     Train the LSTM autoencoder (encoder + f_psi + decoder) for reconstruction.
     Loss = MSE(decoder(f_psi(z)[:q_dim]), frame) + kl_weight * KL.
-    After training, saves the raw training episodes (frames, actions,
-    ground-truth state) to episodes_cache.pt in the run directory, both for
-    Phase 2 (which re-encodes fresh windows through the frozen encoder each
-    batch — see below) and for later analysis.
+    Training data is one long switching-policy rollout (spin-CW / spin-CCW /
+    MPPI-balance / random blocks); each epoch samples fresh random windows
+    from it (PendulumRolloutDataset — no fixed episodes). Saves the raw
+    rollout (frames, actions, ground-truth state) to rollout_cache.pt in the
+    run directory, both for Phase 2 (which re-encodes fresh windows through
+    the frozen encoder each batch — see below) and for later analysis.
     Saves a unified world-model checkpoint with dynamics=None.
 
 Phase 2 (phase2 subcommand):
-    Load the cached episodes. Train a new HamiltonianFlowModel (Phi + H + J/R/B)
+    Load the cached rollout. Train a new HamiltonianFlowModel (Phi + H + J/R/B)
     that maps h_t → (q, p) such that Hamiltonian dynamics hold:
 
         L_tf  = MSE(phi^{-1}(RK4(phi(h_t), u_t)),  h_{t+1})       [teacher-forced, all t]
@@ -80,11 +82,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from data.pendulum import (
-    PendulumDataset,
-    collect_data,
+    PendulumRolloutDataset,
     collect_random_trajectories,
     collect_spin_trajectories,
-    collect_switching_data,
+    collect_switching_rollout,
     collect_val_trajectories,
     collect_zero_trajectories_targeted,
     _DRAG_COEFF,
@@ -1941,17 +1942,16 @@ def cli():
                    "from; training still writes to a fresh run dir, and the optimizer "
                    "and epoch count both restart from scratch")
 # data
-@click.option("--n-episodes", type=int, default=200, show_default=True)
+@click.option("--n-windows", type=int, default=200, show_default=True,
+              help="Random rollout windows sampled per training epoch")
 @click.option("--img-size", type=int, default=64, show_default=True)
-@click.option("--epsilon", type=float, default=0.1, show_default=True,
-              help="Fraction of steps with random uniform action")
 @click.option("--energy-k", type=float, default=1.0, show_default=True,
-              help="Gain for energy-pumping controller")
+              help="Gain for energy-pumping controller (val episodes only)")
 @click.option("--max-steps", type=int, default=200, show_default=True,
-              help="Number of steps per episode")
+              help="Steps per training window (val episodes default to 2x this)")
 @click.option("--rollout-steps", type=int, default=2000, show_default=True,
               help="Length of the single switching-policy rollout that training "
-                   "episodes are randomly windowed from (see collect_switching_data); "
+                   "windows are sampled from (see PendulumRolloutDataset); "
                    "must be >= --max-steps")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
@@ -1996,7 +1996,7 @@ def cli():
 @click.option("--val-every", type=int, default=10, show_default=True,
               help="Epochs between validation plots (0 to disable)")
 @click.option("--n-val-episodes", type=int, default=-1, show_default=True,
-              help="Val episodes per type (-1 = n_episodes // 2)")
+              help="Val episodes per type (-1 = n_windows // 2)")
 @click.option("--val-max-steps", type=int, default=0, show_default=True,
               help="Steps per val episode (0 = 2x --max-steps)")
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
@@ -2013,34 +2013,28 @@ def phase1_cmd(**kwargs):
 
     n_val_episodes = kwargs["n_val_episodes"]
     if n_val_episodes < 0:
-        n_val_episodes = kwargs["n_episodes"] // 2
+        n_val_episodes = kwargs["n_windows"] // 2
     n_val = n_val_episodes if kwargs["val_every"] > 0 else 0
     val_steps = kwargs["val_max_steps"] or kwargs["max_steps"] * 2
 
-    # Train episodes are random-offset windows of a single long rollout whose
-    # policy cycles through spin-CW, spin-CCW, MPPI-balance and random blocks
-    # (see collect_switching_data) — one continuous trajectory rather than
-    # many independent short ones, so windows sliced from its interior carry
-    # real motion history instead of a cold start.
-    print(
-        f"\nCollecting a {kwargs['rollout_steps']}-step switching rollout and "
-        f"windowing {kwargs['n_episodes']} train episodes ({kwargs['max_steps']} steps each)..."
-    )
-    episodes = collect_switching_data(
-        n_episodes=kwargs["n_episodes"],
+    # Training data is a single long rollout whose policy cycles through
+    # spin-CW, spin-CCW, MPPI-balance and random blocks — one continuous
+    # trajectory, no episodes. Training samples fresh random windows from it
+    # each epoch (see PendulumRolloutDataset).
+    print(f"\nCollecting a {kwargs['rollout_steps']}-step switching rollout...")
+    rollout = collect_switching_rollout(
+        n_steps=kwargs["rollout_steps"],
         img_size=kwargs["img_size"],
-        max_steps=kwargs["max_steps"],
-        rollout_steps=kwargs["rollout_steps"],
         damping=kwargs["damping"],
     )
 
-    # Save the raw training episodes (frames, actions, ground-truth state) right
-    # away — Phase 2 re-encodes windows of these through the frozen encoder each
-    # batch, and this cache also doubles as a dataset for later analysis. Saved
-    # before training starts so it survives even if training is interrupted.
-    episodes_cache_path = run_dir / "episodes_cache.pt"
-    torch.save(episodes, episodes_cache_path)
-    print(f"Saved episode cache ({len(episodes)} episodes) to {episodes_cache_path}")
+    # Save the raw rollout (frames, actions, ground-truth state) right away —
+    # Phase 2/3 re-window and re-encode it each batch, and this cache also
+    # doubles as a dataset for later analysis. Saved before training starts so
+    # it survives even if training is interrupted.
+    rollout_cache_path = run_dir / "rollout_cache.pt"
+    torch.save(rollout, rollout_cache_path)
+    print(f"Saved rollout cache ({kwargs['rollout_steps']} steps) to {rollout_cache_path}")
 
     val_energy, val_random, val_spin = [], [], []
     if n_val > 0:
@@ -2058,16 +2052,18 @@ def phase1_cmd(**kwargs):
             max_steps=val_steps, damping=kwargs["damping"],
         )
 
-    coverage_fig = _plot_phase_space_coverage(episodes)
+    coverage_fig = _plot_phase_space_coverage([rollout])
     writer.add_figure("data/phase_space_coverage", coverage_fig, 0)
     plt.close(coverage_fig)
 
-    dataset = PendulumDataset(episodes)
+    dataset = PendulumRolloutDataset(
+        rollout, window_len=kwargs["max_steps"], n_windows=kwargs["n_windows"],
+    )
     loader = DataLoader(
-        dataset, batch_size=kwargs["batch_size"], shuffle=True,
+        dataset, batch_size=kwargs["batch_size"], shuffle=False,
         num_workers=0, pin_memory=device.type == "cuda",
     )
-    print(f"Dataset: {len(dataset)} episodes")
+    print(f"Dataset: {len(dataset)} windows/epoch of {dataset.window_len} steps")
 
     model = TemporalAutoencoder(
         latent_dim=kwargs["latent_dim"],
@@ -2088,10 +2084,11 @@ def phase1_cmd(**kwargs):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
 
-    # How the training episodes were collected — saved into the checkpoint so
-    # Phase 2 and the dashboard can reproduce matching episodes.
+    # How the training rollout was collected — saved into the checkpoint so
+    # Phase 2 and the dashboard can reproduce matching data.
     data_config = {k: kwargs[k] for k in (
-        "n_episodes", "img_size", "epsilon", "energy_k", "max_steps", "damping",
+        "n_windows", "rollout_steps", "img_size", "energy_k",
+        "max_steps", "damping",
     )}
     world_model = WorldModel(model, dynamics=None, data_config=data_config)
 
@@ -2204,7 +2201,7 @@ def phase1_cmd(**kwargs):
                 device=device, writer=writer, epoch=epoch,
             )
             _log_reconstruction_lstm_video(
-                model=model, val_traj=episodes[0],
+                model=model, val_traj=dataset[0],  # a fresh random window
                 device=device, writer=writer, epoch=epoch,
                 tag="train/reconstruction_lstm",
             )
@@ -2231,12 +2228,12 @@ def phase1_cmd(**kwargs):
 # input — architecture + data params are loaded from the Phase 1 checkpoint
 @click.option("--phase1-run", type=str, required=True,
               help="Path to a Phase 1 run directory; loads best.pt (arch/data config + "
-                   "autoencoder weights) and episodes_cache.pt for training episodes")
+                   "autoencoder weights) and rollout_cache.pt for training data")
 @click.option("--phase1-checkpoint", type=str, default=None,
               help="Override the Phase 1 checkpoint (default: {phase1-run}/best.pt, "
                    "falling back to final.pt)")
-@click.option("--episode-cache", type=str, default=None,
-              help="Override the episode cache path (default: {phase1-run}/episodes_cache.pt)")
+@click.option("--rollout-cache", type=str, default=None,
+              help="Override the rollout cache path (default: {phase1-run}/rollout_cache.pt)")
 @click.option("--resume-from", type=str, default=None,
               help="Path to a Phase 2 checkpoint (.pt) whose dynamics weights to warm-start "
                    "from; training still writes to a fresh run dir, and the optimizer "
@@ -2320,7 +2317,7 @@ def phase1_cmd(**kwargs):
 @click.option("--val-every", type=int, default=10, show_default=True,
               help="Epochs between dreaming video logs (0 to disable; requires Phase 1 model)")
 @click.option("--n-val-episodes", type=int, default=-1, show_default=True,
-              help="Val episodes per type (-1 = phase1 n_episodes // 2)")
+              help="Val episodes per type (-1 = phase1 n_windows // 2)")
 @click.option("--val-max-steps", type=int, default=0, show_default=True,
               help="Steps per val episode (0 = 2x phase1 max_steps)")
 @click.option("--val-context-frames", type=int, default=5, show_default=True,
@@ -2343,7 +2340,7 @@ def phase2_cmd(**kwargs):
         raise click.UsageError(
             f"No Phase 1 checkpoint found in {run1} (expected best.pt or final.pt)."
         )
-    episode_cache_path = kwargs["episode_cache"] or str(run1 / "episodes_cache.pt")
+    rollout_cache_path = kwargs["rollout_cache"] or str(run1 / "rollout_cache.pt")
 
     writer = SummaryWriter(comment="_pendulum_offline_phase2")
     run_dir = make_run_dir("pendulum_offline_phase2")
@@ -2357,14 +2354,14 @@ def phase2_cmd(**kwargs):
         f"{k}={v}" for k, v in {**phase1_model.config, **data_cfg}.items()
     ))
 
-    # Load episode cache
-    if not Path(episode_cache_path).exists():
+    # Load rollout cache
+    if not Path(rollout_cache_path).exists():
         raise click.UsageError(
-            f"Episode cache not found at {episode_cache_path}. "
-            "Re-run Phase 1 to regenerate it, or pass --episode-cache explicitly."
+            f"Rollout cache not found at {rollout_cache_path}. "
+            "Re-run Phase 1 to regenerate it, or pass --rollout-cache explicitly."
         )
-    print(f"Loading episode cache from {episode_cache_path}...")
-    episodes = torch.load(episode_cache_path, weights_only=False)
+    print(f"Loading rollout cache from {rollout_cache_path}...")
+    rollout = torch.load(rollout_cache_path, weights_only=False)
 
     # Collect val episodes (only if dreaming logs are enabled)
     train_sample_trajs = []
@@ -2373,7 +2370,7 @@ def phase2_cmd(**kwargs):
     if kwargs["val_every"] > 0:
         n_val = kwargs["n_val_episodes"]
         if n_val < 0:
-            n_val = data_cfg.get("n_episodes", 200) // 2
+            n_val = data_cfg.get("n_windows", 200) // 2
         val_steps = kwargs["val_max_steps"] or data_cfg.get("max_steps", 200) * 2
         img_size = data_cfg.get("img_size", 64)
         damping = data_cfg.get("damping", 0.0)
@@ -2391,15 +2388,13 @@ def phase2_cmd(**kwargs):
             n_episodes=n_val, img_size=img_size,
             max_steps=val_steps, damping=damping,
         )
-        print("Collecting 3 training-distribution episodes for video logging...")
-        train_sample_trajs = collect_data(
-            n_episodes=3,
-            img_size=img_size,
-            epsilon=data_cfg.get("epsilon", 0.1),
-            energy_k=data_cfg.get("energy_k", 1.0),
-            max_steps=data_cfg.get("max_steps", 200),
-            damping=damping,
-        )
+        print("Sampling 3 training-distribution rollout windows for video logging...")
+        train_sample_trajs = [
+            PendulumRolloutDataset(
+                rollout, window_len=data_cfg.get("max_steps", 200), n_windows=3,
+            )[i]
+            for i in range(3)
+        ]
         print("Collecting grid episodes for energy-landscape logging...")
         energy_grid_episodes = _collect_energy_grid_episodes(
             img_size=img_size, damping=damping,
@@ -2410,14 +2405,14 @@ def phase2_cmd(**kwargs):
     latent_dim = phase1_model.config["latent_dim"]
     print(f"Latent dim from Phase 1 config: {latent_dim}")
 
-    # Per-dim std of h across the training episodes — used to scale augmentation
+    # Per-dim std of h across the training rollout — used to scale augmentation
     # noise so --h-noise-std acts as a multiplier on each dimension's spread.
-    # Encoded with full episode history (not windowed) purely as a one-off scale
+    # Encoded with full rollout history (not windowed) purely as a one-off scale
     # estimate; it doesn't need to match the windowed encoding used in training.
     h_noise_scale = None
     if kwargs["h_noise_std"] > 0:
         with torch.no_grad():
-            h_all_full, _ = _encode_val_h(phase1_model, episodes, device)
+            h_all_full, _ = _encode_val_h(phase1_model, [rollout], device)
             h_noise_scale = h_all_full.reshape(-1, latent_dim).std(dim=0)
         print(
             f"h noise: std={kwargs['h_noise_std']} × per-dim spread "
@@ -2425,12 +2420,19 @@ def phase2_cmd(**kwargs):
         )
         del h_all_full
 
-    episode_dataset = PendulumDataset(episodes)
-    episode_loader = DataLoader(
-        episode_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
+    rollout_dataset = PendulumRolloutDataset(
+        rollout,
+        window_len=data_cfg.get("max_steps", 200),
+        n_windows=data_cfg.get("n_windows", 200),
+    )
+    rollout_loader = DataLoader(
+        rollout_dataset, batch_size=kwargs["batch_size"], shuffle=False, num_workers=0,
         pin_memory=device.type == "cuda",
     )
-    print(f"Episode dataset: {len(episode_dataset)} episodes")
+    print(
+        f"Rollout dataset: {len(rollout_dataset)} windows/epoch "
+        f"of {rollout_dataset.window_len} steps"
+    )
 
     dyn_model = HamiltonianFlowModel(
         latent_dim=latent_dim,
@@ -2482,8 +2484,8 @@ def phase2_cmd(**kwargs):
     _log_hparams_text(writer, hparams)
     _log_hparams_table(writer, hparams, {})
 
-    episode_len = episodes[0][1].shape[0]  # actions per episode
-    full_seq_len = episode_len - kwargs["seed_ctx_len"] + 1  # max T given seed_ctx_len
+    window_len = rollout_dataset.window_len  # actions per training window
+    full_seq_len = window_len - kwargs["seed_ctx_len"] + 1  # max T given seed_ctx_len
     if kwargs["max_seq_len"] > 0:
         full_seq_len = min(full_seq_len, kwargs["max_seq_len"])
     seq_len = min(kwargs["seq_len_start"], full_seq_len)
@@ -2497,7 +2499,7 @@ def phase2_cmd(**kwargs):
         metrics = _train_epoch_phase2(
             dyn_model=dyn_model,
             encoder=phase1_model.encoder,
-            loader=episode_loader,
+            loader=rollout_loader,
             optimizer=optimizer,
             grad_clip=kwargs["grad_clip"],
             device=device,
@@ -2647,7 +2649,7 @@ def phase2_cmd(**kwargs):
 
 @cli.command("phase3")
 # input — everything (arch, data params, both sets of weights) comes from the
-# Phase 2 checkpoint; the episode cache is found via the Phase 1 run recorded
+# Phase 2 checkpoint; the rollout cache is found via the Phase 1 run recorded
 # in its hparams
 @click.option("--phase2-run", type=str, required=True,
               help="Path to a Phase 2 run directory; loads best.pt (full world model: "
@@ -2655,12 +2657,12 @@ def phase2_cmd(**kwargs):
 @click.option("--phase2-checkpoint", type=str, default=None,
               help="Override the Phase 2 checkpoint (default: {phase2-run}/best.pt, "
                    "falling back to final.pt)")
-@click.option("--episode-cache", type=str, default=None,
-              help="Override the episode cache path (default: episodes_cache.pt in the "
+@click.option("--rollout-cache", type=str, default=None,
+              help="Override the rollout cache path (default: rollout_cache.pt in the "
                    "Phase 1 run recorded in the Phase 2 checkpoint's hparams)")
 @click.option("--resume-from", type=str, default=None,
               help="Path to a Phase 3 checkpoint (.pt) whose full world-model weights "
-                   "(autoencoder + dynamics) to warm-start from; config and the episode "
+                   "(autoencoder + dynamics) to warm-start from; config and the rollout "
                    "cache still resolve through --phase2-run, training writes to a fresh "
                    "run dir, and the optimizer and epoch count both restart from scratch")
 # training
@@ -2732,7 +2734,7 @@ def phase2_cmd(**kwargs):
 @click.option("--val-every", type=int, default=10, show_default=True,
               help="Epochs between validation logs (0 to disable)")
 @click.option("--n-val-episodes", type=int, default=-1, show_default=True,
-              help="Val episodes per type (-1 = phase1 n_episodes // 2)")
+              help="Val episodes per type (-1 = phase1 n_windows // 2)")
 @click.option("--val-max-steps", type=int, default=0, show_default=True,
               help="Steps per val episode (0 = 2x phase1 max_steps)")
 @click.option("--val-context-frames", type=int, default=5, show_default=True,
@@ -2756,7 +2758,7 @@ def phase3_cmd(**kwargs):
             f"No Phase 2 checkpoint found in {run2} (expected best.pt or final.pt)."
         )
 
-    # Peek at the checkpoint payload for the Phase 1 run path (episode cache
+    # Peek at the checkpoint payload for the Phase 1 run path (rollout cache
     # default) and to fail early on a Phase 1-only checkpoint.
     payload = torch.load(phase2_ckpt, map_location="cpu", weights_only=True)
     if payload.get("dynamics") is None:
@@ -2767,19 +2769,19 @@ def phase3_cmd(**kwargs):
     phase1_run = (payload.get("hparams") or {}).get("phase1_run")
     del payload
 
-    if kwargs["episode_cache"]:
-        episode_cache_path = Path(kwargs["episode_cache"])
+    if kwargs["rollout_cache"]:
+        rollout_cache_path = Path(kwargs["rollout_cache"])
     elif phase1_run:
-        episode_cache_path = Path(phase1_run) / "episodes_cache.pt"
+        rollout_cache_path = Path(phase1_run) / "rollout_cache.pt"
     else:
         raise click.UsageError(
             f"{phase2_ckpt} records no phase1_run in its hparams; "
-            "pass --episode-cache explicitly."
+            "pass --rollout-cache explicitly."
         )
-    if not episode_cache_path.exists():
+    if not rollout_cache_path.exists():
         raise click.UsageError(
-            f"Episode cache not found at {episode_cache_path}. "
-            "Pass --episode-cache explicitly."
+            f"Rollout cache not found at {rollout_cache_path}. "
+            "Pass --rollout-cache explicitly."
         )
 
     writer = SummaryWriter(comment="_pendulum_offline_phase3")
@@ -2806,8 +2808,8 @@ def phase3_cmd(**kwargs):
         dyn_model.load_state_dict(resume_model.dynamics.state_dict())
         del resume_model
 
-    print(f"Loading episode cache from {episode_cache_path}...")
-    episodes = torch.load(episode_cache_path, weights_only=False)
+    print(f"Loading rollout cache from {rollout_cache_path}...")
+    rollout = torch.load(rollout_cache_path, weights_only=False)
 
     # Collect val episodes (only if validation logs are enabled)
     train_sample_trajs = []
@@ -2816,7 +2818,7 @@ def phase3_cmd(**kwargs):
     if kwargs["val_every"] > 0:
         n_val = kwargs["n_val_episodes"]
         if n_val < 0:
-            n_val = data_cfg.get("n_episodes", 200) // 2
+            n_val = data_cfg.get("n_windows", 200) // 2
         val_steps = kwargs["val_max_steps"] or data_cfg.get("max_steps", 200) * 2
         img_size = data_cfg.get("img_size", 64)
         damping = data_cfg.get("damping", 0.0)
@@ -2834,15 +2836,13 @@ def phase3_cmd(**kwargs):
             n_episodes=n_val, img_size=img_size,
             max_steps=val_steps, damping=damping,
         )
-        print("Collecting 3 training-distribution episodes for video logging...")
-        train_sample_trajs = collect_data(
-            n_episodes=3,
-            img_size=img_size,
-            epsilon=data_cfg.get("epsilon", 0.1),
-            energy_k=data_cfg.get("energy_k", 1.0),
-            max_steps=data_cfg.get("max_steps", 200),
-            damping=damping,
-        )
+        print("Sampling 3 training-distribution rollout windows for video logging...")
+        train_sample_trajs = [
+            PendulumRolloutDataset(
+                rollout, window_len=data_cfg.get("max_steps", 200), n_windows=3,
+            )[i]
+            for i in range(3)
+        ]
         print("Collecting grid episodes for energy-landscape logging...")
         energy_grid_episodes = _collect_energy_grid_episodes(
             img_size=img_size, damping=damping,
@@ -2850,12 +2850,19 @@ def phase3_cmd(**kwargs):
             context_frames=kwargs["val_context_frames"],
         )
 
-    episode_dataset = PendulumDataset(episodes)
-    episode_loader = DataLoader(
-        episode_dataset, batch_size=kwargs["batch_size"], shuffle=True, num_workers=0,
+    rollout_dataset = PendulumRolloutDataset(
+        rollout,
+        window_len=data_cfg.get("max_steps", 200),
+        n_windows=data_cfg.get("n_windows", 200),
+    )
+    rollout_loader = DataLoader(
+        rollout_dataset, batch_size=kwargs["batch_size"], shuffle=False, num_workers=0,
         pin_memory=device.type == "cuda",
     )
-    print(f"Episode dataset: {len(episode_dataset)} episodes")
+    print(
+        f"Rollout dataset: {len(rollout_dataset)} windows/epoch "
+        f"of {rollout_dataset.window_len} steps"
+    )
 
     # Freezing + per-module param groups. requires_grad_(False) (not just
     # optimizer exclusion) so autograd skips the frozen subgraphs entirely.
@@ -2899,8 +2906,8 @@ def phase3_cmd(**kwargs):
     _log_hparams_text(writer, hparams)
     _log_hparams_table(writer, hparams, {})
 
-    episode_len = episodes[0][1].shape[0]  # actions per episode
-    full_seq_len = episode_len - kwargs["seed_ctx_len"] + 1
+    window_len = rollout_dataset.window_len  # actions per training window
+    full_seq_len = window_len - kwargs["seed_ctx_len"] + 1
     if kwargs["max_seq_len"] > 0:
         full_seq_len = min(full_seq_len, kwargs["max_seq_len"])
     seq_len = min(kwargs["seq_len_start"], full_seq_len)
@@ -2913,7 +2920,7 @@ def phase3_cmd(**kwargs):
     for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 3"):
         metrics = _train_epoch_phase3(
             world_model=world_model,
-            loader=episode_loader,
+            loader=rollout_loader,
             optimizer=optimizer,
             grad_clip=kwargs["grad_clip"],
             device=device,
