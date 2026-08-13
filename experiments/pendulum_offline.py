@@ -2190,6 +2190,9 @@ def phase1_cmd(**kwargs):
                    "batch, so training covers every part of the episode, not just the start.")
 @click.option("--seq-len-start", type=int, default=5, show_default=True,
               help="Initial closed-loop rollout length for curriculum")
+@click.option("--max-seq-len", type=int, default=0, show_default=True,
+              help="Cap on the curriculum's closed-loop rollout length "
+                   "(0 = no cap: grow to the full episode length)")
 @click.option("--seq-len-advance-threshold", type=float, default=0.005, show_default=True,
               help="Closed-loop EMA loss below which rollout length advances by 1")
 @click.option("--ema-alpha", type=float, default=0.99, show_default=True)
@@ -2365,7 +2368,9 @@ def phase2_cmd(**kwargs):
 
     episode_len = episodes[0][1].shape[0]  # actions per episode
     full_seq_len = episode_len - kwargs["seed_ctx_len"] + 1  # max T given seed_ctx_len
-    seq_len = kwargs["seq_len_start"]
+    if kwargs["max_seq_len"] > 0:
+        full_seq_len = min(full_seq_len, kwargs["max_seq_len"])
+    seq_len = min(kwargs["seq_len_start"], full_seq_len)
     ema_loss = None
     ema_cl = None   # separate EMA for closed-loop loss — gates seq_len curriculum
     best_loss = float("inf")
@@ -2535,6 +2540,11 @@ def phase2_cmd(**kwargs):
 @click.option("--episode-cache", type=str, default=None,
               help="Override the episode cache path (default: episodes_cache.pt in the "
                    "Phase 1 run recorded in the Phase 2 checkpoint's hparams)")
+@click.option("--resume-from", type=str, default=None,
+              help="Path to a Phase 3 checkpoint (.pt) whose full world-model weights "
+                   "(autoencoder + dynamics) to warm-start from; config and the episode "
+                   "cache still resolve through --phase2-run, training writes to a fresh "
+                   "run dir, and the optimizer and epoch count both restart from scratch")
 # training
 @click.option("--epochs", type=int, default=1000, show_default=True)
 @click.option("--batch-size", type=int, default=8, show_default=True,
@@ -2580,6 +2590,9 @@ def phase2_cmd(**kwargs):
               help="Frames of context encoded before each closed-loop seed (as Phase 2)")
 @click.option("--seq-len-start", type=int, default=5, show_default=True,
               help="Initial closed-loop rollout length for curriculum")
+@click.option("--max-seq-len", type=int, default=0, show_default=True,
+              help="Cap on the curriculum's closed-loop rollout length "
+                   "(0 = no cap: grow to the full episode length)")
 @click.option("--seq-len-advance-threshold", type=float, default=2e-3, show_default=True,
               help="Pixel closed-loop EMA loss below which rollout length advances by 1 "
                    "(pixel MSE scale — not comparable to Phase 2's h-space threshold)")
@@ -2653,6 +2666,18 @@ def phase3_cmd(**kwargs):
     print("World-model config: " + ", ".join(
         f"{k}={v}" for k, v in {**phase1_model.config, **dyn_model.config, **data_cfg}.items()
     ))
+
+    if kwargs["resume_from"]:
+        print(f"Resuming world-model weights from {kwargs['resume_from']}...")
+        resume_model = load_world_model(kwargs["resume_from"], device)
+        if resume_model.dynamics is None:
+            raise click.UsageError(
+                f"{kwargs['resume_from']} has no dynamics weights (Phase 1-only "
+                "checkpoint); Phase 3 needs a complete world model to resume from."
+            )
+        phase1_model.load_state_dict(resume_model.autoencoder.state_dict())
+        dyn_model.load_state_dict(resume_model.dynamics.state_dict())
+        del resume_model
 
     print(f"Loading episode cache from {episode_cache_path}...")
     episodes = torch.load(episode_cache_path, weights_only=False)
@@ -2749,7 +2774,9 @@ def phase3_cmd(**kwargs):
 
     episode_len = episodes[0][1].shape[0]  # actions per episode
     full_seq_len = episode_len - kwargs["seed_ctx_len"] + 1
-    seq_len = kwargs["seq_len_start"]
+    if kwargs["max_seq_len"] > 0:
+        full_seq_len = min(full_seq_len, kwargs["max_seq_len"])
+    seq_len = min(kwargs["seq_len_start"], full_seq_len)
     ema_loss = None
     ema_cl = None   # EMA of the PIXEL closed-loop loss — gates seq_len curriculum
     best_loss = float("inf")
