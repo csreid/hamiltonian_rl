@@ -404,6 +404,108 @@ def _plot_learned_energy_landscape(
 
     return fig
 
+
+def _plot_gradient_magnitude_landscape(
+    model: WorldModel,
+    episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    landscape_resolution: int = 200,
+    min_vel: float | None = None,
+    max_vel: float | None = None,
+    device: torch.device | None = None,
+) -> plt.Figure:
+    """Compare ‖∇H_true‖ against ‖∇H_learned‖ on the same phase-space grid.
+
+    Unlike H itself, ∇H is exactly what the dynamics consume — it is what's
+    actually being fit by the prediction losses (and, since it is squared
+    away from unknown affine gauge on H, comparable in shape even though H's
+    absolute values aren't). A flat/small ‖∇H_learned‖ where ‖∇H_true‖ is
+    large indicates real underfitting (or a term like the energy-balance
+    loss pulling H toward its trivial H ≡ const solution) rather than just
+    an unidentified additive/scale offset on H.
+
+    True gradient (closed form): H_true = θ̇²/2 + 1.5·g·(1+cosθ), so
+    ∇H_true = (∂H/∂θ, ∂H/∂θ̇) = (−1.5·g·sinθ, θ̇).
+
+    Learned gradient: ∇_z H_learned(q, p) via autograd, at the same encoded
+    (q, p) points used for the energy-landscape plot, mapped onto the same
+    (θ, θ̇) grid via `griddata` so the two panels are directly comparable in
+    *shape* (own color scales, like the energy-landscape plot — the gauge
+    freedom on H means only relative structure, not absolute magnitude, is
+    meaningful).
+    """
+    model.eval()
+    if device is None:
+        device = next(model.autoencoder.parameters()).device
+    dyn = model.dynamics
+    q_dim = dyn.latent_dim // 2
+
+    samples = _collect_grid_qp_samples(model, episodes, device=device)
+    q = samples["q"].to(device)
+    p = samples["p"].to(device)
+    with torch.enable_grad():
+        z = torch.cat([q, p], dim=-1).requires_grad_(True)
+        H_val = dyn.hamiltonian(z[:, :q_dim], z[:, q_dim:]).sum()
+        grad_H = torch.autograd.grad(H_val, z)[0]
+    grad_mag_learned = grad_H.norm(dim=-1).detach().cpu().numpy()
+
+    theta = samples["theta"].cpu().numpy()
+    theta_dot = samples["theta_dot"].cpu().numpy()
+    grad_mag_true = np.sqrt((1.5 * _G * np.sin(theta)) ** 2 + theta_dot**2)
+
+    if min_vel is None or max_vel is None:
+        vel_margin = 1.1
+        max_vel = float(np.abs(theta_dot).max()) * vel_margin
+        min_vel = -max_vel
+
+    theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
+    theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
+    grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
+    grad_mag_true_dense = torch.sqrt(
+        (1.5 * _G * torch.sin(grid_theta)) ** 2 + grid_theta_dot**2
+    ).numpy()
+
+    grad_mag_learned_dense = griddata(
+        points=np.stack([theta, theta_dot], axis=-1),
+        values=grad_mag_learned,
+        xi=(grid_theta.numpy(), grid_theta_dot.numpy()),
+        method="cubic",
+    )
+
+    extent = [-np.pi, np.pi, min_vel, max_vel]
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6), sharex=True, sharey=True)
+
+    im0 = axes[0].imshow(
+        grad_mag_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
+    )
+    axes[0].set_title("Ground truth")
+    fig.colorbar(im0, ax=axes[0], label="‖∇H_true‖", pad=0.02)
+
+    im1 = axes[1].imshow(
+        grad_mag_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
+    )
+    axes[1].set_title("Learned ‖∇H‖ (interpolated)")
+    fig.colorbar(im1, ax=axes[1], label="‖∇H_learned‖", pad=0.02)
+
+    im2 = axes[2].imshow(
+        grad_mag_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
+    )
+    axes[2].scatter(
+        theta, theta_dot, c=grad_mag_learned, cmap="viridis", vmin=im2.norm.vmin, vmax=im2.norm.vmax,
+        s=30, edgecolors="white", linewidths=0.6,
+    )
+    axes[2].set_title("Learned ‖∇H‖ (interpolated + measured points)")
+    fig.colorbar(im2, ax=axes[2], label="‖∇H_learned‖", pad=0.02)
+
+    for ax in axes:
+        ax.set_xlabel("θ (rad)")
+    axes[0].set_ylabel("θ̇ (rad/s)")
+
+    r = np.corrcoef(grad_mag_true, grad_mag_learned)[0, 1]
+    fig.suptitle(f"‖∇H_true‖ vs. ‖∇H_learned‖, Pearson r={r:.3f}")
+    fig.tight_layout()
+
+    return fig
+
 # ---------------------------------------------------------------------------
 # Phase 1: autoencoder training
 # ---------------------------------------------------------------------------
@@ -2632,6 +2734,11 @@ def phase2_cmd(**kwargs):
             )
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
             plt.close(energy_fig)
+            grad_mag_fig = _plot_gradient_magnitude_landscape(
+                world_model, energy_grid_episodes, device=device,
+            )
+            writer.add_figure("val/gradient_magnitude_landscape", grad_mag_fig, epoch)
+            plt.close(grad_mag_fig)
             if dyn_model._has_dissipation:
                 dissipation_fig = _plot_dissipation_landscape(
                     world_model,
@@ -3056,6 +3163,11 @@ def phase3_cmd(**kwargs):
             )
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
             plt.close(energy_fig)
+            grad_mag_fig = _plot_gradient_magnitude_landscape(
+                world_model, energy_grid_episodes, device=device,
+            )
+            writer.add_figure("val/gradient_magnitude_landscape", grad_mag_fig, epoch)
+            plt.close(grad_mag_fig)
             if dyn_model._has_dissipation:
                 dissipation_fig = _plot_dissipation_landscape(
                     world_model,
