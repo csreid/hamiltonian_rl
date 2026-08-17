@@ -614,6 +614,7 @@ def collect_switching_rollout(
     img_size: int,
     damping: float = 0.0,
     drag: float = _DRAG_COEFF,
+    epsilon: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One continuous rollout of ``n_steps`` that cycles through four behaviors
     in equal-length blocks: constant max-torque CW spin, constant max-torque
@@ -625,6 +626,16 @@ def collect_switching_rollout(
     later sliced out of the middle of this rollout (see
     ``PendulumRolloutDataset``) has genuine causal context for the encoder
     without needing the zero-action warmup those collectors rely on.
+
+    ``epsilon`` overrides the phase's action with a uniform-random one w.p.
+    epsilon at every step (same scheme as ``_collect_episodes``). This mainly
+    matters during the ``balance`` block: the MPPI controller there is a
+    deterministic closed-loop function of (theta, theta_dot), so without
+    dithering, every visit to a given near-upright state pairs with
+    essentially the same action — the learned model can't tell whether the
+    resulting motion came from the true restoring force or from the applied
+    torque, and H collapses/misfits in exactly that region. Dithering breaks
+    the state->action determinism so the two effects become separable.
 
     Returns the same (frames, actions, states) shapes as ``_collect_episodes``,
     but for the full ``n_steps``-long trajectory rather than one episode.
@@ -647,7 +658,10 @@ def collect_switching_rollout(
         for t in tqdm(range(n_steps), desc="Collecting switching rollout"):
             phase = _SWITCHING_PHASES[min(t // block, n_phases - 1)]
             theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
-            action = _switching_phase_action(phase, theta, theta_dot, balance_policy)
+            if epsilon > 0.0 and random.random() < epsilon:
+                action = float(np.random.uniform(-2.0, 2.0))
+            else:
+                action = _switching_phase_action(phase, theta, theta_dot, balance_policy)
 
             obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
             theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]

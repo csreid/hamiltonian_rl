@@ -2107,6 +2107,13 @@ def cli():
                    "must be >= --max-steps")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
+@click.option("--dither-epsilon", type=float, default=0.1, show_default=True,
+              help="Probability of overriding the switching-rollout policy's action "
+                   "with a uniform-random one at each step. Chiefly matters for the "
+                   "balance block: the MPPI controller there is a deterministic "
+                   "function of (theta, theta_dot), so without dithering, action and "
+                   "state are collinear near the upright and the learned Hamiltonian "
+                   "can't disambiguate real physics from applied torque there.")
 # model architecture
 @click.option("--pos-ch", type=int, default=8, show_default=True)
 @click.option("--feat-dim", type=int, default=256, show_default=True)
@@ -2178,6 +2185,7 @@ def phase1_cmd(**kwargs):
         n_steps=kwargs["rollout_steps"],
         img_size=kwargs["img_size"],
         damping=kwargs["damping"],
+        epsilon=kwargs["dither_epsilon"],
     )
 
     # Save the raw rollout (frames, actions, ground-truth state) right away —
@@ -2242,7 +2250,7 @@ def phase1_cmd(**kwargs):
     # Phase 2 and the dashboard can reproduce matching data.
     data_config = {k: kwargs[k] for k in (
         "n_windows", "rollout_steps", "img_size", "energy_k",
-        "max_steps", "damping",
+        "max_steps", "damping", "dither_epsilon",
     )}
     world_model = WorldModel(model, dynamics=None, data_config=data_config)
 
