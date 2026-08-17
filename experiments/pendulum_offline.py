@@ -91,6 +91,7 @@ from data.pendulum import (
     _DRAG_COEFF,
     _G,
     _MAX_SPEED,
+    _SWITCHING_PHASES,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
 from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldModel
@@ -176,6 +177,55 @@ def _plot_phase_space_coverage(
     fig.tight_layout()
 
     return fig
+
+
+def _log_training_rollout(
+    rollout: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    writer: SummaryWriter,
+    tag: str = "data/rollout",
+    fps: int = 30,
+) -> None:
+    """Log the full switching training rollout to TensorBoard.
+
+    Two views: a step-annotated video of every frame, and a θ/θ̇/action
+    time-series with the policy-phase block boundaries marked — since every
+    training window is sampled out of this one trajectory, this is the whole
+    training distribution in one place.
+    """
+    frames, actions, states = rollout
+
+    annotated = torch.stack(
+        [_annotate_frame(frames[i], f"{i}") for i in range(len(frames))]
+    ).unsqueeze(0)
+    writer.add_video(f"{tag}/video", (annotated.clamp(0, 1) * 255).byte(), 0, fps=fps)
+
+    theta = torch.atan2(states[:, 1], states[:, 0]).numpy()
+    theta_dot = states[:, 2].numpy()
+    n_steps = actions.shape[0]
+    block = max(1, n_steps // len(_SWITCHING_PHASES))
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 7), sharex=True)
+    for ax, series, label in (
+        (axes[0], theta, "θ (rad)"),
+        (axes[1], theta_dot, "θ̇ (rad/s)"),
+        (axes[2], actions.numpy(), "action (torque)"),
+    ):
+        ax.plot(series, linewidth=0.7)
+        ax.set_ylabel(label)
+        for b in range(1, len(_SWITCHING_PHASES)):
+            ax.axvline(b * block, color="gray", linestyle="--", linewidth=0.8)
+    for i, phase in enumerate(_SWITCHING_PHASES):
+        start = i * block
+        end = n_steps if i == len(_SWITCHING_PHASES) - 1 else (i + 1) * block
+        axes[0].text(
+            (start + end) / 2, axes[0].get_ylim()[1], phase,
+            ha="center", va="bottom", fontsize=9, color="gray",
+        )
+    axes[-1].set_xlabel("step")
+    fig.suptitle(f"Training rollout ({n_steps} steps)")
+    fig.tight_layout()
+    writer.add_figure(f"{tag}/timeseries", fig, 0)
+    plt.close(fig)
 
 
 def _collect_energy_grid_episodes(
@@ -2036,6 +2086,8 @@ def phase1_cmd(**kwargs):
     torch.save(rollout, rollout_cache_path)
     print(f"Saved rollout cache ({kwargs['rollout_steps']} steps) to {rollout_cache_path}")
 
+    _log_training_rollout(rollout, writer)
+
     val_energy, val_random, val_spin = [], [], []
     if n_val > 0:
         print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
@@ -2362,6 +2414,7 @@ def phase2_cmd(**kwargs):
         )
     print(f"Loading rollout cache from {rollout_cache_path}...")
     rollout = torch.load(rollout_cache_path, weights_only=False)
+    _log_training_rollout(rollout, writer)
 
     # Collect val episodes (only if dreaming logs are enabled)
     train_sample_trajs = []
@@ -2810,6 +2863,7 @@ def phase3_cmd(**kwargs):
 
     print(f"Loading rollout cache from {rollout_cache_path}...")
     rollout = torch.load(rollout_cache_path, weights_only=False)
+    _log_training_rollout(rollout, writer)
 
     # Collect val episodes (only if validation logs are enabled)
     train_sample_trajs = []
