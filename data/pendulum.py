@@ -380,7 +380,7 @@ def _collect_episodes(
     seeds = _targeted_grid_seeds(n_episodes, warmup, damping=damping, drag=env.drag)
 
     try:
-        for i in tqdm(range(n_episodes), desc=desc):
+        for i in tqdm(range(n_episodes), desc=desc, dynamic_ncols=True):
             kp = random.uniform(2.0, 15.0)
             kd = random.uniform(0.5, 5.0)
 
@@ -485,7 +485,7 @@ def _collect_spin_episodes(
     seeds = _targeted_grid_seeds(n_episodes, warmup, damping=damping, drag=env.drag)
 
     try:
-        for i in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
+        for i in tqdm(range(n_episodes), desc="Val trajectories (spin)", dynamic_ncols=True):
             env.reset()
             theta0, theta_dot0 = seeds[i]
             obs = env.set_state(theta0, theta_dot0)
@@ -655,7 +655,7 @@ def collect_switching_rollout(
         actions = []
         states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
-        for t in tqdm(range(n_steps), desc="Collecting switching rollout"):
+        for t in tqdm(range(n_steps), desc="Collecting switching rollout", dynamic_ncols=True):
             phase = _SWITCHING_PHASES[min(t // block, n_phases - 1)]
             theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
             if epsilon > 0.0 and random.random() < epsilon:
@@ -772,7 +772,7 @@ def _collect_zero_episodes(
         seeds = _grid_seeds(n_episodes)
 
     try:
-        for i in tqdm(range(n_episodes), desc="Val trajectories (zero action)"):
+        for i in tqdm(range(n_episodes), desc="Val trajectories (zero action)", dynamic_ncols=True):
             env.reset()
             theta0, theta_dot0 = seeds[i]
             obs = env.set_state(theta0, theta_dot0)
@@ -911,7 +911,7 @@ def _collect_state_only_episodes(
     episodes = []
     seeds = _grid_seeds(n_episodes)
 
-    for i in tqdm(range(n_episodes), desc=desc):
+    for i in tqdm(range(n_episodes), desc=desc, dynamic_ncols=True):
         kp = random.uniform(2.0, 15.0)
         kd = random.uniform(0.5, 5.0)
 
@@ -1005,7 +1005,7 @@ def _collect_state_spin_episodes(
     episodes = []
     seeds = _grid_seeds(n_episodes)
 
-    for i in tqdm(range(n_episodes), desc="Val trajectories (spin)"):
+    for i in tqdm(range(n_episodes), desc="Val trajectories (spin)", dynamic_ncols=True):
         theta, theta_dot = (float(x) for x in seeds[i])
         states = [np.array([theta, theta_dot], dtype=np.float32)]
         actions = []

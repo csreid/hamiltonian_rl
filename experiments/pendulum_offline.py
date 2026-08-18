@@ -2262,7 +2262,7 @@ def phase1_cmd(**kwargs):
     converge_streak = 0
 
     print("\n=== Phase 1: reconstruction training ===")
-    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 1"):
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 1", dynamic_ncols=True):
         metrics = _train_epoch_phase1(
             model=model,
             loader=loader,
@@ -2658,7 +2658,7 @@ def phase2_cmd(**kwargs):
     converge_streak = 0
 
     print("\n=== Phase 2: dynamics flow training ===")
-    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 2"):
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 2", dynamic_ncols=True):
         metrics = _train_epoch_phase2(
             dyn_model=dyn_model,
             encoder=phase1_model.encoder,
@@ -3086,7 +3086,7 @@ def phase3_cmd(**kwargs):
     converge_streak = 0
 
     print("\n=== Phase 3: end-to-end finetuning ===")
-    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 3"):
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 3", dynamic_ncols=True):
         metrics = _train_epoch_phase3(
             world_model=world_model,
             loader=rollout_loader,

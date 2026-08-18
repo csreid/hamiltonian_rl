@@ -793,7 +793,7 @@ def main(**kwargs):
     ema_loss = None
 
     print("\n=== Training ===")
-    for epoch in tqdm(range(kwargs["epochs"]), desc="Training"):
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Training", dynamic_ncols=True):
         metrics = _train_epoch(
             model=model,
             loader=loader,
