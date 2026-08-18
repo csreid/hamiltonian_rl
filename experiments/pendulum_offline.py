@@ -522,6 +522,7 @@ def _train_epoch_phase1(
     temporal_reg_weight: float = 0.0,
     temporal_scale: float = 0.01,
     sparsity_weight: float = 0.0,
+    gate_weight: float = 0.0,
     max_context_len: int = 0,
     deterministic: bool = False,
 ) -> dict[str, float]:
@@ -538,7 +539,7 @@ def _train_epoch_phase1(
     either way — only the training-time treatment of h changes.
     """
     model.train()
-    total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_loss = 0.0
+    total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_gate = total_loss = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
@@ -597,6 +598,15 @@ def _train_epoch_phase1(
             loss = loss + sparsity_weight * sparsity
             total_sparsity = total_sparsity + sparsity.detach()
 
+        # L0 gate regulariser: expected number of active latent dims, from
+        # the encoder's learned per-dim HardConcreteGate (see hamilton_rl.models).
+        # Unlike L1 above, dims that stay open pay no magnitude penalty and
+        # dims that close are multiplied to exactly 0 rather than shrunk.
+        if gate_weight > 0 and model.encoder.gate is not None:
+            gate_penalty = model.encoder.gate.l0_penalty()
+            loss = loss + gate_weight * gate_penalty
+            total_gate = total_gate + gate_penalty.detach()
+
         # Temporal metric regulariser: random pairs should be at least
         # temporal_scale * |t1 - t2| apart in h-space.  One-sided so we only
         # penalise being too close, not too far.
@@ -633,6 +643,10 @@ def _train_epoch_phase1(
         "phase1/kl": float(total_kl) / n,
         "phase1/temporal_reg": float(total_temporal) / n,
         "phase1/sparsity": float(total_sparsity) / n,
+        "phase1/gate_l0": float(total_gate) / n,
+        "phase1/effective_dim": (
+            model.encoder.gate.effective_dim() if model.encoder.gate is not None else float("nan")
+        ),
     }
 
 
@@ -720,7 +734,12 @@ def _log_latent_distribution_phase1(
     h_sorted = h_pool[:, order].numpy()
     dim_h = h_sorted.shape[1]
 
-    fig, ax = plt.subplots(figsize=(max(8, dim_h * 0.35), 4))
+    has_gate = model.encoder.gate is not None
+    fig, axes = plt.subplots(
+        2 if has_gate else 1, 1, figsize=(max(8, dim_h * 0.35), 7 if has_gate else 4),
+        squeeze=False,
+    )
+    ax = axes[0, 0]
     parts = ax.violinplot(h_sorted, showmedians=False, showextrema=False)
     for pc in parts["bodies"]:
         pc.set_facecolor("tab:blue")
@@ -730,6 +749,18 @@ def _log_latent_distribution_phase1(
     ax.set_xlabel("h dimension (sorted by std, descending)")
     ax.set_ylabel("value")
     ax.set_title(f"LSTM latent value distribution, held-out trajectories (epoch {epoch + 1})")
+
+    if has_gate:
+        gate_probs = torch.sigmoid(model.encoder.gate.log_alpha.detach().cpu())[order].numpy()
+        ax2 = axes[1, 0]
+        ax2.bar(np.arange(1, dim_h + 1), gate_probs, color="tab:orange")
+        ax2.set_xticks(np.arange(1, dim_h + 1))
+        ax2.set_xticklabels([str(i.item()) for i in order], fontsize=6 if dim_h > 16 else 8)
+        ax2.set_xlabel("h dimension (same order as above)")
+        ax2.set_ylabel("sigmoid(log_alpha)")
+        ax2.set_ylim(0, 1)
+        ax2.set_title(f"Gate open probability (effective dim ≈ {model.encoder.gate.effective_dim():.2f})")
+
     fig.tight_layout()
     writer.add_figure(tag, fig, epoch)
     plt.close(fig)
@@ -769,9 +800,9 @@ def _log_markov_pairwise_probe_phase1(
     panels below check that reverse direction directly.
     """
     model.eval()
-    h_list, phase_list, traj_id_list = [], [], []
+    h_list, phase_list, traj_id_list, step_list, policy_list = [], [], [], [], []
     traj_id = 0
-    for val_trajs, _label in val_traj_sets:
+    for val_trajs, label in val_traj_sets:
         for frames, _actions, states in val_trajs:
             ctx = frames.unsqueeze(0).to(device)
             mu_all, _ = model.encoder.forward_all(ctx)
@@ -779,7 +810,10 @@ def _log_markov_pairwise_probe_phase1(
             phase = states.float().clone()
             phase[:, 2] = phase[:, 2] / _MAX_SPEED
             phase_list.append(phase)
-            traj_id_list.append(torch.full((frames.shape[0],), traj_id, dtype=torch.long))
+            n_t = frames.shape[0]
+            traj_id_list.append(torch.full((n_t,), traj_id, dtype=torch.long))
+            step_list.append(torch.arange(n_t, dtype=torch.long))
+            policy_list.extend([label] * n_t)
             traj_id += 1
 
     if traj_id < 2:
@@ -788,6 +822,8 @@ def _log_markov_pairwise_probe_phase1(
     h_all = torch.cat(h_list, dim=0)
     phase_all = torch.cat(phase_list, dim=0)
     traj_ids = torch.cat(traj_id_list, dim=0).numpy()
+    steps_all = torch.cat(step_list, dim=0).numpy()
+    policy_all = np.array(policy_list)
     n = h_all.shape[0]
 
     rng = np.random.default_rng(seed)
@@ -896,6 +932,78 @@ def _log_markov_pairwise_probe_phase1(
     )
     writer.add_scalar(f"{tag}_fold_score/median", fold_median, epoch)
     writer.add_scalar(f"{tag}_fold_score/p95", fold_p95, epoch)
+
+    # --- Tear diagnosis: among phase-neighbors, split into "clean" (h agrees
+    # they're close, near-0 delta_hidden) vs. "torn" (h places them as far
+    # apart as a typical random pair, despite matching phase). Torn is
+    # defined relative to the random-pair population so it adapts to scale:
+    # a phase-neighbor whose Δh looks statistically like Δh for an
+    # arbitrary, non-neighboring pair. Then check whether torn-ness
+    # correlates with crossing a policy boundary and/or with how far apart
+    # in trajectory step-index the two frames are.
+    policy_i, policy_j = policy_all[idx_i], policy_all[idx_j]
+    step_i, step_j = steps_all[idx_i], steps_all[idx_j]
+    same_policy = policy_i == policy_j
+    step_gap = np.abs(step_i.astype(np.int64) - step_j.astype(np.int64))
+
+    torn_thresh = float(np.percentile(delta_hidden, 25))
+    torn = is_neighbor & (delta_hidden >= torn_thresh)
+    clean = is_neighbor & ~torn
+
+    frac_same_policy_torn = float(same_policy[torn].mean()) if torn.any() else float("nan")
+    frac_same_policy_clean = float(same_policy[clean].mean()) if clean.any() else float("nan")
+    frac_same_policy_all = float(same_policy.mean())
+    median_step_gap_torn = float(np.median(step_gap[torn])) if torn.any() else float("nan")
+    median_step_gap_clean = float(np.median(step_gap[clean])) if clean.any() else float("nan")
+
+    writer.add_scalar(f"{tag}_tear/frac_same_policy_torn", frac_same_policy_torn, epoch)
+    writer.add_scalar(f"{tag}_tear/frac_same_policy_clean", frac_same_policy_clean, epoch)
+    writer.add_scalar(f"{tag}_tear/frac_same_policy_all_pairs", frac_same_policy_all, epoch)
+    writer.add_scalar(f"{tag}_tear/median_step_gap_torn", median_step_gap_torn, epoch)
+    writer.add_scalar(f"{tag}_tear/median_step_gap_clean", median_step_gap_clean, epoch)
+    writer.add_scalar(f"{tag}_tear/n_torn", int(torn.sum()), epoch)
+    writer.add_scalar(f"{tag}_tear/n_clean", int(clean.sum()), epoch)
+
+    fig2, axes2 = plt.subplots(1, 3, figsize=(15, 4.5))
+
+    ax = axes2[0]
+    bar_labels = ["clean\nneighbors", "torn\nneighbors", "all\npairs"]
+    same_fracs = [frac_same_policy_clean, frac_same_policy_torn, frac_same_policy_all]
+    ax.bar(bar_labels, same_fracs, color=["tab:green", "tab:red", "tab:gray"])
+    ax.set_ylabel("fraction same-policy pair")
+    ax.set_ylim(0, 1)
+    ax.set_title("Torn pairs: does the policy differ?")
+
+    ax = axes2[1]
+    max_gap = int(max(step_gap.max(), 1))
+    bins = np.linspace(0, max_gap, 40)
+    ax.hist(step_gap[clean], bins=bins, density=True, alpha=0.6, label=f"clean (n={clean.sum()})")
+    ax.hist(step_gap[torn], bins=bins, density=True, alpha=0.6, label=f"torn (n={torn.sum()})")
+    ax.set_xlabel("|step_i - step_j| (trajectory index gap)")
+    ax.set_title("Torn pairs: does the step-index gap differ?")
+    ax.legend(fontsize=8)
+
+    ax = axes2[2]
+    policies = sorted(set(policy_all.tolist()))
+    counts = np.zeros((len(policies), len(policies)))
+    for a, pa in enumerate(policies):
+        for b, pb in enumerate(policies):
+            mask = torn & (
+                ((policy_i == pa) & (policy_j == pb)) | ((policy_i == pb) & (policy_j == pa))
+            )
+            counts[a, b] = mask.sum()
+    im = ax.imshow(counts, cmap="viridis")
+    ax.set_xticks(range(len(policies)))
+    ax.set_xticklabels(policies, rotation=45, ha="right", fontsize=7)
+    ax.set_yticks(range(len(policies)))
+    ax.set_yticklabels(policies, fontsize=7)
+    ax.set_title("Torn pairs by policy combination")
+    fig2.colorbar(im, ax=ax, label="count", pad=0.02)
+
+    fig2.suptitle(f"Markov pairwise probe — tear diagnosis (epoch {epoch + 1})")
+    fig2.tight_layout()
+    writer.add_figure(f"{tag}_tear_diagnosis", fig2, epoch)
+    plt.close(fig2)
 
 
 @torch.no_grad()
@@ -2146,6 +2254,12 @@ def cli():
               help="Expected h-space distance per timestep")
 @click.option("--sparsity-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on latent mean, pushes irrelevant dims to 0 (0 to disable)")
+@click.option("--use-gate", is_flag=True, default=False, show_default=True,
+              help="Replace/augment L1 sparsity with a learned per-dim L0 "
+                   "hard-concrete gate on the latent mean")
+@click.option("--gate-weight", type=float, default=0.0, show_default=True,
+              help="L0 penalty weight on the expected number of active gate "
+                   "dims (0 to disable; requires --use-gate)")
 @click.option("--ema-alpha", type=float, default=0.99, show_default=True)
 @click.option("--convergence-patience", type=int, default=0, show_default=True,
               help="Epochs of stable EMA before stopping; 0 disables")
@@ -2235,6 +2349,7 @@ def phase1_cmd(**kwargs):
         control_dim=1,
         num_layers=kwargs["lstm_layers"],
         encoder_type=kwargs["encoder_type"],
+        use_gate=kwargs["use_gate"],
     ).to(device)
     print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -2274,6 +2389,7 @@ def phase1_cmd(**kwargs):
             temporal_reg_weight=kwargs["temporal_reg_weight"],
             temporal_scale=kwargs["temporal_scale"],
             sparsity_weight=kwargs["sparsity_weight"],
+            gate_weight=kwargs["gate_weight"],
             max_context_len=kwargs["max_context_len"],
             deterministic=kwargs["deterministic"],
         )

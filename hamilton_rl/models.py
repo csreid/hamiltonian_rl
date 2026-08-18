@@ -70,6 +70,48 @@ class FlexFrameCNN(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class HardConcreteGate(nn.Module):
+    """Per-dimension L0 gate (Louizos et al. 2017, https://arxiv.org/abs/1712.01312).
+
+    Learns one logit per latent dim controlling whether that dim is used at
+    all, separately from its value — unlike L1, kept dims pay no magnitude
+    penalty and dropped dims are exactly zero, not just discouraged.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        temperature: float = 2.0 / 3.0,
+        stretch: tuple[float, float] = (-0.1, 1.1),
+        init_open_prob: float = 0.9,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.gamma, self.zeta = stretch
+        init_logit = math.log(init_open_prob / (1 - init_open_prob))
+        self.log_alpha = nn.Parameter(torch.full((dim,), init_logit))
+
+    def _stretch(self, s: torch.Tensor) -> torch.Tensor:
+        return (s * (self.zeta - self.gamma) + self.gamma).clamp(0.0, 1.0)
+
+    def forward(self) -> torch.Tensor:
+        """Returns the (dim,) gate mask — stochastic if training, hard if eval."""
+        if self.training:
+            u = torch.rand_like(self.log_alpha).clamp(1e-6, 1 - 1e-6)
+            s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + self.log_alpha) / self.temperature)
+        else:
+            s = torch.sigmoid(self.log_alpha)
+        return self._stretch(s)
+
+    def l0_penalty(self) -> torch.Tensor:
+        """Expected number of active dims (differentiable) — the L0 regularizer."""
+        return torch.sigmoid(self.log_alpha - self.temperature * math.log(-self.gamma / self.zeta)).sum()
+
+    @torch.no_grad()
+    def effective_dim(self) -> float:
+        return float(self.l0_penalty().item())
+
+
 class FlexLSTMEncoder(nn.Module):
     """Causal LSTM encoder: image sequence → (mu, logvar) flat vectors.
 
@@ -87,6 +129,7 @@ class FlexLSTMEncoder(nn.Module):
         latent_dim: int = 32,
         img_size: int = 64,
         num_layers: int = 1,
+        use_gate: bool = False,
     ):
         super().__init__()
         self.feat_dim = feat_dim
@@ -101,6 +144,7 @@ class FlexLSTMEncoder(nn.Module):
         )
         self.mu_head = nn.Linear(feat_dim, latent_dim)
         self.logvar_head = nn.Linear(feat_dim, latent_dim)
+        self.gate = HardConcreteGate(latent_dim) if use_gate else None
 
     def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = imgs.shape
@@ -129,7 +173,10 @@ class FlexLSTMEncoder(nn.Module):
             _, (h_n, _) = self.lstm(feats)
 
         h = h_n[-1]  # (B, feat_dim) — final layer's hidden state at the last step
-        return self.mu_head(h), self.logvar_head(h)
+        mu = self.mu_head(h)
+        if self.gate is not None:
+            mu = mu * self.gate()
+        return mu, self.logvar_head(h)
 
     def forward_all(
         self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
@@ -156,7 +203,10 @@ class FlexLSTMEncoder(nn.Module):
             out, _ = self.lstm(feats)
 
         # out: (B, T, feat_dim) — per-timestep forward hidden states
-        return self.mu_head(out), self.logvar_head(out)
+        mu_all = self.mu_head(out)
+        if self.gate is not None:
+            mu_all = mu_all * self.gate()
+        return mu_all, self.logvar_head(out)
 
 
 class FrameStackEncoder(nn.Module):
@@ -177,6 +227,7 @@ class FrameStackEncoder(nn.Module):
         feat_dim: int = 256,
         latent_dim: int = 32,
         img_size: int = 64,
+        use_gate: bool = False,
     ):
         super().__init__()
         self.feat_dim = feat_dim
@@ -189,6 +240,7 @@ class FrameStackEncoder(nn.Module):
         )
         self.mu_head = nn.Linear(feat_dim, latent_dim)
         self.logvar_head = nn.Linear(feat_dim, latent_dim)
+        self.gate = HardConcreteGate(latent_dim) if use_gate else None
 
     def _embed_frames(self, imgs: torch.Tensor) -> torch.Tensor:
         B, T, C, H, W = imgs.shape
@@ -211,7 +263,10 @@ class FrameStackEncoder(nn.Module):
         feats = self._embed_frames(imgs)                       # (B, T, feat_dim)
         prev = torch.cat([feats[:, :1], feats[:, :-1]], dim=1)  # frame_{-1} := frame_0
         out = self.fuse(torch.cat([prev, feats], dim=-1))      # (B, T, feat_dim)
-        return self.mu_head(out), self.logvar_head(out)
+        mu_all = self.mu_head(out)
+        if self.gate is not None:
+            mu_all = mu_all * self.gate()
+        return mu_all, self.logvar_head(out)
 
     def forward(
         self, imgs: torch.Tensor, lengths: torch.Tensor | None = None
@@ -548,6 +603,8 @@ class TemporalAutoencoder(nn.Module):
         num_layers:   number of stacked LSTM layers (lstm encoder only)
         encoder_type: "lstm" (causal LSTM over frame embeddings) or "framestack"
                       (memoryless two-consecutive-frame encoder)
+        use_gate:     learn a per-dim L0 hard-concrete gate on the latent mean
+                      (see HardConcreteGate), in place of/alongside L1 sparsity
     """
 
     def __init__(
@@ -560,6 +617,7 @@ class TemporalAutoencoder(nn.Module):
         control_dim: int = 1,
         num_layers: int = 1,
         encoder_type: str = "lstm",
+        use_gate: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -572,6 +630,7 @@ class TemporalAutoencoder(nn.Module):
             "control_dim": control_dim,
             "num_layers": num_layers,
             "encoder_type": encoder_type,
+            "use_gate": use_gate,
         }
         q_dim = latent_dim // 2
 
@@ -582,6 +641,7 @@ class TemporalAutoencoder(nn.Module):
                 latent_dim=latent_dim,
                 img_size=img_size,
                 num_layers=num_layers,
+                use_gate=use_gate,
             )
         elif encoder_type == "framestack":
             self.encoder = FrameStackEncoder(
@@ -589,6 +649,7 @@ class TemporalAutoencoder(nn.Module):
                 feat_dim=feat_dim,
                 latent_dim=latent_dim,
                 img_size=img_size,
+                use_gate=use_gate,
             )
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type!r}")
