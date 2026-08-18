@@ -83,13 +83,23 @@ class HardConcreteGate(nn.Module):
         dim: int,
         temperature: float = 2.0 / 3.0,
         stretch: tuple[float, float] = (-0.1, 1.1),
-        init_open_prob: float = 0.9,
+        init_open_prob: float = 0.5,
+        init_std: float = 0.01,
     ):
         super().__init__()
         self.temperature = temperature
         self.gamma, self.zeta = stretch
+        # init_open_prob=0.5 (log_alpha≈0) keeps the initial stochastic gate
+        # samples centered in the unclipped region of the stretch interval —
+        # starting near-saturated-open (e.g. 0.9) makes samples land above 1
+        # and get hard-clamped almost every step, zeroing the reconstruction
+        # gradient into log_alpha and leaving only the smooth, dim-symmetric
+        # L0 penalty gradient, which drags every dim down in lockstep instead
+        # of letting useful dims diverge from useless ones. Small per-dim
+        # jitter (std=0.01, per Louizos et al.) breaks the tie so dims don't
+        # start bit-identical either.
         init_logit = math.log(init_open_prob / (1 - init_open_prob))
-        self.log_alpha = nn.Parameter(torch.full((dim,), init_logit))
+        self.log_alpha = nn.Parameter(torch.full((dim,), init_logit) + init_std * torch.randn(dim))
 
     def _stretch(self, s: torch.Tensor) -> torch.Tensor:
         return (s * (self.zeta - self.gamma) + self.gamma).clamp(0.0, 1.0)
