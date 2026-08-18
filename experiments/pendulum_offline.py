@@ -2260,6 +2260,19 @@ def cli():
 @click.option("--gate-weight", type=float, default=0.0, show_default=True,
               help="L0 penalty weight on the expected number of active gate "
                    "dims (0 to disable; requires --use-gate)")
+@click.option("--gate-warmup-epochs", type=int, default=200, show_default=True,
+              help="Epochs over which --gate-weight ramps linearly from 0 to "
+                   "its target value. Without warmup the L0 penalty starts "
+                   "at full strength before the encoder has learned to rely "
+                   "on any dim, so every gate loses the same trivial "
+                   "reconstruction argument and collapses to 0 in lockstep "
+                   "(a permanent dead zone, since the clamp in the hard-"
+                   "concrete gate has zero gradient there).")
+@click.option("--gate-lr-mult", type=float, default=0.1, show_default=True,
+              help="Multiplier on --lr for the gate's log_alpha parameters, "
+                   "so gates move slower than the encoder they're gating — "
+                   "gives the reconstruction signal more relative time to "
+                   "differentiate useful dims before the gate reacts")
 @click.option("--ema-alpha", type=float, default=0.99, show_default=True)
 @click.option("--convergence-patience", type=int, default=0, show_default=True,
               help="Epochs of stable EMA before stopping; 0 disables")
@@ -2359,7 +2372,16 @@ def phase1_cmd(**kwargs):
         model.load_state_dict(resume_model.autoencoder.state_dict())
         del resume_model
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
+    if model.encoder.gate is not None:
+        gate_params = list(model.encoder.gate.parameters())
+        gate_param_ids = {id(p) for p in gate_params}
+        other_params = [p for p in model.parameters() if id(p) not in gate_param_ids]
+        optimizer = torch.optim.Adam([
+            {"params": other_params, "lr": kwargs["lr"]},
+            {"params": gate_params, "lr": kwargs["lr"] * kwargs["gate_lr_mult"]},
+        ])
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=kwargs["lr"])
 
     # How the training rollout was collected — saved into the checkpoint so
     # Phase 2 and the dashboard can reproduce matching data.
@@ -2378,6 +2400,10 @@ def phase1_cmd(**kwargs):
 
     print("\n=== Phase 1: reconstruction training ===")
     for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 1", dynamic_ncols=True):
+        gate_warmup = kwargs["gate_warmup_epochs"]
+        gate_weight_epoch = kwargs["gate_weight"] * (
+            min(1.0, epoch / gate_warmup) if gate_warmup > 0 else 1.0
+        )
         metrics = _train_epoch_phase1(
             model=model,
             loader=loader,
@@ -2389,10 +2415,11 @@ def phase1_cmd(**kwargs):
             temporal_reg_weight=kwargs["temporal_reg_weight"],
             temporal_scale=kwargs["temporal_scale"],
             sparsity_weight=kwargs["sparsity_weight"],
-            gate_weight=kwargs["gate_weight"],
+            gate_weight=gate_weight_epoch,
             max_context_len=kwargs["max_context_len"],
             deterministic=kwargs["deterministic"],
         )
+        metrics["phase1/gate_weight_effective"] = gate_weight_epoch
 
         alpha = kwargs["ema_alpha"]
         prev_ema = ema_loss
