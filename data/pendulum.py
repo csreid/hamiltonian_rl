@@ -12,8 +12,6 @@ from gymnasium import spaces
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from hamilton_rl.mppi import MPPIConfig, mppi_plan, shift_mean
-
 # Pendulum-v1 physical constants (gymnasium defaults)
 _G = 10.0
 _H_STAR = 20.0  # 2 * m * g * l  with m=l=1, g=10
@@ -559,135 +557,76 @@ def _mppi_gt_cost_fn(
     return cost_fn
 
 
-_BALANCE_MPPI_CFG = MPPIConfig(
-    horizon=20, n_samples=256, n_iterations=1, noise_std=1.0, temperature=1.0,
-    action_low=-2.0, action_high=2.0,
-)
-_BALANCE_ACTION_WEIGHT = 0.001
-
-
-class _MPPIBalancePolicy:
-    """Closed-loop receding-horizon MPPI controller, warm-started across steps.
-
-    Plans against the same ground-truth analytic dynamics the real env
-    steps with (see module docstring above ``analytic_pendulum_step``), so
-    it needs no learned model to drive the "try to balance" phase of
-    ``_collect_switching_rollout``.
-    """
-
-    def __init__(self, damping: float, drag: float):
-        self.damping = damping
-        self.drag = drag
-        self.mean = torch.zeros(_BALANCE_MPPI_CFG.horizon, 1)
-
-    def act(self, theta: float, theta_dot: float) -> float:
-        cost_fn = _mppi_gt_cost_fn(
-            torch.tensor(float(theta)), torch.tensor(float(theta_dot)),
-            self.damping, _BALANCE_ACTION_WEIGHT, drag=self.drag,
-        )
-        self.mean = mppi_plan(self.mean, cost_fn, _BALANCE_MPPI_CFG)
-        u0 = float(self.mean[0, 0].clamp(_BALANCE_MPPI_CFG.action_low, _BALANCE_MPPI_CFG.action_high))
-        self.mean = shift_mean(self.mean)
-        return u0
-
-
-# Order matters only in that it determines which quarter of the rollout each
-# behavior occupies; equal-length blocks, MPPI-balance placed after both spin
-# directions so it always gets to recover from whichever spin state it's left in.
-_SWITCHING_PHASES = ("spin_cw", "spin_ccw", "balance", "random")
-
-
-def _switching_phase_action(
-    phase: str, theta: float, theta_dot: float, balance_policy: _MPPIBalancePolicy
-) -> float:
-    if phase == "spin_cw":
-        return 2.0
-    if phase == "spin_ccw":
-        return -2.0
-    if phase == "balance":
-        return balance_policy.act(theta, theta_dot)
-    return float(np.random.uniform(-2.0, 2.0))  # random
-
-
-def collect_switching_rollout(
-    n_steps: int,
+def collect_seeded_random_rollouts(
+    n_samples: int,
+    rollout_len: int,
     img_size: int,
     damping: float = 0.0,
     drag: float = _DRAG_COEFF,
-    epsilon: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One continuous rollout of ``n_steps`` that cycles through four behaviors
-    in equal-length blocks: constant max-torque CW spin, constant max-torque
-    CCW spin, an MPPI controller balancing at the upright, and uniform-random
-    actions (see ``_SWITCHING_PHASES``).
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Many short, purely-random-action rollouts seeded across phase space.
 
-    Unlike the per-episode collectors above, there is exactly one reset —
-    every step after the first carries real motion history, so any window
-    later sliced out of the middle of this rollout (see
-    ``PendulumRolloutDataset``) has genuine causal context for the encoder
-    without needing the zero-action warmup those collectors rely on.
+    Replaces the old single-long-rollout/switching-policy scheme: a scripted
+    policy driving toward specific regimes (spin extremes, upright balance)
+    systematically under-visits the rest of (theta, theta_dot). Instead,
+    ``n_seeds = max(1, n_samples // rollout_len)`` starting points are drawn
+    from the same covering-grid seeding used for validation episodes (see
+    ``_grid_seeds``), and each seed runs ``rollout_len`` steps of a fully
+    uniform-random policy — no scripted phases, no dithering needed (dithering
+    existed only to break the old MPPI-balance policy's state->action
+    collinearity; a random policy has none).
 
-    ``epsilon`` overrides the phase's action with a uniform-random one w.p.
-    epsilon at every step (same scheme as ``_collect_episodes``). This mainly
-    matters during the ``balance`` block: the MPPI controller there is a
-    deterministic closed-loop function of (theta, theta_dot), so without
-    dithering, every visit to a given near-upright state pairs with
-    essentially the same action — the learned model can't tell whether the
-    resulting motion came from the true restoring force or from the applied
-    torque, and H collapses/misfits in exactly that region. Dithering breaks
-    the state->action determinism so the two effects become separable.
-
-    Returns the same (frames, actions, states) shapes as ``_collect_episodes``,
-    but for the full ``n_steps``-long trajectory rather than one episode.
+    Returns a list of ``n_seeds`` (frames, actions, states) tuples, each with
+    the same per-tuple shapes as ``_collect_episodes``:
+        frames  : (rollout_len+1, 3, img_size, img_size) float32 [0,1]
+        actions : (rollout_len,)  float32
+        states  : (rollout_len+1, 3) float32 — (cos(theta), sin(theta), theta_dot)
     """
+    n_seeds = max(1, n_samples // rollout_len)
+    seeds = _grid_seeds(n_seeds, min_theta_dot=-_MAX_SPEED, max_theta_dot=_MAX_SPEED)
+
     env = PendulumPixelEnv(img_size=img_size, damping=damping, drag=drag)
-    balance_policy = _MPPIBalancePolicy(damping=damping, drag=drag)
-    n_phases = len(_SWITCHING_PHASES)
-    block = max(1, n_steps // n_phases)
-
+    rollouts = []
     try:
-        env.reset()
-        theta0 = float(np.random.uniform(-np.pi, np.pi))
-        theta_dot0 = float(np.random.uniform(-_MAX_SPEED, _MAX_SPEED))
-        obs = env.set_state(theta0, theta_dot0)
+        for theta0, theta_dot0 in tqdm(seeds, desc="Collecting seeded random rollouts", dynamic_ncols=True):
+            env.reset()
+            obs = env.set_state(float(theta0), float(theta_dot0))
+            frames = [torch.from_numpy(obs).float() / 255.0]
+            actions = []
+            states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
-        frames = [torch.from_numpy(obs).float() / 255.0]
-        actions = []
-        states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
-
-        for t in tqdm(range(n_steps), desc="Collecting switching rollout", dynamic_ncols=True):
-            phase = _SWITCHING_PHASES[min(t // block, n_phases - 1)]
-            theta, theta_dot = env.unwrapped.state  # type: ignore[union-attr]
-            if epsilon > 0.0 and random.random() < epsilon:
+            for _ in range(rollout_len):
                 action = float(np.random.uniform(-2.0, 2.0))
-            else:
-                action = _switching_phase_action(phase, theta, theta_dot, balance_policy)
+                obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+                theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
+                frames.append(torch.from_numpy(obs).float() / 255.0)
+                actions.append(action)
+                states.append(
+                    np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32)
+                )
 
-            obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
-            theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
-            frames.append(torch.from_numpy(obs).float() / 255.0)
-            actions.append(action)
-            states.append(
-                np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32)
+            rollouts.append(
+                (
+                    torch.stack(frames),  # (rollout_len+1, 3, H, W)
+                    torch.tensor(actions, dtype=torch.float32),  # (rollout_len,)
+                    torch.from_numpy(np.stack(states)),  # (rollout_len+1, 3)
+                )
             )
     finally:
         env.close()
 
-    return (
-        torch.stack(frames),  # (n_steps+1, 3, H, W)
-        torch.tensor(actions, dtype=torch.float32),  # (n_steps,)
-        torch.from_numpy(np.stack(states)),  # (n_steps+1, 3)
-    )
+    return rollouts
 
 
-class PendulumRolloutDataset(Dataset):
-    """Random windows of one long switching rollout — no fixed episodes.
+class PendulumMultiRolloutDataset(Dataset):
+    """Random windows drawn from many short seeded rollouts.
 
-    Holds a single (frames, actions, states) trajectory (see
-    ``collect_switching_rollout``) and draws a *fresh* random offset on every
-    ``__getitem__`` — the index is ignored, so each epoch trains on a new set
-    of windows rather than a frozen slicing. ``n_windows`` only sets the
-    nominal epoch size for the DataLoader.
+    Holds a list of (frames, actions, states) trajectories (see
+    ``collect_seeded_random_rollouts``) and on every ``__getitem__`` picks a
+    *fresh* random rollout, then a fresh random offset within it — the index
+    is ignored, so each epoch trains on a new set of windows rather than a
+    frozen slicing. ``n_windows`` only sets the nominal epoch size for the
+    DataLoader.
 
     Each item matches one old "episode" shape-for-shape:
         frames  : (window_len+1, 3, H, W) float32 [0,1]
@@ -697,33 +636,34 @@ class PendulumRolloutDataset(Dataset):
 
     def __init__(
         self,
-        rollout: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        rollouts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
         window_len: int,
         n_windows: int,
     ):
-        frames, actions, states = rollout
-        rollout_steps = actions.shape[0]
-        if rollout_steps < window_len:
-            raise ValueError(
-                f"rollout has {rollout_steps} steps but window_len is {window_len}"
-            )
-        self.frames = frames
-        self.actions = actions
-        self.states = states
+        self.rollouts = rollouts
         self.window_len = window_len
         self.n_windows = n_windows
-        self.max_offset = rollout_steps - window_len
+        self.max_offsets = []
+        for i, (_, actions, _) in enumerate(rollouts):
+            rollout_steps = actions.shape[0]
+            if rollout_steps < window_len:
+                raise ValueError(
+                    f"rollout {i} has {rollout_steps} steps but window_len is {window_len}"
+                )
+            self.max_offsets.append(rollout_steps - window_len)
 
     def __len__(self):
         return self.n_windows
 
     def __getitem__(self, idx):
-        start = random.randint(0, self.max_offset)
+        i = random.randrange(len(self.rollouts))
+        frames, actions, states = self.rollouts[i]
+        start = random.randint(0, self.max_offsets[i])
         end = start + self.window_len
         return (
-            self.frames[start : end + 1],
-            self.actions[start:end],
-            self.states[start : end + 1],
+            frames[start : end + 1],
+            actions[start:end],
+            states[start : end + 1],
         )
 
 

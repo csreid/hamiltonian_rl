@@ -3,10 +3,11 @@
 Phase 1 (phase1 subcommand):
     Train the LSTM autoencoder (encoder + f_psi + decoder) for reconstruction.
     Loss = MSE(decoder(f_psi(z)[:q_dim]), frame) + kl_weight * KL.
-    Training data is one long switching-policy rollout (spin-CW / spin-CCW /
-    MPPI-balance / random blocks); each epoch samples fresh random windows
-    from it (PendulumRolloutDataset — no fixed episodes). Saves the raw
-    rollout (frames, actions, ground-truth state) to rollout_cache.pt in the
+    Training data is many short, purely-random-action rollouts seeded across
+    (theta, theta_dot) phase space (collect_seeded_random_rollouts); each
+    epoch samples fresh random windows from a fresh random rollout
+    (PendulumMultiRolloutDataset — no fixed episodes). Saves the raw
+    rollouts (frames, actions, ground-truth state) to rollout_cache.pt in the
     run directory, both for Phase 2 (which re-encodes fresh windows through
     the frozen encoder each batch — see below) and for later analysis.
     Saves a unified world-model checkpoint with dynamics=None.
@@ -82,16 +83,15 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from data.pendulum import (
-    PendulumRolloutDataset,
+    PendulumMultiRolloutDataset,
     collect_random_trajectories,
+    collect_seeded_random_rollouts,
     collect_spin_trajectories,
-    collect_switching_rollout,
     collect_val_trajectories,
     collect_zero_trajectories_targeted,
     _DRAG_COEFF,
     _G,
     _MAX_SPEED,
-    _SWITCHING_PHASES,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
 from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldModel
@@ -180,52 +180,46 @@ def _plot_phase_space_coverage(
 
 
 def _log_training_rollout(
-    rollout: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    rollouts: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     writer: SummaryWriter,
     tag: str = "data/rollout",
     fps: int = 30,
+    n_sample: int = 5,
 ) -> None:
-    """Log the full switching training rollout to TensorBoard.
+    """Log a handful of seeded training rollouts to TensorBoard.
 
-    Two views: a step-annotated video of every frame, and a θ/θ̇/action
-    time-series with the policy-phase block boundaries marked — since every
-    training window is sampled out of this one trajectory, this is the whole
-    training distribution in one place.
+    Two views per sampled rollout: a step-annotated video of every frame, and
+    a θ/θ̇/action time-series — since ``rollouts`` are now many short
+    independent seeded trajectories rather than one long one, we can't show
+    "the whole training distribution" in a single clip, so this logs
+    ``n_sample`` representative rollouts individually (see
+    ``_plot_phase_space_coverage`` for the full-distribution view).
     """
-    frames, actions, states = rollout
+    for idx, (frames, actions, states) in enumerate(rollouts[:n_sample]):
+        rtag = f"{tag}_{idx}"
 
-    annotated = torch.stack(
-        [_annotate_frame(frames[i], f"{i}") for i in range(len(frames))]
-    ).unsqueeze(0)
-    writer.add_video(f"{tag}/video", (annotated.clamp(0, 1) * 255).byte(), 0, fps=fps)
+        annotated = torch.stack(
+            [_annotate_frame(frames[i], f"{i}") for i in range(len(frames))]
+        ).unsqueeze(0)
+        writer.add_video(f"{rtag}/video", (annotated.clamp(0, 1) * 255).byte(), 0, fps=fps)
 
-    theta = torch.atan2(states[:, 1], states[:, 0]).numpy()
-    theta_dot = states[:, 2].numpy()
-    n_steps = actions.shape[0]
-    block = max(1, n_steps // len(_SWITCHING_PHASES))
+        theta = torch.atan2(states[:, 1], states[:, 0]).numpy()
+        theta_dot = states[:, 2].numpy()
+        n_steps = actions.shape[0]
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 7), sharex=True)
-    for ax, series, label in (
-        (axes[0], theta, "θ (rad)"),
-        (axes[1], theta_dot, "θ̇ (rad/s)"),
-        (axes[2], actions.numpy(), "action (torque)"),
-    ):
-        ax.plot(series, linewidth=0.7)
-        ax.set_ylabel(label)
-        for b in range(1, len(_SWITCHING_PHASES)):
-            ax.axvline(b * block, color="gray", linestyle="--", linewidth=0.8)
-    for i, phase in enumerate(_SWITCHING_PHASES):
-        start = i * block
-        end = n_steps if i == len(_SWITCHING_PHASES) - 1 else (i + 1) * block
-        axes[0].text(
-            (start + end) / 2, axes[0].get_ylim()[1], phase,
-            ha="center", va="bottom", fontsize=9, color="gray",
-        )
-    axes[-1].set_xlabel("step")
-    fig.suptitle(f"Training rollout ({n_steps} steps)")
-    fig.tight_layout()
-    writer.add_figure(f"{tag}/timeseries", fig, 0)
-    plt.close(fig)
+        fig, axes = plt.subplots(3, 1, figsize=(14, 7), sharex=True)
+        for ax, series, label in (
+            (axes[0], theta, "θ (rad)"),
+            (axes[1], theta_dot, "θ̇ (rad/s)"),
+            (axes[2], actions.numpy(), "action (torque)"),
+        ):
+            ax.plot(series, linewidth=0.7)
+            ax.set_ylabel(label)
+        axes[-1].set_xlabel("step")
+        fig.suptitle(f"Seeded rollout {idx} ({n_steps} steps)")
+        fig.tight_layout()
+        writer.add_figure(f"{rtag}/timeseries", fig, 0)
+        plt.close(fig)
 
 
 def _collect_energy_grid_episodes(
@@ -2209,19 +2203,16 @@ def cli():
               help="Gain for energy-pumping controller (val episodes only)")
 @click.option("--max-steps", type=int, default=200, show_default=True,
               help="Steps per training window (val episodes default to 2x this)")
-@click.option("--rollout-steps", type=int, default=2000, show_default=True,
-              help="Length of the single switching-policy rollout that training "
-                   "windows are sampled from (see PendulumRolloutDataset); "
-                   "must be >= --max-steps")
+@click.option("--n-samples", type=int, default=2000, show_default=True,
+              help="Total env-step budget for training data collection, split "
+                   "across many short random rollouts seeded across phase "
+                   "space (see collect_seeded_random_rollouts); "
+                   "n_seeds = n_samples // rollout_len")
+@click.option("--rollout-len", type=int, default=0, show_default=True,
+              help="Steps per seeded rollout (0 = 2x --max-steps); must be "
+                   ">= --max-steps")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
-@click.option("--dither-epsilon", type=float, default=0.1, show_default=True,
-              help="Probability of overriding the switching-rollout policy's action "
-                   "with a uniform-random one at each step. Chiefly matters for the "
-                   "balance block: the MPPI controller there is a deterministic "
-                   "function of (theta, theta_dot), so without dithering, action and "
-                   "state are collinear near the upright and the learned Hamiltonian "
-                   "can't disambiguate real physics from applied torque there.")
 # model architecture
 @click.option("--pos-ch", type=int, default=8, show_default=True)
 @click.option("--feat-dim", type=int, default=256, show_default=True)
@@ -2302,28 +2293,30 @@ def phase1_cmd(**kwargs):
         n_val_episodes = kwargs["n_windows"] // 2
     n_val = n_val_episodes if kwargs["val_every"] > 0 else 0
     val_steps = kwargs["val_max_steps"] or kwargs["max_steps"] * 2
+    rollout_len = kwargs["rollout_len"] or kwargs["max_steps"] * 2
 
-    # Training data is a single long rollout whose policy cycles through
-    # spin-CW, spin-CCW, MPPI-balance and random blocks — one continuous
-    # trajectory, no episodes. Training samples fresh random windows from it
-    # each epoch (see PendulumRolloutDataset).
-    print(f"\nCollecting a {kwargs['rollout_steps']}-step switching rollout...")
-    rollout = collect_switching_rollout(
-        n_steps=kwargs["rollout_steps"],
+    # Training data is many short, purely-random-action rollouts seeded
+    # across (theta, theta_dot) phase space — no scripted policy driving
+    # toward specific regimes. Training samples fresh random windows from a
+    # fresh random rollout each epoch (see PendulumMultiRolloutDataset).
+    n_seeds = max(1, kwargs["n_samples"] // rollout_len)
+    print(f"\nCollecting {n_seeds} seeded random rollouts of {rollout_len} steps each...")
+    rollouts = collect_seeded_random_rollouts(
+        n_samples=kwargs["n_samples"],
+        rollout_len=rollout_len,
         img_size=kwargs["img_size"],
         damping=kwargs["damping"],
-        epsilon=kwargs["dither_epsilon"],
     )
 
-    # Save the raw rollout (frames, actions, ground-truth state) right away —
+    # Save the raw rollouts (frames, actions, ground-truth state) right away —
     # Phase 2/3 re-window and re-encode it each batch, and this cache also
     # doubles as a dataset for later analysis. Saved before training starts so
     # it survives even if training is interrupted.
     rollout_cache_path = run_dir / "rollout_cache.pt"
-    torch.save(rollout, rollout_cache_path)
-    print(f"Saved rollout cache ({kwargs['rollout_steps']} steps) to {rollout_cache_path}")
+    torch.save(rollouts, rollout_cache_path)
+    print(f"Saved rollout cache ({len(rollouts)} rollouts x {rollout_len} steps) to {rollout_cache_path}")
 
-    _log_training_rollout(rollout, writer)
+    _log_training_rollout(rollouts, writer)
 
     val_energy, val_random, val_spin = [], [], []
     if n_val > 0:
@@ -2341,12 +2334,12 @@ def phase1_cmd(**kwargs):
             max_steps=val_steps, damping=kwargs["damping"],
         )
 
-    coverage_fig = _plot_phase_space_coverage([rollout])
+    coverage_fig = _plot_phase_space_coverage(rollouts)
     writer.add_figure("data/phase_space_coverage", coverage_fig, 0)
     plt.close(coverage_fig)
 
-    dataset = PendulumRolloutDataset(
-        rollout, window_len=kwargs["max_steps"], n_windows=kwargs["n_windows"],
+    dataset = PendulumMultiRolloutDataset(
+        rollouts, window_len=kwargs["max_steps"], n_windows=kwargs["n_windows"],
     )
     loader = DataLoader(
         dataset, batch_size=kwargs["batch_size"], shuffle=False,
@@ -2386,9 +2379,10 @@ def phase1_cmd(**kwargs):
     # How the training rollout was collected — saved into the checkpoint so
     # Phase 2 and the dashboard can reproduce matching data.
     data_config = {k: kwargs[k] for k in (
-        "n_windows", "rollout_steps", "img_size", "energy_k",
-        "max_steps", "damping", "dither_epsilon",
+        "n_windows", "n_samples", "img_size", "energy_k",
+        "max_steps", "damping",
     )}
+    data_config["rollout_len"] = rollout_len
     world_model = WorldModel(model, dynamics=None, data_config=data_config)
 
     hparams = {k: v for k, v in kwargs.items()}
@@ -2666,8 +2660,8 @@ def phase2_cmd(**kwargs):
             "Re-run Phase 1 to regenerate it, or pass --rollout-cache explicitly."
         )
     print(f"Loading rollout cache from {rollout_cache_path}...")
-    rollout = torch.load(rollout_cache_path, weights_only=False)
-    _log_training_rollout(rollout, writer)
+    rollouts = torch.load(rollout_cache_path, weights_only=False)
+    _log_training_rollout(rollouts, writer)
 
     # Collect val episodes (only if dreaming logs are enabled)
     train_sample_trajs = []
@@ -2696,8 +2690,8 @@ def phase2_cmd(**kwargs):
         )
         print("Sampling 3 training-distribution rollout windows for video logging...")
         train_sample_trajs = [
-            PendulumRolloutDataset(
-                rollout, window_len=data_cfg.get("max_steps", 200), n_windows=3,
+            PendulumMultiRolloutDataset(
+                rollouts, window_len=data_cfg.get("max_steps", 200), n_windows=3,
             )[i]
             for i in range(3)
         ]
@@ -2711,14 +2705,14 @@ def phase2_cmd(**kwargs):
     latent_dim = phase1_model.config["latent_dim"]
     print(f"Latent dim from Phase 1 config: {latent_dim}")
 
-    # Per-dim std of h across the training rollout — used to scale augmentation
+    # Per-dim std of h across the training rollouts — used to scale augmentation
     # noise so --h-noise-std acts as a multiplier on each dimension's spread.
     # Encoded with full rollout history (not windowed) purely as a one-off scale
     # estimate; it doesn't need to match the windowed encoding used in training.
     h_noise_scale = None
     if kwargs["h_noise_std"] > 0:
         with torch.no_grad():
-            h_all_full, _ = _encode_val_h(phase1_model, [rollout], device)
+            h_all_full, _ = _encode_val_h(phase1_model, rollouts, device)
             h_noise_scale = h_all_full.reshape(-1, latent_dim).std(dim=0)
         print(
             f"h noise: std={kwargs['h_noise_std']} × per-dim spread "
@@ -2726,8 +2720,8 @@ def phase2_cmd(**kwargs):
         )
         del h_all_full
 
-    rollout_dataset = PendulumRolloutDataset(
-        rollout,
+    rollout_dataset = PendulumMultiRolloutDataset(
+        rollouts,
         window_len=data_cfg.get("max_steps", 200),
         n_windows=data_cfg.get("n_windows", 200),
     )
@@ -3120,8 +3114,8 @@ def phase3_cmd(**kwargs):
         del resume_model
 
     print(f"Loading rollout cache from {rollout_cache_path}...")
-    rollout = torch.load(rollout_cache_path, weights_only=False)
-    _log_training_rollout(rollout, writer)
+    rollouts = torch.load(rollout_cache_path, weights_only=False)
+    _log_training_rollout(rollouts, writer)
 
     # Collect val episodes (only if validation logs are enabled)
     train_sample_trajs = []
@@ -3150,8 +3144,8 @@ def phase3_cmd(**kwargs):
         )
         print("Sampling 3 training-distribution rollout windows for video logging...")
         train_sample_trajs = [
-            PendulumRolloutDataset(
-                rollout, window_len=data_cfg.get("max_steps", 200), n_windows=3,
+            PendulumMultiRolloutDataset(
+                rollouts, window_len=data_cfg.get("max_steps", 200), n_windows=3,
             )[i]
             for i in range(3)
         ]
@@ -3162,8 +3156,8 @@ def phase3_cmd(**kwargs):
             context_frames=kwargs["val_context_frames"],
         )
 
-    rollout_dataset = PendulumRolloutDataset(
-        rollout,
+    rollout_dataset = PendulumMultiRolloutDataset(
+        rollouts,
         window_len=data_cfg.get("max_steps", 200),
         n_windows=data_cfg.get("n_windows", 200),
     )

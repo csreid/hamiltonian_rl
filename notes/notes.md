@@ -295,3 +295,50 @@ One large eigenvalue, 15 near zero — model correctly concentrates dissipation 
 
 * Root cause of the snap/reverse behavior: with all timesteps weighted equally, once the true pendulum passes antipodal to the dreamed one, the optimizer prefers slowing/reversing the dreamed pendulum to wait rather than accelerating to catch up
 * Fix: added $\gamma$ as a discount factor over rollout horizon, so later-stage antipodal states are downweighted rather than penalized fully
+
+# 8/20
+
+## Two Threads
+
+1. Make the environment's dissipation physically real (not just a velocity clip)
+2. Get the LSTM hidden state to actually be Markov
+
+## Thread 1: Real Drag
+
+* Old `Pendulum-v1` clipped $|\dot\theta|$ hard --- not physical
+* Fix: quadratic (Rayleigh) drag on momentum, $\dot p_\text{drag} = -c\,p\,|p|$
+* Calibrated so light swings barely change (~7.9 vs ~8.6 rad/s peak); sustained torque now saturates smoothly (~10--12 rad/s) instead of growing unbounded
+* Exact, reversible leapfrog step (forward + analytic inverse) --- matches the integrator already used inside the learned model
+
+## Thread 1: State-Dependent $R$
+
+* Once drag depends on state, a learned constant $R$ can't capture it
+* Fix: $R$ is now a function of $(q,p)$, not a fixed matrix
+
+## Thread 1: Energy Accounting
+
+* Found + fixed a bug in ground-truth energy computation (needed before trusting anything downstream)
+* Added energy-balance regularization --- penalize the learned dynamics for violating energy balance
+* **Status: solid.** Drag + state-dependent $R$ + energy-balance reg together give an honest dissipation model
+
+## Thread 2: Framestack as a Markov Baseline
+
+* Can't easily verify an LSTM isn't smuggling extra history into $h_t$
+* Fix: swap in a 2-frame stack --- memoryless, Markov by construction, nothing to hide behind
+* **Result: doesn't recover angular momentum well from 2 frames.** Unclear if that's a capacity limit or something more fundamental about the encoding
+
+## Thread 2: Hidden-State Collapse (Still Unresolved)
+
+* L1 sparsity forces a bad trade-off: too weak $\rightarrow$ non-Markov info leaks in (tearing); too strong $\rightarrow$ distinct states collapse together (folding)
+* Switched to L0 gated regularization [@louizos2018learning] --- true sparsity without shrinking surviving features
+* First pass buggy, fixed
+* Failure mode: gate probabilities drift down all training, then collapse at once --- every dim gates to zero, model predicts the dataset mean
+* Tried: curriculum on the L0 weight, so the optimizer commits to useful dims before sparsity pressure ramps up
+* **Still collapsing.** This is the open fight right now
+
+## Also This Cycle
+
+* Dropped the VAE for a deterministic encoder --- no apparent cost, simpler
+* Added phase 3: joint end-to-end fine-tune at low LR, to break the phase-2 plateau
+* Several rounds of better data collection (coverage, randomized actions)
+* Misc viz: gradient landscape, rollout logging, trajectory/plan viz

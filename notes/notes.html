@@ -611,6 +611,102 @@ factor over rollout horizon, so later-stage antipodal states are
 downweighted rather than penalized fully</li>
 </ul>
 </section></section>
+<section>
+<section id="section-8" class="title-slide slide level1">
+<h1>8/20</h1>
+
+</section>
+<section id="two-threads" class="slide level2">
+<h2>Two Threads</h2>
+<ol type="1">
+<li>Make the environment’s dissipation physically real (not just a
+velocity clip)</li>
+<li>Get the LSTM hidden state to actually be Markov</li>
+</ol>
+</section>
+<section id="thread-1-real-drag" class="slide level2">
+<h2>Thread 1: Real Drag</h2>
+<ul>
+<li>Old <code>Pendulum-v1</code> clipped <span
+class="math inline">\(|\dot\theta|\)</span> hard — not physical</li>
+<li>Fix: quadratic (Rayleigh) drag on momentum, <span
+class="math inline">\(\dot p_\text{drag} = -c\,p\,|p|\)</span></li>
+<li>Calibrated so light swings barely change (~7.9 vs ~8.6 rad/s peak);
+sustained torque now saturates smoothly (~10–12 rad/s) instead of
+growing unbounded</li>
+<li>Exact, reversible leapfrog step (forward + analytic inverse) —
+matches the integrator already used inside the learned model</li>
+</ul>
+</section>
+<section id="thread-1-state-dependent-r" class="slide level2">
+<h2>Thread 1: State-Dependent <span
+class="math inline">\(R\)</span></h2>
+<ul>
+<li>Once drag depends on state, a learned constant <span
+class="math inline">\(R\)</span> can’t capture it</li>
+<li>Fix: <span class="math inline">\(R\)</span> is now a function of
+<span class="math inline">\((q,p)\)</span>, not a fixed matrix</li>
+</ul>
+</section>
+<section id="thread-1-energy-accounting" class="slide level2">
+<h2>Thread 1: Energy Accounting</h2>
+<ul>
+<li>Found + fixed a bug in ground-truth energy computation (needed
+before trusting anything downstream)</li>
+<li>Added energy-balance regularization — penalize the learned dynamics
+for violating energy balance</li>
+<li><strong>Status: solid.</strong> Drag + state-dependent <span
+class="math inline">\(R\)</span> + energy-balance reg together give an
+honest dissipation model</li>
+</ul>
+</section>
+<section id="thread-2-framestack-as-a-markov-baseline"
+class="slide level2">
+<h2>Thread 2: Framestack as a Markov Baseline</h2>
+<ul>
+<li>Can’t easily verify an LSTM isn’t smuggling extra history into <span
+class="math inline">\(h_t\)</span></li>
+<li>Fix: swap in a 2-frame stack — memoryless, Markov by construction,
+nothing to hide behind</li>
+<li><strong>Result: doesn’t recover angular momentum well from 2
+frames.</strong> Unclear if that’s a capacity limit or something more
+fundamental about the encoding</li>
+</ul>
+</section>
+<section id="thread-2-hidden-state-collapse-still-unresolved"
+class="slide level2">
+<h2>Thread 2: Hidden-State Collapse (Still Unresolved)</h2>
+<ul>
+<li>L1 sparsity forces a bad trade-off: too weak <span
+class="math inline">\(\rightarrow\)</span> non-Markov info leaks in
+(tearing); too strong <span class="math inline">\(\rightarrow\)</span>
+distinct states collapse together (folding)</li>
+<li>Switched to L0 gated regularization <span class="citation"
+data-cites="louizos2018learning">[@louizos2018learning]</span> — true
+sparsity without shrinking surviving features</li>
+<li>First pass buggy, fixed</li>
+<li>Failure mode: gate probabilities drift down all training, then
+collapse at once — every dim gates to zero, model predicts the dataset
+mean</li>
+<li>Tried: curriculum on the L0 weight, so the optimizer commits to
+useful dims before sparsity pressure ramps up</li>
+<li><strong>Still collapsing.</strong> This is the open fight right
+now</li>
+</ul>
+</section>
+<section id="also-this-cycle" class="slide level2">
+<h2>Also This Cycle</h2>
+<ul>
+<li>Dropped the VAE for a deterministic encoder — no apparent cost,
+simpler</li>
+<li>Added phase 3: joint end-to-end fine-tune at low LR, to break the
+phase-2 plateau</li>
+<li>Several rounds of better data collection (coverage, randomized
+actions)</li>
+<li>Misc viz: gradient landscape, rollout logging, trajectory/plan
+viz</li>
+</ul>
+</section></section>
     </div>
   </div>
 

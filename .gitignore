@@ -9,3 +9,8 @@ wheels/
 # Virtual environments
 .venv
 *.png
+
+# Training outputs / checkpoints
+models/
+runs/
+*.pt
