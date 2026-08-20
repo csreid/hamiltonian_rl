@@ -102,6 +102,22 @@ from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldM
 # ---------------------------------------------------------------------------
 
 
+def _safe_hist(ax, data, bins=50, **kwargs):
+    """ax.hist wrapper that tolerates degenerate/non-finite data.
+
+    numpy's histogram raises ValueError ("Too many bins for data range")
+    when the finite data range is zero or tiny relative to bin count. Drop
+    non-finite values and skip plotting if nothing usable remains.
+    """
+    data = np.asarray(data)
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return None
+    if finite.min() == finite.max():
+        bins = 1
+    return ax.hist(finite, bins=bins, **kwargs)
+
+
 def _log_latent_variance(
     qs: torch.Tensor,
     ps: torch.Tensor,
@@ -867,17 +883,17 @@ def _log_markov_pairwise_probe_phase1(
     ax = axes[1]
     thresh = np.percentile(delta_phase, neighbor_pct)
     is_neighbor = delta_phase <= thresh
-    ax.hist(delta_hidden[is_neighbor], bins=50, density=True, alpha=0.6,
-            label=f"phase-neighbors (n={is_neighbor.sum()})")
-    ax.hist(delta_hidden, bins=50, density=True, alpha=0.6,
-            label=f"all pairs (n={len(delta_hidden)})")
+    _safe_hist(ax, delta_hidden[is_neighbor], bins=50, density=True, alpha=0.6,
+               label=f"phase-neighbors (n={is_neighbor.sum()})")
+    _safe_hist(ax, delta_hidden, bins=50, density=True, alpha=0.6,
+               label=f"all pairs (n={len(delta_hidden)})")
     ax.set_xlabel("Δ hidden ||h_i - h_j||")
     ax.set_title(f"Neighbors (bottom {neighbor_pct:.0f}%) vs. random")
     ax.legend(fontsize=8)
 
     ax = axes[2]
-    ax.hist(cos_sim[is_neighbor], bins=50, density=True, alpha=0.6, label="phase-neighbors")
-    ax.hist(cos_sim, bins=50, density=True, alpha=0.6, label="all pairs")
+    _safe_hist(ax, cos_sim[is_neighbor], bins=50, density=True, alpha=0.6, label="phase-neighbors")
+    _safe_hist(ax, cos_sim, bins=50, density=True, alpha=0.6, label="all pairs")
     ax.set_xlabel("cos similarity(h_i, h_j)")
     ax.set_title("Hidden-state cosine similarity")
     ax.legend(fontsize=8)
@@ -891,9 +907,9 @@ def _log_markov_pairwise_probe_phase1(
     fold_p95 = float(np.percentile(delta_phase[is_h_neighbor], 95))
 
     ax = axes[3]
-    ax.hist(delta_phase[is_h_neighbor], bins=50, density=True, alpha=0.6,
-            label=f"h-neighbors (n={is_h_neighbor.sum()})")
-    ax.hist(delta_phase, bins=50, density=True, alpha=0.6, label="all pairs")
+    _safe_hist(ax, delta_phase[is_h_neighbor], bins=50, density=True, alpha=0.6,
+               label=f"h-neighbors (n={is_h_neighbor.sum()})")
+    _safe_hist(ax, delta_phase, bins=50, density=True, alpha=0.6, label="all pairs")
     ax.set_xlabel("Δ phase-space ||p_i - p_j||")
     ax.set_title(f"Fold check: phase-distance of h-neighbors (bottom {neighbor_pct:.0f}%)")
     ax.legend(fontsize=8)
@@ -1302,9 +1318,9 @@ def _log_cnn_feature_fold_probe_phase1(
     is_feat_neighbor = delta_feat <= feat_thresh
     fold_median = float(np.median(delta_theta[is_feat_neighbor]))
     fold_p95 = float(np.percentile(delta_theta[is_feat_neighbor], 95))
-    ax.hist(delta_theta[is_feat_neighbor], bins=50, density=True, alpha=0.6,
-            label=f"feat-neighbors (n={is_feat_neighbor.sum()})")
-    ax.hist(delta_theta, bins=50, density=True, alpha=0.6, label="all pairs")
+    _safe_hist(ax, delta_theta[is_feat_neighbor], bins=50, density=True, alpha=0.6,
+               label=f"feat-neighbors (n={is_feat_neighbor.sum()})")
+    _safe_hist(ax, delta_theta, bins=50, density=True, alpha=0.6, label="all pairs")
     ax.set_xlabel("Δθ (circular, rad)")
     ax.set_title(f"Fold check: angular distance of CNN-feat-neighbors (bottom {neighbor_pct:.0f}%)")
     ax.legend(fontsize=8)
