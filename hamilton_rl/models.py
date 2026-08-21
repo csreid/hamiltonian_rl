@@ -104,10 +104,22 @@ class HardConcreteGate(nn.Module):
     def _stretch(self, s: torch.Tensor) -> torch.Tensor:
         return (s * (self.zeta - self.gamma) + self.gamma).clamp(0.0, 1.0)
 
-    def forward(self) -> torch.Tensor:
-        """Returns the (dim,) gate mask — stochastic if training, hard if eval."""
+    def forward(self, sample_shape: tuple[int, ...] = ()) -> torch.Tensor:
+        """Returns a gate mask of shape sample_shape + (dim,) — stochastic if training, hard if eval.
+
+        sample_shape lets the caller draw an independent gate per example (and
+        per timestep) instead of a single mask shared across the whole batch.
+        A shared mask means that whenever a dim's gate happens to sample near
+        0, *every* example in the batch gets zero gradient into that dim for
+        the whole step — as log_alpha drifts down, those zero-gradient steps
+        get more frequent, starving the encoder of the chance to prove the
+        dim useful and accelerating collapse. Sampling per example keeps a
+        partial gradient flowing even when a dim's average gate is low.
+        """
         if self.training:
-            u = torch.rand_like(self.log_alpha).clamp(1e-6, 1 - 1e-6)
+            shape = (*sample_shape, *self.log_alpha.shape)
+            u = torch.rand(shape, device=self.log_alpha.device, dtype=self.log_alpha.dtype)
+            u = u.clamp(1e-6, 1 - 1e-6)
             s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + self.log_alpha) / self.temperature)
         else:
             s = torch.sigmoid(self.log_alpha)
@@ -185,7 +197,7 @@ class FlexLSTMEncoder(nn.Module):
         h = h_n[-1]  # (B, feat_dim) — final layer's hidden state at the last step
         mu = self.mu_head(h)
         if self.gate is not None:
-            mu = mu * self.gate()
+            mu = mu * self.gate(mu.shape[:-1])
         return mu, self.logvar_head(h)
 
     def forward_all(
@@ -215,7 +227,7 @@ class FlexLSTMEncoder(nn.Module):
         # out: (B, T, feat_dim) — per-timestep forward hidden states
         mu_all = self.mu_head(out)
         if self.gate is not None:
-            mu_all = mu_all * self.gate()
+            mu_all = mu_all * self.gate(mu_all.shape[:-1])
         return mu_all, self.logvar_head(out)
 
 
@@ -275,7 +287,7 @@ class FrameStackEncoder(nn.Module):
         out = self.fuse(torch.cat([prev, feats], dim=-1))      # (B, T, feat_dim)
         mu_all = self.mu_head(out)
         if self.gate is not None:
-            mu_all = mu_all * self.gate()
+            mu_all = mu_all * self.gate(mu_all.shape[:-1])
         return mu_all, self.logvar_head(out)
 
     def forward(
