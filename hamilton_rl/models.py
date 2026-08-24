@@ -135,7 +135,12 @@ class HardConcreteGate(nn.Module):
             s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + self.log_alpha) / self.temperature)
         else:
             s = torch.sigmoid(self.log_alpha)
-        return self._stretch(s)
+        # Eval mode computes s from log_alpha alone, shape (dim,) regardless of
+        # sample_shape — expand so callers always get sample_shape + (dim,),
+        # matching the training branch, instead of relying on implicit
+        # broadcasting (which breaks once a caller reshapes/unsqueezes the
+        # result rather than multiplying it directly).
+        return self._stretch(s).expand(*sample_shape, *self.log_alpha.shape)
 
     def l0_penalty(self) -> torch.Tensor:
         """Expected number of active dims (differentiable) — the L0 regularizer."""
