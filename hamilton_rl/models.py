@@ -104,27 +104,32 @@ class HardConcreteGate(nn.Module):
     def _stretch(self, s: torch.Tensor) -> torch.Tensor:
         return (s * (self.zeta - self.gamma) + self.gamma).clamp(0.0, 1.0)
 
-    def forward(self) -> torch.Tensor:
-        """Returns a gate mask of shape (dim,) — stochastic if training, hard if eval.
+    def forward(self, sample_shape: tuple[int, ...] = ()) -> torch.Tensor:
+        """Returns a gate mask of shape sample_shape + (dim,) — stochastic if training, hard if eval.
 
-        One sample shared across the whole batch (and, where applicable, the
-        whole sequence) per forward pass, matching Louizos et al.: the gate
-        answers "does this dim exist in the architecture", a property of the
-        model, not of the individual example — so the expectation is over
-        training steps (a fresh draw every step), not over per-example noise
-        within a step. Sampling independently per example (or per timestep)
-        instead turns the gate into per-example dropout, which rewards
-        spreading signal redundantly across many dims to hedge against
-        unlucky individual draws — exactly the opposite of what L0 sparsity
-        is meant to induce. A dim that draws near-zero for one step doesn't
-        get starved: log_alpha still gets a real gradient through the
-        unclipped pathwise sample, and it gets an independent fresh draw
-        next step. init_open_prob=0.5 (log_alpha≈0) keeps draws centered in
-        the unclipped region of the stretch interval so that gradient stays
-        alive from the start.
+        Per Louizos et al., the gate answers "does this dim exist in the
+        architecture" — a property of the model, ideally sampled once per
+        step and shared across every example. In practice a single sample
+        per step is too high-variance for this small offline setup: it
+        exposes the whole downstream network (decoder, dynamics) to one
+        coin-flip realization of the architecture every step instead of an
+        implicit average over many, which destabilizes training broadly
+        (reconstruction degrades, not just the gate). sample_shape lets the
+        caller restore batch-size-many independent draws per step (e.g. one
+        per trajectory, broadcast across time) to keep gradient variance
+        sane, while still sharing the draw across time within an example so
+        a dim can't be "on for this frame, off for that frame" of the same
+        trajectory to hedge against an unlucky draw — that per-timestep
+        hedging is what caused gates to converge to a uniform, non-sparse
+        probability instead of differentiating. A dim that draws near-zero
+        for one example/step doesn't get starved: log_alpha still gets a
+        real gradient through the unclipped pathwise sample, and gets an
+        independent fresh draw next step. init_open_prob=0.5 (log_alpha≈0)
+        keeps draws centered in the unclipped region of the stretch
+        interval so gradient stays alive from the start.
         """
         if self.training:
-            shape = self.log_alpha.shape
+            shape = (*sample_shape, *self.log_alpha.shape)
             u = torch.rand(shape, device=self.log_alpha.device, dtype=self.log_alpha.dtype)
             u = u.clamp(1e-6, 1 - 1e-6)
             s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + self.log_alpha) / self.temperature)
@@ -234,7 +239,7 @@ class FlexLSTMEncoder(nn.Module):
         # out: (B, T, feat_dim) — per-timestep forward hidden states
         mu_all = self.mu_head(out)
         if self.gate is not None:
-            mu_all = mu_all * self.gate()
+            mu_all = mu_all * self.gate((mu_all.shape[0],)).unsqueeze(1)
         return mu_all, self.logvar_head(out)
 
 
@@ -294,7 +299,7 @@ class FrameStackEncoder(nn.Module):
         out = self.fuse(torch.cat([prev, feats], dim=-1))      # (B, T, feat_dim)
         mu_all = self.mu_head(out)
         if self.gate is not None:
-            mu_all = mu_all * self.gate()
+            mu_all = mu_all * self.gate((mu_all.shape[0],)).unsqueeze(1)
         return mu_all, self.logvar_head(out)
 
     def forward(
