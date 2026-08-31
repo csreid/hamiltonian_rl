@@ -109,6 +109,31 @@ def decode_h(model: WorldModel, h: torch.Tensor) -> np.ndarray:
     return (frame.clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
 
 
+@torch.no_grad()
+def decode_h_batch(model: WorldModel, h_batch: torch.Tensor) -> np.ndarray:
+    """(B, latent_dim) -> (B, H, W, C) uint8."""
+    device = next(model.autoencoder.parameters()).device
+    frames = model.autoencoder.decode_latent(h_batch.to(device)).cpu()
+    return (frames.clamp(0, 1).permute(0, 2, 3, 1).numpy() * 255).astype("uint8")
+
+
+def build_montage(tiles: np.ndarray, tile_px: int) -> "Image.Image":
+    """(rows, cols, H, W, C) uint8 -> one PIL image, row 0 at the TOP.
+
+    Caller is responsible for row/col ordering — row 0 is drawn first (top),
+    so pass rows high-value-first if "up" should mean "higher slider value".
+    """
+    from PIL import Image
+
+    rows, cols = tiles.shape[:2]
+    canvas = Image.new("RGB", (cols * tile_px, rows * tile_px))
+    for r in range(rows):
+        for c in range(cols):
+            tile = Image.fromarray(tiles[r, c]).resize((tile_px, tile_px), Image.NEAREST)
+            canvas.paste(tile, (c * tile_px, r * tile_px))
+    return canvas
+
+
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Pendulum Feature Explorer", layout="wide")
@@ -166,7 +191,17 @@ h_samples = encode_sample_latents(
 baseline = h_samples.mean(dim=0)  # (latent_dim,) — inactive dims are already ~0 (gated at encode time)
 dim_std = h_samples.std(dim=0)    # (latent_dim,) — per-dim scale, for sizing sliders
 
-tab_dims, tab_pca = st.tabs(["Per-dimension sliders", "PCA (3D)"])
+# PCA basis over the active subspace, computed once and reused by both the
+# PCA-slider tab and the grid-sweep tab.
+pca_ready = n_active >= 2
+if pca_ready:
+    h_active_samples = h_samples[:, active_idx]
+    n_components = min(3, n_active)
+    mean_active, components, pc_std = fit_pca(h_active_samples, n_components)
+
+tab_dims, tab_pca, tab_grid = st.tabs(
+    ["Per-dimension sliders", "PCA (3D)", "2D grid sweep"]
+)
 
 with tab_dims:
     st.subheader(f"{n_active} active latent dim(s)")
@@ -189,24 +224,20 @@ with tab_dims:
         st.image(decode_h(world_model, h), caption="Reconstructed frame", width=img_size * 3)
 
 with tab_pca:
-    if n_active < 2:
+    if not pca_ready:
         st.info("Need at least 2 active dims to fit a PCA basis.")
     else:
-        h_active_samples = h_samples[:, active_idx]
-        n_components = min(3, n_active)
-        mean_active, components, std = fit_pca(h_active_samples, n_components)
-
         st.subheader(f"Top {n_components} PCA component(s) over the {n_active} active dim(s)")
         pc_coeffs = []
         for i in range(n_components):
             coeff = st.slider(
-                f"PC{i + 1}  (σ={std[i]:.3f})", min_value=-3.0, max_value=3.0,
+                f"PC{i + 1}  (σ={pc_std[i]:.3f})", min_value=-3.0, max_value=3.0,
                 value=0.0, step=0.1, key=f"pca_slider_{i}",
             )
             pc_coeffs.append(coeff)
 
         offset_active = sum(
-            coeff * std[i] * components[:, i] for i, coeff in enumerate(pc_coeffs)
+            coeff * pc_std[i] * components[:, i] for i, coeff in enumerate(pc_coeffs)
         )
         h_active = mean_active + offset_active
 
@@ -216,3 +247,117 @@ with tab_pca:
         col_img, _ = st.columns([1, 2])
         with col_img:
             st.image(decode_h(world_model, h), caption="Reconstructed frame", width=img_size * 3)
+
+with tab_grid:
+    st.subheader("Sweep two axes into a grid of reconstructions")
+    sweep_mode = st.radio(
+        "Axes to sweep", ["Two latent dims", "Two PCA axes"],
+        horizontal=True, key="grid_mode",
+    )
+
+    col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+    with col_cfg1:
+        grid_size = st.slider("Grid size (N×N)", min_value=3, max_value=20, value=10, key="grid_n")
+    with col_cfg2:
+        sigma_mult = st.slider("Sweep range (±σ)", min_value=0.5, max_value=5.0, value=3.0, step=0.5, key="grid_sigma")
+    with col_cfg3:
+        tile_px = st.select_slider("Tile size (px)", options=[24, 32, 48, 64, 96, 128], value=48, key="grid_tile")
+
+    if sweep_mode == "Two latent dims":
+        if n_active < 2:
+            st.info("Need at least 2 active dims for a 2D sweep.")
+        else:
+            dim_labels = {d: f"h[{d}]" for d in active_idx}
+            col_a, col_b = st.columns(2)
+            with col_a:
+                dim_a = st.selectbox("X axis", active_idx, format_func=dim_labels.__getitem__, key="grid_dim_a")
+            with col_b:
+                default_b_idx = 1 if len(active_idx) > 1 else 0
+                dim_b = st.selectbox(
+                    "Y axis", active_idx, index=default_b_idx,
+                    format_func=dim_labels.__getitem__, key="grid_dim_b",
+                )
+
+            if dim_a == dim_b:
+                st.warning("Pick two different dims.")
+            else:
+                vals_a = baseline[dim_a] + torch.linspace(-sigma_mult, sigma_mult, grid_size) * dim_std[dim_a]
+                vals_b = baseline[dim_b] + torch.linspace(-sigma_mult, sigma_mult, grid_size) * dim_std[dim_b]
+
+                grid_h = baseline.repeat(grid_size * grid_size, 1)
+                a_grid, b_grid = torch.meshgrid(vals_a, vals_b, indexing="xy")  # (rows=b, cols=a)
+                grid_h[:, dim_a] = a_grid.reshape(-1)
+                grid_h[:, dim_b] = b_grid.reshape(-1)
+
+                with st.spinner(f"Decoding {grid_size * grid_size} frames…"):
+                    tiles = decode_h_batch(world_model, grid_h).reshape(
+                        grid_size, grid_size, img_size, img_size, 3
+                    )
+                montage = build_montage(tiles[::-1], tile_px)  # flip so high b is at the top
+                st.image(
+                    np.array(montage),
+                    caption=(
+                        f"X: h[{dim_a}] ∈ [{vals_a.min():.2f}, {vals_a.max():.2f}]  |  "
+                        f"Y: h[{dim_b}] ∈ [{vals_b.min():.2f}, {vals_b.max():.2f}] (low→high, bottom→top)"
+                    ),
+                )
+
+    else:
+        if not pca_ready:
+            st.info("Need at least 2 active dims to fit a PCA basis.")
+        elif n_components < 2:
+            st.info("Need at least 2 PCA components for a 2D sweep.")
+        else:
+            pc_options = list(range(n_components))
+            col_a, col_b = st.columns(2)
+            with col_a:
+                pc_a = st.selectbox("X axis", pc_options, format_func=lambda i: f"PC{i + 1}", key="grid_pc_a")
+            with col_b:
+                default_pc_b = 1 if n_components > 1 else 0
+                pc_b = st.selectbox(
+                    "Y axis", pc_options, index=default_pc_b,
+                    format_func=lambda i: f"PC{i + 1}", key="grid_pc_b",
+                )
+
+            if pc_a == pc_b:
+                st.warning("Pick two different components.")
+            else:
+                other_coeffs = {}
+                remaining = [i for i in pc_options if i not in (pc_a, pc_b)]
+                if remaining:
+                    st.caption("Held fixed:")
+                    fix_cols = st.columns(len(remaining))
+                    for col, i in zip(fix_cols, remaining):
+                        with col:
+                            other_coeffs[i] = st.slider(
+                                f"PC{i + 1}  (σ={pc_std[i]:.3f})", -3.0, 3.0, 0.0, 0.1,
+                                key=f"grid_pc_fixed_{i}",
+                            )
+
+                coeffs_a = torch.linspace(-sigma_mult, sigma_mult, grid_size)
+                coeffs_b = torch.linspace(-sigma_mult, sigma_mult, grid_size)
+                a_grid, b_grid = torch.meshgrid(coeffs_a, coeffs_b, indexing="xy")  # (rows=b, cols=a)
+
+                fixed_offset = mean_active + sum(
+                    (coeff * pc_std[i] * components[:, i] for i, coeff in other_coeffs.items()),
+                    torch.zeros_like(mean_active),
+                )
+                offset_a = a_grid.reshape(-1, 1) * pc_std[pc_a] * components[:, pc_a]
+                offset_b = b_grid.reshape(-1, 1) * pc_std[pc_b] * components[:, pc_b]
+                h_active_grid = fixed_offset.unsqueeze(0) + offset_a + offset_b  # (N*N, d_active)
+
+                grid_h = baseline.repeat(grid_size * grid_size, 1)
+                grid_h[:, active_idx] = h_active_grid
+
+                with st.spinner(f"Decoding {grid_size * grid_size} frames…"):
+                    tiles = decode_h_batch(world_model, grid_h).reshape(
+                        grid_size, grid_size, img_size, img_size, 3
+                    )
+                montage = build_montage(tiles[::-1], tile_px)  # flip so high b is at the top
+                st.image(
+                    np.array(montage),
+                    caption=(
+                        f"X: PC{pc_a + 1} ∈ [{-sigma_mult:.1f}σ, {sigma_mult:.1f}σ]  |  "
+                        f"Y: PC{pc_b + 1} ∈ [{-sigma_mult:.1f}σ, {sigma_mult:.1f}σ] (low→high, bottom→top)"
+                    ),
+                )
