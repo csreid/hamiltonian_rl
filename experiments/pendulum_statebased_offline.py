@@ -34,6 +34,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hamilton_rl.checkpoint import make_run_dir, save_checkpoint
+from hamilton_rl.models import QuadraticKinetic
 from data.pendulum import (
     _G,
     collect_state_data,
@@ -50,31 +51,39 @@ from data.pendulum import (
 
 
 class _HamiltonianMLP(nn.Module):
-    """H(q, p) for asymmetric q_dim / p_dim.
+    """H(q, p) = T(p) + V(q_enc) (separable) or a joint MLP over (q_enc, p).
 
-    Separable mode: H = T(q, p) + V(q) — matches physical structure where
-    kinetic energy depends on both q and p but potential only on q.
+    Kinetic energy is a pure function of p — matches the pendulum's true
+    T = ½θ̇² and is what makes an explicit symplectic (leapfrog) step
+    possible: ∂H/∂p depends only on p and ∂H/∂q only on q, mirroring
+    ``hamilton_rl.models.MLPHamiltonianNet``.
     """
 
     def __init__(
         self,
-        q_dim: int,
+        q_enc_dim: int,
         p_dim: int,
         hidden: int = 256,
         separable: bool = True,
+        quadratic_t: bool = True,
     ):
         super().__init__()
+        if quadratic_t and not separable:
+            raise ValueError(
+                "quadratic_t requires a separable Hamiltonian H = T(p) + V(q); "
+                "pass separable=True or quadratic_t=False."
+            )
         self.separable = separable
         if separable:
-            self.kinetic = nn.Sequential(
-                nn.Linear(q_dim + p_dim, hidden),
+            self.kinetic = QuadraticKinetic(p_dim) if quadratic_t else nn.Sequential(
+                nn.Linear(p_dim, hidden),
                 nn.Softplus(),
                 nn.Linear(hidden, hidden),
                 nn.Softplus(),
                 nn.Linear(hidden, 1),
             )
             self.potential = nn.Sequential(
-                nn.Linear(q_dim, hidden),
+                nn.Linear(q_enc_dim, hidden),
                 nn.Softplus(),
                 nn.Linear(hidden, hidden),
                 nn.Softplus(),
@@ -82,33 +91,54 @@ class _HamiltonianMLP(nn.Module):
             )
         else:
             self.net = nn.Sequential(
-                nn.Linear(q_dim + p_dim, hidden),
+                nn.Linear(q_enc_dim + p_dim, hidden),
                 nn.Softplus(),
                 nn.Linear(hidden, hidden),
                 nn.Softplus(),
                 nn.Linear(hidden, 1),
             )
 
-    def forward(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    def forward(self, q_enc: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         if self.separable:
-            T = self.kinetic(torch.cat([q, p], dim=-1)).squeeze(-1)
-            V = self.potential(q).squeeze(-1)
+            T = self.kinetic(p).squeeze(-1)
+            V = self.potential(q_enc).squeeze(-1)
             return T + V
-        return self.net(torch.cat([q, p], dim=-1)).squeeze(-1)
+        return self.net(torch.cat([q_enc, p], dim=-1)).squeeze(-1)
 
 
 class StatePHGN(nn.Module):
     """Controlled port-Hamiltonian model operating on ground-truth pendulum state.
 
     Phase space: z = (θ, θ̇) with q = z[:1], p = z[1:]
-    ODE: dz/dt = (J − R) ∇H(z) + [0, b] u
-    Integrated with RK4.
+    ODE: dz/dt = (J − R(z)) ∇H(z) + [0, b] u
+
+    Mirrors ``hamilton_rl.models.HamiltonianFlowModel`` (the pixel-pipeline
+    dynamics model) as closely as the fixed 1-D phase space allows:
+
+      - J is always the canonical symplectic structure — never learned (see
+        get_J for why a learned constant J buys nothing here either).
+      - R is restricted to the momentum block, R = [[0, 0], [0, L(z)L(z)ᵀ]];
+        optionally state-dependent (state_dep_r) to express the env's
+        quadratic drag ṗ ∝ −θ̇|θ̇|, whose effective damping grows with speed
+        (a constant R can only express linear/viscous damping).
+      - T(p) can be a learned PSD quadratic form (quadratic_t, default) or a
+        free MLP.
+      - Integrated with RK4 or leapfrog (Strang-split symplectic
+        Störmer-Verlet); leapfrog requires a separable H and is the default
+        whenever that holds.
 
     Args:
-        hidden_dim:  width of Hamiltonian MLP hidden layers
-        dt:          RK4 step size (should match env timestep, 0.05 for Pendulum-v1)
-        control_dim: dimension of control input u (1 for Pendulum-v1)
-        separable:   use T(q,p) + V(q) Hamiltonian decomposition
+        hidden_dim:   width of Hamiltonian MLP hidden layers
+        dt:           integration step size (should match env timestep, 0.05
+                      for Pendulum-v1)
+        control_dim:  dimension of control input u (1 for Pendulum-v1)
+        separable:    use T(p) + V(q) Hamiltonian decomposition
+        quadratic_t:  T(p) = ½pᵀM⁻¹p with a learned constant mass, instead of
+                      a free MLP (requires separable=True)
+        state_dep_r:  R_pp(z) from a small MLP over the current state instead
+                      of a constant matrix (requires learn_structure=True)
+        integrator:   "auto" (leapfrog if separable else rk4), "rk4", or
+                      "leapfrog" (requires separable=True)
     """
 
     Q_DIM = 1
@@ -124,56 +154,137 @@ class StatePHGN(nn.Module):
         separable: bool = True,
         learn_structure: bool = True,
         damping: float = 0.0,
+        quadratic_t: bool = True,
+        state_dep_r: bool = False,
+        integrator: str = "auto",
     ):
         super().__init__()
+        if integrator not in ("auto", "rk4", "leapfrog"):
+            raise ValueError(f"integrator must be 'auto', 'rk4' or 'leapfrog', got {integrator!r}")
+        if integrator == "leapfrog" and not separable:
+            raise ValueError(
+                "leapfrog requires a separable Hamiltonian H = T(p) + V(q); "
+                "pass separable=True or integrator='rk4'."
+            )
+        if state_dep_r and not learn_structure:
+            raise ValueError("state_dep_r requires learn_structure=True")
+        if integrator == "auto":
+            integrator = "leapfrog" if separable else "rk4"
+
         self.dt = dt
         self.control_dim = control_dim
         self.learn_structure = learn_structure
-        D = self.STATE_DIM
+        self.separable = separable
+        self.state_dep_r = state_dep_r
+        self.integrator = integrator
 
         self.hamiltonian = _HamiltonianMLP(
-            q_dim=self.Q_ENC_DIM,
+            q_enc_dim=self.Q_ENC_DIM,
             p_dim=self.P_DIM,
             hidden=hidden_dim,
             separable=separable,
+            quadratic_t=quadratic_t,
         )
 
+        # J is ALWAYS the canonical symplectic structure. A learned constant J
+        # buys nothing over canonical: the change of variables p' = c^-1 p
+        # turns any 1-D coupling into canonical while keeping H separable, so
+        # it's absorbed by the kinetic net's first layer. Fixing J also keeps
+        # leapfrog trivially valid and symplectic.
+        self.register_buffer("J_fixed", torch.tensor([[0.0, 1.0], [-1.0, 0.0]]))
+
         if learn_structure:
-            # J = A − Aᵀ (skew-symmetric), R = L Lᵀ (PSD)
-            self.A = nn.Parameter(torch.zeros(D, D))
-            self.L_param = nn.Parameter(torch.zeros(D, D))
-            nn.init.normal_(self.A, std=1e-2)
-            nn.init.normal_(self.L_param, std=1e-2)
+            if state_dep_r:
+                # L(z): small MLP z = (q_enc, p) -> lower-triangular entries,
+                # so R_pp(z) = L(z)L(z)ᵀ is PSD at every state. Zero-init
+                # output layer: the bias alone then plays the role of the
+                # constant L_param (softplus(0)·I diagonal), so training
+                # starts from exactly the constant-R model and the weights
+                # learn only the state-dependent deviation.
+                n_tril = self.P_DIM * (self.P_DIM + 1) // 2
+                self.r_net = nn.Sequential(
+                    nn.Linear(self.Q_ENC_DIM + self.P_DIM, 64),
+                    nn.Tanh(),
+                    nn.Linear(64, n_tril),
+                )
+                nn.init.zeros_(self.r_net[-1].weight)
+                nn.init.zeros_(self.r_net[-1].bias)
+                self.register_buffer(
+                    "_tril_idx", torch.tril_indices(self.P_DIM, self.P_DIM), persistent=False
+                )
+            else:
+                self.L_param = nn.Parameter(torch.zeros(self.P_DIM, self.P_DIM))
+                nn.init.normal_(self.L_param, std=1e-2)
             # Control: b maps scalar torque to dp (1-D momentum update)
             self.b = nn.Parameter(torch.zeros(self.P_DIM, control_dim))
             nn.init.normal_(self.b, std=1e-2)
+            self._has_dissipation = True
         else:
-            self.register_buffer("J_fixed", torch.tensor([[0.0, 1.0], [-1.0, 0.0]]))
-            self.register_buffer("R_fixed", torch.tensor([[0.0, 0.0], [0.0, damping]]))
+            self.register_buffer("R_pp_fixed", torch.tensor([[damping]]))
             self.register_buffer("b_fixed", torch.full((self.P_DIM, control_dim), 3.0))
+            self._has_dissipation = damping > 0
 
     # ── Structure matrix helpers ────────────────────────────────────────────
 
     def get_J(self) -> torch.Tensor:
-        if not self.learn_structure:
-            return self.J_fixed
-        return self.A - self.A.T
+        return self.J_fixed
 
-    def get_L(self) -> torch.Tensor:
-        L_lower = self.L_param.tril(-1)
-        diag_pos = F.softplus(self.L_param.diagonal())
-        return L_lower + torch.diag(diag_pos)
+    def get_L(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Cholesky factor of the momentum-block dissipation.
 
-    def get_R(self) -> torch.Tensor:
+        Constant R: (P_DIM, P_DIM), z is ignored. State-dependent R: pass the
+        encoded phase-space point z = cat(encode_q(q), p) of shape
+        (B, Q_ENC_DIM + P_DIM) to get (B, P_DIM, P_DIM); z=None evaluates at
+        the r_net's zero-input baseline and returns (P_DIM, P_DIM).
+        """
+        if not self.state_dep_r:
+            L_lower = self.L_param.tril(-1)
+            diag_pos = F.softplus(self.L_param.diagonal())
+            return L_lower + torch.diag(diag_pos)
+        squeeze = z is None
+        if z is None:
+            z = self.J_fixed.new_zeros(1, self.Q_ENC_DIM + self.P_DIM)
+        entries = self.r_net(z)  # (B, P_DIM*(P_DIM+1)//2)
+        L = entries.new_zeros(z.shape[0], self.P_DIM, self.P_DIM)
+        L[:, self._tril_idx[0], self._tril_idx[1]] = entries
+        diag_pos = F.softplus(L.diagonal(dim1=-2, dim2=-1))
+        L = L.tril(-1) + torch.diag_embed(diag_pos)
+        return L.squeeze(0) if squeeze else L
+
+    def get_R_pp(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Momentum-block of R — the only part that can be nonzero.
+
+        (P_DIM, P_DIM), or (B, P_DIM, P_DIM) for state-dependent R with z
+        given (see get_L for the z convention).
+        """
         if not self.learn_structure:
-            return self.R_fixed
-        L = self.get_L()
-        return L @ L.T
+            return self.R_pp_fixed
+        L = self.get_L(z)
+        return L @ L.transpose(-2, -1)
+
+    def get_R(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        R_pp = self.get_R_pp(z)
+        R = R_pp.new_zeros(*R_pp.shape[:-2], self.STATE_DIM, self.STATE_DIM)
+        R[..., self.Q_DIM :, self.Q_DIM :] = R_pp
+        return R
 
     def get_b(self) -> torch.Tensor:
         if not self.learn_structure:
             return self.b_fixed
         return self.b
+
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """The learned structure parameters (R and b) — for the structural_lr group."""
+        if not self.learn_structure:
+            return []
+        r_params = list(self.r_net.parameters()) if self.state_dep_r else [self.L_param]
+        return r_params + [self.b]
+
+    def _apply_R_pp(self, R_pp: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """R_pp @ v per sample."""
+        if R_pp.dim() == 2:
+            return v @ R_pp  # R_pp symmetric
+        return (R_pp @ v.unsqueeze(-1)).squeeze(-1)
 
     # ── Phase-space helpers ─────────────────────────────────────────────────
 
@@ -188,7 +299,10 @@ class StatePHGN(nn.Module):
     def H(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         return self.hamiltonian(self.encode_q(q), p)
 
-    # ── Dynamics ────────────────────────────────────────────────────────────
+    def _r_input(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor | None:
+        return torch.cat([self.encode_q(q), p], dim=-1) if self.state_dep_r else None
+
+    # ── Dynamics (RK4) ──────────────────────────────────────────────────────
 
     @torch.enable_grad()
     def _dynamics(
@@ -196,22 +310,102 @@ class StatePHGN(nn.Module):
         q: torch.Tensor,
         p: torch.Tensor,
         u: torch.Tensor,
-        M: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """dz/dt = (J − R) ∇H(z) + [0, 0, b] u."""
-        z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
-        H_val = self.hamiltonian(
-            self.encode_q(z_[:, : self.Q_DIM]), z_[:, self.Q_DIM :]
-        ).sum()
-        grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
+        """(J − R(z)) ∇H at z = (q, p), written blockwise for canonical J:
 
-        dz = torch.einsum("ij,bj->bi", M, grad_H)
-
-        # Control acts on the momentum component only
+            q̇ = ∂H/∂p,   ṗ = −∂H/∂q − R_pp(z) ∂H/∂p + b u
+        """
+        q_ = q.clone().requires_grad_(True)
+        p_ = p.clone().requires_grad_(True)
+        H_val = self.H(q_, p_).sum()
+        g_q, g_p = torch.autograd.grad(H_val, [q_, p_], create_graph=self.training)
+        dq = g_p
+        dp = -g_q
+        if self._has_dissipation:
+            R_pp = self.get_R_pp(self._r_input(q, p))
+            dp = dp - self._apply_R_pp(R_pp, g_p)
         Bu = u @ self.get_b().T  # (B, P_DIM)
-        dz = dz + torch.cat([torch.zeros_like(q), Bu], dim=-1)
+        dp = dp + Bu
+        return dq, dp
 
-        return dz[:, : self.Q_DIM], dz[:, self.Q_DIM :]
+    def _rk4_step(
+        self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Classic 4-stage explicit RK4 on the full field (J − R(z))∇H + bu."""
+        dq1, dp1 = self._dynamics(q, p, u)
+        dq2, dp2 = self._dynamics(q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u)
+        dq3, dp3 = self._dynamics(q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u)
+        dq4, dp4 = self._dynamics(q + dt * dq3, p + dt * dp3, u)
+        q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
+        p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
+        return q_next, p_next
+
+    # ── Dynamics (leapfrog) ─────────────────────────────────────────────────
+
+    @torch.enable_grad()
+    def _grad_V(self, q: torch.Tensor) -> torch.Tensor:
+        """∇V(q) alone — skips the kinetic net entirely (separable H only)."""
+        q_ = q.clone().requires_grad_(True)
+        V_val = self.hamiltonian.potential(self.encode_q(q_)).sum()
+        return torch.autograd.grad(V_val, q_, create_graph=self.training)[0]
+
+    @torch.enable_grad()
+    def _grad_T(self, p: torch.Tensor) -> torch.Tensor:
+        """∇T(p) alone — skips the potential net entirely (separable H only)."""
+        p_ = p.clone().requires_grad_(True)
+        T_val = self.hamiltonian.kinetic(p_).sum()
+        return torch.autograd.grad(T_val, p_, create_graph=self.training)[0]
+
+    def _dissipation_substep(
+        self, q: torch.Tensor, p: torch.Tensor, tau: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Substep of the dissipative flow ż = −R∇H over (possibly negative) time tau.
+
+        R acts only on the momentum block, so q is untouched and ṗ = −R_pp ∂H/∂p.
+        With a constant R and quadratic kinetic energy the flow is linear,
+        ṗ = −R_pp M⁻¹ p, integrated exactly via a matrix exponential (also
+        matches the env's exponential damping θ̇ *= exp(−c·dt)). With
+        state-dependent R, R_pp(z) is frozen at the substep's entry state and
+        the same matrix-exp flow is applied — exact for constant R, O(tau²)
+        otherwise. With an MLP kinetic the flow is nonlinear; falls back to
+        explicit Euler.
+        """
+        kin = self.hamiltonian.kinetic
+        R_pp = self.get_R_pp(self._r_input(q, p))
+        if isinstance(kin, QuadraticKinetic):
+            A = R_pp @ kin.M_inv()
+            if A.dim() == 2:
+                return q, p @ torch.matrix_exp(-tau * A).T
+            return q, (torch.matrix_exp(-tau * A) @ p.unsqueeze(-1)).squeeze(-1)
+        g_T = self._grad_T(p)
+        if R_pp.dim() == 2:
+            return q, p - tau * g_T @ R_pp  # R_pp symmetric
+        return q, p - tau * (R_pp @ g_T.unsqueeze(-1)).squeeze(-1)
+
+    def _leapfrog_step(
+        self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Strang split: D(dt/2) ∘ Leapfrog(dt) ∘ D(dt/2).
+
+        The symplectic core is canonical kick-drift-kick on ż = J∇H, with the
+        constant control force bu folded into the two half-kicks (exact ZOH).
+        The dissipative flow ż = −R∇H is Strang-split symmetrically around it
+        so the composite stays 2nd-order and reduces to pure symplectic
+        leapfrog when R = 0.
+        """
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, dt / 2)
+
+        Bu = u @ self.get_b().T  # constant force on p (zero-order hold)
+        p = p - (dt / 2) * self._grad_V(q) + (dt / 2) * Bu
+        q = q + dt * self._grad_T(p)
+        p = p - (dt / 2) * self._grad_V(q) + (dt / 2) * Bu
+
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, dt / 2)
+        return q, p
+
+    # ── Public step ─────────────────────────────────────────────────────────
 
     @torch.enable_grad()
     def step(
@@ -221,19 +415,17 @@ class StatePHGN(nn.Module):
         u: torch.Tensor,
         dt: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One RK4 step of dz/dt = (J − R) ∇H + control."""
+        """One integration step of dz/dt = (J − R) ∇H + control.
+
+        Dispatches on self.integrator: 'rk4' (classic 4-stage, works for any
+        structure) or 'leapfrog' (Strang-split symplectic Störmer-Verlet;
+        requires separable H).
+        """
         if dt is None:
             dt = self.dt
-        M = self.get_J() - self.get_R()
-
-        dq1, dp1 = self._dynamics(q, p, u, M)
-        dq2, dp2 = self._dynamics(q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u, M)
-        dq3, dp3 = self._dynamics(q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u, M)
-        dq4, dp4 = self._dynamics(q + dt * dq3, p + dt * dp3, u, M)
-
-        q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
-        p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
-        return q_next, p_next
+        if self.integrator == "leapfrog":
+            return self._leapfrog_step(q, p, u, dt)
+        return self._rk4_step(q, p, u, dt)
 
 
 # ---------------------------------------------------------------------------
@@ -644,12 +836,32 @@ def _log_rollout_videos(
     help="Width of Hamiltonian MLP hidden layers",
 )
 @click.option("--dt", type=float, default=0.05, show_default=True)
-@click.option("--no-separable", "separable", default=True, flag_value=False)
+@click.option("--separable/--no-separable", default=True, show_default=True)
 @click.option(
     "--learn-structure/--no-learn-structure",
     default=True,
     show_default=True,
-    help="Learn J/R/B matrices; --no-learn-structure fixes J=[[0,1],[-1,0]], R=[[0,0],[0,damping]], B=3",
+    help="Learn R/b (J is always canonical); --no-learn-structure fixes R=[[0,0],[0,damping]], b=3",
+)
+@click.option(
+    "--quadratic-t/--no-quadratic-t",
+    default=True,
+    show_default=True,
+    help="T(p) = 1/2 p^T M^-1 p with learned constant mass, instead of a free MLP (requires separable)",
+)
+@click.option(
+    "--state-dep-r",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="R_pp(z) from a small MLP over the current state, instead of a constant matrix (requires --learn-structure)",
+)
+@click.option(
+    "--integrator",
+    type=click.Choice(["auto", "rk4", "leapfrog"]),
+    default="auto",
+    show_default=True,
+    help="'auto' = leapfrog if separable else rk4",
 )
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
@@ -768,7 +980,11 @@ def main(**kwargs):
         separable=kwargs["separable"],
         learn_structure=kwargs["learn_structure"],
         damping=kwargs["damping"],
+        quadratic_t=kwargs["quadratic_t"],
+        state_dep_r=kwargs["state_dep_r"],
+        integrator=kwargs["integrator"],
     ).to(device)
+    print(f"Integrator: {model.integrator}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     hparams = dict(kwargs)
@@ -777,7 +993,7 @@ def main(**kwargs):
             [
                 {"params": model.hamiltonian.parameters(), "lr": kwargs["h_lr"]},
                 {
-                    "params": [model.L_param, model.A, model.b],
+                    "params": model.structural_parameters(),
                     "lr": kwargs["structural_lr"],
                 },
             ]

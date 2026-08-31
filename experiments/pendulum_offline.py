@@ -122,10 +122,16 @@ def _log_latent_variance(
     qs: torch.Tensor,
     ps: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mean per-dim variance of q and p, as 0-dim tensors (no host sync)."""
+    """Per-dim variance of q and p, as (q_dim,)/(p_dim,) tensors (no host sync).
+
+    A mean over dims hides dead-dimension collapse (a few live dims carrying
+    real signal, the rest ~0) behind a single small number — log the full
+    per-dim vector as a TensorBoard histogram instead of averaging it away.
+    """
     q_dim = qs.shape[-1]
-    q_var = qs.detach().reshape(-1, q_dim).var(dim=0).mean()
-    p_var = ps.detach().reshape(-1, q_dim).var(dim=0).mean()
+    p_dim = ps.shape[-1]
+    q_var = qs.detach().reshape(-1, q_dim).var(dim=0)
+    p_var = ps.detach().reshape(-1, p_dim).var(dim=0)
     return q_var, p_var
 
 
@@ -1444,7 +1450,7 @@ def _train_epoch_phase2(
     huber_delta: float = 0.0,
     h_noise_std: float = 0.0,
     h_noise_scale: torch.Tensor | None = None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
     """Dynamics epoch: joint teacher-forced + closed-loop rollout.
 
     Each batch samples one random window [s, s+ctx+T) — shared across the
@@ -1649,18 +1655,17 @@ def _train_epoch_phase2(
             total_p_var = total_p_var + p_var
 
     n = len(loader)
-    return {
+    metrics = {
         "phase2/dynamics": float(total_dynamics) / n,
         "phase2/tf_loss": float(total_tf) / n,
         "phase2/cl_loss": float(total_cl) / n,
         "phase2/logdet_reg": float(total_logdet_reg) / n,
-        "phase2/q_var": float(total_q_var) / n,
-        "phase2/p_var": float(total_p_var) / n,
         "phase2/hamiltonian_l1": float(total_hamiltonian_l1) / n,
         "phase2/grad_H_norm": float(total_grad_H_norm) / n,
         "phase2/struct_reg": float(total_struct_reg) / n,
         "phase2/energy_balance": float(total_energy_balance) / n,
     }
+    return metrics, total_q_var / n, total_p_var / n
 
 
 def _encode_val_h(
@@ -1965,7 +1970,7 @@ def _train_epoch_phase3(
     energy_balance_weight: float = 0.0,
     huber_delta: float = 0.0,
     decode_stride: int = 1,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
     """End-to-end epoch: every module trains through the full dreaming pipeline.
 
     Window sampling matches Phase 2 (one random [s, s+ctx+T) window shared
@@ -2133,17 +2138,16 @@ def _train_epoch_phase3(
             total_p_var = total_p_var + p_var
 
     n = len(loader)
-    return {
+    metrics = {
         "phase3/loss": float(total_loss) / n,
         "phase3/recon": float(total_recon) / n,
         "phase3/cl_pixel": float(total_pix_cl) / n,
         "phase3/tf_h": float(total_tf) / n,
         "phase3/cl_h": float(total_cl_h) / n,
         "phase3/logdet_reg": float(total_logdet) / n,
-        "phase3/q_var": float(total_q_var) / n,
-        "phase3/p_var": float(total_p_var) / n,
         "phase3/energy_balance": float(total_energy_balance) / n,
     }
+    return metrics, total_q_var / n, total_p_var / n
 
 
 @torch.no_grad()
@@ -2812,7 +2816,7 @@ def phase2_cmd(**kwargs):
 
     print("\n=== Phase 2: dynamics flow training ===")
     for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 2", dynamic_ncols=True):
-        metrics = _train_epoch_phase2(
+        metrics, q_var_vec, p_var_vec = _train_epoch_phase2(
             dyn_model=dyn_model,
             encoder=phase1_model.encoder,
             loader=rollout_loader,
@@ -2867,6 +2871,8 @@ def phase2_cmd(**kwargs):
         if (epoch + 1) % kwargs["log_every"] == 0:
             for k, v in metrics.items():
                 writer.add_scalar(k, v, epoch)
+            writer.add_histogram("phase2/q_var", q_var_vec, epoch)
+            writer.add_histogram("phase2/p_var", p_var_vec, epoch)
             writer.add_scalar("phase2/seq_len", seq_len, epoch)
             writer.add_scalar("phase2/ema_loss", ema_loss, epoch)
             writer.add_scalar("phase2/ema_cl", ema_cl, epoch)
@@ -2884,8 +2890,6 @@ def phase2_cmd(**kwargs):
                 f"  cl={metrics['phase2/cl_loss']:.4f}"
                 f"  ema_cl={ema_cl:.4f}"
                 f"  logdet={metrics['phase2/logdet_reg']:.4f}"
-                f"  q_var={metrics['phase2/q_var']:.4f}"
-                f"  p_var={metrics['phase2/p_var']:.4f}"
             )
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
@@ -3240,7 +3244,7 @@ def phase3_cmd(**kwargs):
 
     print("\n=== Phase 3: end-to-end finetuning ===")
     for epoch in tqdm(range(kwargs["epochs"]), desc="Phase 3", dynamic_ncols=True):
-        metrics = _train_epoch_phase3(
+        metrics, q_var_vec, p_var_vec = _train_epoch_phase3(
             world_model=world_model,
             loader=rollout_loader,
             optimizer=optimizer,
@@ -3293,6 +3297,8 @@ def phase3_cmd(**kwargs):
         if (epoch + 1) % kwargs["log_every"] == 0:
             for k, v in metrics.items():
                 writer.add_scalar(k, v, epoch)
+            writer.add_histogram("phase3/q_var", q_var_vec, epoch)
+            writer.add_histogram("phase3/p_var", p_var_vec, epoch)
             writer.add_scalar("phase3/seq_len", seq_len, epoch)
             writer.add_scalar("phase3/ema_loss", ema_loss, epoch)
             writer.add_scalar("phase3/ema_cl_pixel", ema_cl, epoch)
