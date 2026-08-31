@@ -164,18 +164,22 @@ h_samples = encode_sample_latents(
     world_model, str(ckpt_path), int(n_samples), int(rollout_len), img_size, damping,
 )
 baseline = h_samples.mean(dim=0)  # (latent_dim,) — inactive dims are already ~0 (gated at encode time)
+dim_std = h_samples.std(dim=0)    # (latent_dim,) — per-dim scale, for sizing sliders
 
 tab_dims, tab_pca = st.tabs(["Per-dimension sliders", "PCA (3D)"])
 
 with tab_dims:
     st.subheader(f"{n_active} active latent dim(s)")
+    st.caption("Each slider spans ±3σ of that dim's value over the sampled rollouts.")
     cols = st.columns(2)
     h = baseline.clone()
     for i, dim in enumerate(active_idx):
         with cols[i % 2]:
+            span = max(3.0 * float(dim_std[dim]), 1e-3)
+            lo, hi = float(baseline[dim]) - span, float(baseline[dim]) + span
             val = st.slider(
-                f"h[{dim}]", min_value=-2.0, max_value=2.0,
-                value=float(baseline[dim].clamp(-2.0, 2.0)), step=0.05,
+                f"h[{dim}]  (σ={dim_std[dim]:.3f})", min_value=lo, max_value=hi,
+                value=float(baseline[dim]), step=span / 40,
                 key=f"dim_slider_{dim}",
             )
             h[dim] = val
