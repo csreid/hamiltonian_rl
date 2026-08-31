@@ -76,8 +76,9 @@ from data.pendulum import (
     collect_spin_trajectories,
     collect_val_trajectories,
 )
+from hamilton_rl.checkpoint import load_state_model
 from hamilton_rl.mppi import MPPIConfig, mppi_plan, shift_mean
-from hamilton_rl.models import WorldModel
+from hamilton_rl.models import StatePHGN, WorldModel
 from hamilton_rl.streamlit_common import (
     build_sidebyside_frames,
     frames_to_gif,
@@ -100,6 +101,12 @@ _DISPLAY_VEL_LIMIT = 15.0
 def load_model(pt_path_str: str) -> WorldModel:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return WorldModel.load(Path(pt_path_str), device)
+
+
+@st.cache_resource(show_spinner="Loading state model…")
+def load_state_checkpoint(pt_path_str: str) -> StatePHGN:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return load_state_model(Path(pt_path_str), device)
 
 
 @st.cache_resource(show_spinner="Fitting h → state linear probe…")
@@ -527,6 +534,106 @@ def run_latent_mppi(
     }
 
 
+# ── State-based MPPI ─────────────────────────────────────────────────────────
+
+
+def _state_rollout_cost_fn(model: StatePHGN, q0: torch.Tensor, p0: torch.Tensor, action_weight: float):
+    """Imagined-rollout cost directly in (θ, θ̇) — same shape as the ground-truth
+    cost (`_mppi_gt_cost_fn`), just stepped through the learned `StatePHGN`
+    instead of `analytic_pendulum_step`. No probe/decoder needed: the model's
+    phase space *is* (θ, θ̇) already.
+    """
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        K, H, _ = candidates.shape
+        q = q0.expand(K, -1).clone()
+        p = p0.expand(K, -1).clone()
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
+        for t in range(H):
+            u = candidates[:, t, :]
+            q, p = model.step(q, p, u)
+            total = total + angle_normalize(q.squeeze(-1)) ** 2 + 0.1 * p.squeeze(-1) ** 2 + action_weight * u.squeeze(-1) ** 2
+        return total
+
+    return cost_fn
+
+
+@torch.no_grad()
+def run_state_mppi(
+    model: StatePHGN,
+    theta0: float,
+    theta_dot0: float,
+    img_size: int,
+    damping: float,
+    total_steps: int,
+    cfg: MPPIConfig,
+    action_weight: float,
+    device: torch.device,
+    progress_cb=None,
+) -> dict:
+    """Closed-loop receding-horizon MPPI: plan with the learned StatePHGN, act on the real pendulum.
+
+    Unlike the pixel pipeline there is no encoder/context window to fill or
+    re-ground each step — the model's phase space already *is* (θ, θ̇), so
+    "grounding" is just reading `env.unwrapped.state` directly, exactly like
+    `run_ground_truth_mppi`. `PendulumPixelEnv` is used purely to render
+    frames for the side-by-side comparison GIF; planning never touches pixels.
+    """
+    env = PendulumPixelEnv(img_size=img_size, damping=damping)
+    env.reset()
+    env.set_state(theta0, theta_dot0)
+    theta_b, theta_dot_b = env.unwrapped.state
+
+    theta_cur = torch.tensor([[float(theta_b)]], device=device)
+    theta_dot_cur = torch.tensor([[float(theta_dot_b)]], device=device)
+    mean = torch.zeros(cfg.horizon, 1, device=device)
+
+    frames = []
+    thetas = [float(angle_normalize(torch.tensor(float(theta_b))))]
+    theta_dots = [float(theta_dot_b)]
+    plan_thetas, plan_theta_dots = [], []
+    try:
+        for step in range(total_steps):
+            cost_fn = _state_rollout_cost_fn(model, theta_cur, theta_dot_cur, action_weight)
+            mean = mppi_plan(mean, cost_fn, cfg)
+
+            # Roll the chosen (noise-free) plan forward once, purely to show
+            # "what does the controller currently intend to do" — never executed.
+            pq, pp = theta_cur.clone(), theta_dot_cur.clone()
+            plan_t, plan_td = [], []
+            for t in range(cfg.horizon):
+                pq, pp = model.step(pq, pp, mean[t : t + 1, :])
+                plan_t.append(float(angle_normalize(pq.squeeze())))
+                plan_td.append(float(pp.squeeze()))
+            plan_thetas.append(plan_t)
+            plan_theta_dots.append(plan_td)
+
+            u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
+
+            env.step(np.array([u0], dtype=np.float32))
+            theta_new, theta_dot_new = env.unwrapped.state  # post-damping
+            theta_cur = torch.tensor([[float(theta_new)]], device=device)
+            theta_dot_cur = torch.tensor([[float(theta_dot_new)]], device=device)
+
+            display_obs = env.render_with_action(u0)
+            frames.append(torch.from_numpy(display_obs).float() / 255.0)
+            thetas.append(float(angle_normalize(torch.tensor(float(theta_new)))))
+            theta_dots.append(float(theta_dot_new))
+
+            mean = shift_mean(mean)
+            if progress_cb is not None:
+                progress_cb(step + 1, total_steps)
+    finally:
+        env.close()
+
+    return {
+        "frames": frames,
+        "theta": thetas,
+        "theta_dot": theta_dots,
+        "plan_theta": plan_thetas,
+        "plan_theta_dot": plan_theta_dots,
+    }
+
+
 # ── Decoded plan (single control step) ──────────────────────────────────────
 
 
@@ -643,15 +750,28 @@ st.title("Pendulum MPPI Planner: Ground Truth vs. Learned Dynamics")
 
 with st.sidebar:
     st.header("Checkpoint")
+    model_kind_label = st.radio(
+        "Model type",
+        ["Pixel (autoencoder + flow)", "State-based (ground-truth phase space)"],
+        index=0,
+        help="Both are compared against the same analytic ground-truth MPPI — "
+        "this toggles which learned checkpoint plays the 'learned' role. "
+        "Pixel needs an encoder/decoder and a fitted h→state probe; "
+        "state-based operates on (θ, θ̇) directly, same as ground truth.",
+    )
+    model_kind = "pixel" if model_kind_label.startswith("Pixel") else "state"
     models_root = Path("models")
-    ckpt_path = pick_checkpoint(models_root, "World model", "wm")
+    ckpt_path = pick_checkpoint(models_root, "Model", "ckpt")
 
     st.divider()
     st.header("Initial condition")
     theta0 = st.slider("θ₀ (rad)", -float(np.pi), float(np.pi), float(np.pi), step=0.05,
                         help="π = hanging straight down (swing-up); 0 = upright")
     theta_dot0 = st.slider("θ̇₀ (rad/s)", -8.0, 8.0, 0.0, step=0.1)
-    n_context = st.slider("Encoder context frames", min_value=2, max_value=20, value=5, step=1)
+    if model_kind == "pixel":
+        n_context = st.slider("Encoder context frames", min_value=2, max_value=20, value=5, step=1)
+    else:
+        n_context = 1  # no encoder window to fill for the state-based model
 
     st.divider()
     st.header("MPPI")
@@ -665,27 +785,30 @@ with st.sidebar:
     st.header("Cost weights")
     w_u_gt = st.number_input("Action weight (ground truth)", min_value=0.0, value=0.001, step=0.001, format="%.4f")
     w_u_latent = st.number_input("Action weight (learned)", min_value=0.0, value=0.001, step=0.001, format="%.4f")
-    # label -> mode key understood by run_latent_mppi
-    cost_mode_options = {
-        "Linear probe (θ, θ̇)": "probe",
-        "Pixel distance": "pixel",
-        "CV on decoded frames": "cv",
-    }
-    cost_mode_label = st.selectbox(
-        "Cost function (learned)",
-        options=list(cost_mode_options),
-        index=0,
-        help="How the learned MPPI scores imagined rollouts. Linear probe: "
-        "apply the h → state regression and use the same angle² + velocity² "
-        "cost as ground truth. Pixel distance: decoded-frame MSE against a "
-        "rendered upright target frame — slower (CNN decoder per candidate "
-        "per step) and known to give little gradient until the pendulum is "
-        "nearly upright. CV on decoded frames: decode to pixels, then read "
-        "an implied (θ, θ̇) off each decoded frame via a soft rod-direction "
-        "centroid (θ̇ by finite differences) and use the probe-style angle² "
-        "+ velocity² cost — no privileged state regression involved.",
-    )
-    cost_mode = cost_mode_options[cost_mode_label]
+    if model_kind == "pixel":
+        # label -> mode key understood by run_latent_mppi
+        cost_mode_options = {
+            "Linear probe (θ, θ̇)": "probe",
+            "Pixel distance": "pixel",
+            "CV on decoded frames": "cv",
+        }
+        cost_mode_label = st.selectbox(
+            "Cost function (learned)",
+            options=list(cost_mode_options),
+            index=0,
+            help="How the learned MPPI scores imagined rollouts. Linear probe: "
+            "apply the h → state regression and use the same angle² + velocity² "
+            "cost as ground truth. Pixel distance: decoded-frame MSE against a "
+            "rendered upright target frame — slower (CNN decoder per candidate "
+            "per step) and known to give little gradient until the pendulum is "
+            "nearly upright. CV on decoded frames: decode to pixels, then read "
+            "an implied (θ, θ̇) off each decoded frame via a soft rod-direction "
+            "centroid (θ̇ by finite differences) and use the probe-style angle² "
+            "+ velocity² cost — no privileged state regression involved.",
+        )
+        cost_mode = cost_mode_options[cost_mode_label]
+    else:
+        cost_mode = None  # state-based cost is always the direct angle² + velocity² form
 
     st.divider()
     st.header("Rollout")
@@ -697,23 +820,36 @@ with st.sidebar:
 
 # ── Load model ────────────────────────────────────────────────────────────────
 
+world_model = None
+state_model = None
 try:
-    world_model = load_model(str(ckpt_path))
-    device = next(world_model.autoencoder.parameters()).device
+    if model_kind == "pixel":
+        world_model = load_model(str(ckpt_path))
+        device = next(world_model.autoencoder.parameters()).device
+        if world_model.dynamics is None:
+            st.warning(f"`{ckpt_path}` is a Phase-1-only checkpoint (no dynamics). Pick a Phase 2 checkpoint to plan.")
+            st.stop()
+        data_cfg = world_model.data_config
+        img_size = data_cfg.get("img_size", 64)
+        damping = data_cfg.get("damping", 0.0)
+    else:
+        state_model = load_state_checkpoint(str(ckpt_path))
+        device = next(state_model.parameters()).device
+        data_cfg = state_model.data_config
+        img_size = 64  # rendering only — the state model has no notion of image size
+        damping = data_cfg.get("damping", 0.0)
 except Exception as exc:
     st.error(f"Failed to load checkpoint:\n\n```\n{exc}\n```")
     st.stop()
 
-if world_model.dynamics is None:
-    st.warning(f"`{ckpt_path}` is a Phase-1-only checkpoint (no dynamics). Pick a Phase 2 checkpoint to plan.")
-    st.stop()
-
-data_cfg = world_model.data_config
-img_size = data_cfg.get("img_size", 64)
-damping = data_cfg.get("damping", 0.0)
-
 with st.sidebar:
-    st.caption(f"img_size={img_size}  damping={damping}  device={device}")
+    if model_kind == "pixel":
+        st.caption(f"img_size={img_size}  damping={damping}  device={device}")
+    else:
+        st.caption(
+            f"integrator={state_model.integrator}  state_dep_r={state_model.state_dep_r}  "
+            f"damping={damping}  device={device}"
+        )
 
 
 # ── Generation ────────────────────────────────────────────────────────────────
@@ -723,13 +859,6 @@ if generate_btn:
         horizon=horizon, n_samples=n_samples, n_iterations=n_iterations,
         noise_std=noise_std, temperature=temperature, action_low=-2.0, action_high=2.0,
     )
-
-    with st.spinner("Fitting h → state regression on fresh held-out episodes…"):
-        try:
-            A, r2 = fit_h_state_regression(str(ckpt_path))
-        except Exception as exc:
-            st.error(f"Regression fit failed:\n\n```\n{exc}\n```")
-            st.stop()
 
     gt_progress = st.progress(0.0, text="Ground-truth MPPI…")
     try:
@@ -743,14 +872,24 @@ if generate_btn:
         st.stop()
     gt_progress.empty()
 
+    r2 = None
     latent_progress = st.progress(0.0, text="Learned-dynamics MPPI…")
     try:
-        latent_result = run_latent_mppi(
-            world_model=world_model, theta0=theta0, theta_dot0=theta_dot0, n_context=n_context,
-            total_steps=total_steps, cfg=cfg, action_weight=w_u_latent, regression=A,
-            cost_mode=cost_mode,
-            progress_cb=lambda i, n: latent_progress.progress(i / n, text=f"Learned-dynamics MPPI… {i}/{n}"),
-        )
+        if model_kind == "pixel":
+            with st.spinner("Fitting h → state regression on fresh held-out episodes…"):
+                A, r2 = fit_h_state_regression(str(ckpt_path))
+            latent_result = run_latent_mppi(
+                world_model=world_model, theta0=theta0, theta_dot0=theta_dot0, n_context=n_context,
+                total_steps=total_steps, cfg=cfg, action_weight=w_u_latent, regression=A,
+                cost_mode=cost_mode,
+                progress_cb=lambda i, n: latent_progress.progress(i / n, text=f"Learned-dynamics MPPI… {i}/{n}"),
+            )
+        else:
+            latent_result = run_state_mppi(
+                model=state_model, theta0=theta0, theta_dot0=theta_dot0, img_size=img_size, damping=damping,
+                total_steps=total_steps, cfg=cfg, action_weight=w_u_latent, device=device,
+                progress_cb=lambda i, n: latent_progress.progress(i / n, text=f"Learned-dynamics MPPI… {i}/{n}"),
+            )
     except Exception as exc:
         st.error(f"Learned-dynamics MPPI failed:\n\n```\n{exc}\n```")
         st.stop()
@@ -760,6 +899,7 @@ if generate_btn:
         gt_result=gt_result,
         latent_result=latent_result,
         r2=r2,
+        model_kind=model_kind,
         ckpt_path=str(ckpt_path),
         total_steps=total_steps,
     )
@@ -774,12 +914,24 @@ if gt_result is None or latent_result is None:
     st.info("Configure settings in the sidebar and press **▶ Plan & Generate**.")
     st.stop()
 
+result_model_kind = st.session_state.get("model_kind", "pixel")
+if result_model_kind != model_kind:
+    st.warning(
+        "Sidebar model type changed since these results were generated "
+        f"(shown: **{result_model_kind}**, selected: **{model_kind}**). "
+        "Press **▶ Plan & Generate** to refresh."
+    )
+    st.stop()
+
 r2 = st.session_state["r2"]
-st.success(
+summary = (
     f"Planned **{st.session_state['total_steps']}** control steps  |  "
-    f"Checkpoint: `{st.session_state['ckpt_path']}`  |  "
-    f"h→state R² — cosθ: {r2[0]:.3f}  sinθ: {r2[1]:.3f}  θ̇: {r2[2]:.3f}"
+    f"Model: **{'Pixel' if result_model_kind == 'pixel' else 'State-based'}**  |  "
+    f"Checkpoint: `{st.session_state['ckpt_path']}`"
 )
+if r2 is not None:
+    summary += f"  |  h→state R² — cosθ: {r2[0]:.3f}  sinθ: {r2[1]:.3f}  θ̇: {r2[2]:.3f}"
+st.success(summary)
 
 col_fps, col_size = st.columns(2)
 with col_fps:
@@ -801,11 +953,19 @@ with st.spinner("Rendering pixel-rollout GIF…"):
     pixel_gif = frames_to_gif(composite, fps)
 
 st.subheader("Ground-truth MPPI  (left)  |  Learned-dynamics MPPI  (right)")
-st.markdown(
-    "Both panels render real `PendulumPixelEnv` frames — the learned side plans with the "
-    "checkpoint's dynamics but only ever executes on the real pendulum, re-grounding its "
-    "latent state from real frames every step."
-)
+if result_model_kind == "pixel":
+    st.markdown(
+        "Both panels render real `PendulumPixelEnv` frames — the learned side plans with the "
+        "checkpoint's dynamics but only ever executes on the real pendulum, re-grounding its "
+        "latent state from real frames every step."
+    )
+else:
+    st.markdown(
+        "Both panels render real `PendulumPixelEnv` frames — the learned side plans with the "
+        "checkpoint's `StatePHGN` dynamics directly on (θ, θ̇) but only ever executes on the "
+        "real pendulum, re-grounding from the real simulator state every step (no encoder "
+        "involved)."
+    )
 st.image(pixel_gif, use_container_width=False)
 
 with st.spinner("Rendering phase-space animation…"):
@@ -825,40 +985,46 @@ st.markdown(
 )
 st.image(phase_gif, use_container_width=False)
 
-st.subheader("Decoded imagined plan at one control step")
-st.markdown(
-    "MPPI replans from scratch every control step, so the imagined horizon can look "
-    "completely different step to step — averaging or animating across steps would just "
-    "blur that together. Instead, pick one step below to decode *that step's* full "
-    "H-frame plan straight from the learned dynamics (`controlled_step` → `decode` → "
-    "`decode_latent`, the same pipeline `WorldModel.dream` uses), and compare it against "
-    "the real frame the pendulum was actually in when that plan was made."
-)
-n_control_steps = len(latent_result["plan_actions"])
-plan_step = st.slider(
-    "Control step to inspect", min_value=0, max_value=n_control_steps - 1, value=0
-)
-with st.spinner("Decoding imagined plan…"):
-    plan_frames_u8 = decode_plan_frames(
-        world_model=world_model,
-        q0=latent_result["plan_q0"][plan_step],
-        p0=latent_result["plan_p0"][plan_step],
-        actions=latent_result["plan_actions"][plan_step],
+if result_model_kind == "pixel":
+    st.subheader("Decoded imagined plan at one control step")
+    st.markdown(
+        "MPPI replans from scratch every control step, so the imagined horizon can look "
+        "completely different step to step — averaging or animating across steps would just "
+        "blur that together. Instead, pick one step below to decode *that step's* full "
+        "H-frame plan straight from the learned dynamics (`controlled_step` → `decode` → "
+        "`decode_latent`, the same pipeline `WorldModel.dream` uses), and compare it against "
+        "the real frame the pendulum was actually in when that plan was made."
     )
-    plan_pil = [
-        Image.fromarray(f).resize((display_size, display_size), Image.BILINEAR)
-        for f in plan_frames_u8
-    ]
-    plan_gif = frames_to_gif(plan_pil, fps)
+    n_control_steps = len(latent_result["plan_actions"])
+    plan_step = st.slider(
+        "Control step to inspect", min_value=0, max_value=n_control_steps - 1, value=0
+    )
+    with st.spinner("Decoding imagined plan…"):
+        plan_frames_u8 = decode_plan_frames(
+            world_model=world_model,
+            q0=latent_result["plan_q0"][plan_step],
+            p0=latent_result["plan_p0"][plan_step],
+            actions=latent_result["plan_actions"][plan_step],
+        )
+        plan_pil = [
+            Image.fromarray(f).resize((display_size, display_size), Image.BILINEAR)
+            for f in plan_frames_u8
+        ]
+        plan_gif = frames_to_gif(plan_pil, fps)
 
-col_real, col_plan = st.columns(2)
-with col_real:
-    st.caption(f"Real frame at t={plan_step} (start of this step's plan)")
-    real_frame = Image.fromarray(latent_frames_u8[max(plan_step - 1, 0)]).resize(
-        (display_size, display_size), Image.BILINEAR
+    col_real, col_plan = st.columns(2)
+    with col_real:
+        st.caption(f"Real frame at t={plan_step} (start of this step's plan)")
+        real_frame = Image.fromarray(latent_frames_u8[max(plan_step - 1, 0)]).resize(
+            (display_size, display_size), Image.BILINEAR
+        )
+        st.image(real_frame, use_container_width=False)
+    with col_plan:
+        horizon_len = len(latent_result["plan_actions"][plan_step])
+        st.caption(f"Imagined {horizon_len}-step plan from t={plan_step}")
+        st.image(plan_gif, use_container_width=False)
+else:
+    st.caption(
+        "Decoded-plan preview is pixel-model only — the state-based model's imagined "
+        "horizon is already shown as the dashed line in the phase-space plot above."
     )
-    st.image(real_frame, use_container_width=False)
-with col_plan:
-    horizon_len = len(latent_result["plan_actions"][plan_step])
-    st.caption(f"Imagined {horizon_len}-step plan from t={plan_step}")
-    st.image(plan_gif, use_container_width=False)

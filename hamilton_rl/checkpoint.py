@@ -1,11 +1,15 @@
-"""Checkpointing: run directories and the unified world-model format.
+"""Checkpointing: run directories and the unified single-file checkpoint formats.
 
-A world-model checkpoint is a single ``.pt`` holding both halves of the model
-plus everything needed to rebuild them — no YAML sidecar or out-of-band
-hyperparameters required to load:
+Two self-describing formats, both a single ``.pt`` holding model weights plus
+everything needed to rebuild them — no YAML sidecar or out-of-band
+hyperparameters required to load. ``kind`` distinguishes them so a loader
+given the wrong file fails with a clear error instead of a shape mismatch.
+
+World model (pixel pipeline — ``save_world_model`` / ``load_world_model``):
 
     {
       "format_version": 1,
+      "kind": "world_model",
       "config": {
         "autoencoder": {...TemporalAutoencoder ctor args...},
         "dynamics":    {...HamiltonianFlowModel ctor args...} | None,
@@ -17,8 +21,23 @@ hyperparameters required to load:
     }
 
 Phase 1 writes ``dynamics: None``; Phase 2 fills it in, so its checkpoint is
-the one file the dashboard needs.  A YAML sidecar (hparams + metrics only) is
-still written for human eyeballing.
+the one file the dashboard needs.
+
+State model (ground-truth phase-space pipeline — ``save_state_model`` /
+``load_state_model``):
+
+    {
+      "format_version": 1,
+      "kind": "state_model",
+      "config": {
+        "model": {...StatePHGN ctor args...},
+        "data":  {...how the training episodes were collected...},
+      },
+      "model": <state_dict>,
+      "hparams": {...}, "metrics": {...}, "epoch": int,
+    }
+
+Both also get a YAML sidecar (hparams + metrics only) for human eyeballing.
 """
 
 from __future__ import annotations
@@ -50,26 +69,18 @@ def _write_yaml_sidecar(run_dir: Path, stem: str, hparams: dict, metrics: dict) 
         )
 
 
-def save_checkpoint(
-    run_dir: Path,
-    epoch: int,
-    model: torch.nn.Module,
-    hparams: dict,
-    metrics: dict,
-    stem: str | None = None,
-) -> None:
-    """Save bare model weights and a YAML sidecar with hparams + metrics.
-
-    Legacy format for models outside the world-model pipeline (e.g. the
-    state-based experiment).  The world-model pipeline uses save_world_model.
-
-    Args:
-        stem: filename stem (no extension). Defaults to ``checkpoint_{epoch}``.
-    """
-    if stem is None:
-        stem = f"checkpoint_{epoch}"
-    torch.save(model.state_dict(), run_dir / f"{stem}.pt")
-    _write_yaml_sidecar(run_dir, stem, hparams, metrics)
+def _load_checked(path, expected_kind: str, device: torch.device | None) -> dict:
+    path = Path(path)
+    ckpt = torch.load(path, map_location=device or "cpu", weights_only=True)
+    if not isinstance(ckpt, dict) or "format_version" not in ckpt:
+        raise ValueError(
+            f"{path} is not a unified checkpoint. "
+            "Re-train with the current pipeline (old-format run dirs are obsolete)."
+        )
+    kind = ckpt.get("kind", "world_model")  # pre-"kind" checkpoints are all world models
+    if kind != expected_kind:
+        raise ValueError(f"{path} is a {kind!r} checkpoint, not {expected_kind!r}.")
+    return ckpt
 
 
 def save_world_model(
@@ -83,6 +94,7 @@ def save_world_model(
     """Save a WorldModel (autoencoder + optional dynamics) as one .pt file."""
     payload = {
         "format_version": FORMAT_VERSION,
+        "kind": "world_model",
         "config": {
             "autoencoder": model.autoencoder.config,
             "dynamics": model.dynamics.config if model.dynamics is not None else None,
@@ -102,14 +114,7 @@ def load_world_model(path, device: torch.device | None = None):
     """Load a unified checkpoint into a WorldModel (dynamics may be None)."""
     from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldModel
 
-    path = Path(path)
-    ckpt = torch.load(path, map_location=device or "cpu", weights_only=True)
-    if not isinstance(ckpt, dict) or "format_version" not in ckpt:
-        raise ValueError(
-            f"{path} is not a unified world-model checkpoint. "
-            "Re-train with the current pipeline (old-format run dirs are obsolete)."
-        )
-
+    ckpt = _load_checked(path, "world_model", device)
     config = ckpt["config"]
     autoencoder = TemporalAutoencoder(**config["autoencoder"])
     autoencoder.load_state_dict(ckpt["autoencoder"])
@@ -123,4 +128,44 @@ def load_world_model(path, device: torch.device | None = None):
     if device is not None:
         model = model.to(device)
     model.eval()
+    return model
+
+
+def save_state_model(
+    run_dir: Path,
+    stem: str,
+    model,
+    hparams: dict,
+    metrics: dict,
+    epoch: int,
+    data_config: dict | None = None,
+) -> None:
+    """Save a StatePHGN (ground-truth phase-space dynamics) as one .pt file."""
+    payload = {
+        "format_version": FORMAT_VERSION,
+        "kind": "state_model",
+        "config": {
+            "model": model.config,
+            "data": data_config or {},
+        },
+        "model": model.state_dict(),
+        "hparams": hparams,
+        "metrics": metrics,
+        "epoch": epoch,
+    }
+    torch.save(payload, Path(run_dir) / f"{stem}.pt")
+    _write_yaml_sidecar(Path(run_dir), stem, hparams, metrics)
+
+
+def load_state_model(path, device: torch.device | None = None):
+    """Load a unified checkpoint into a StatePHGN."""
+    from hamilton_rl.models import StatePHGN
+
+    ckpt = _load_checked(path, "state_model", device)
+    model = StatePHGN(**ckpt["config"]["model"])
+    model.load_state_dict(ckpt["model"])
+    if device is not None:
+        model = model.to(device)
+    model.eval()
+    model.data_config = ckpt["config"].get("data") or {}
     return model
