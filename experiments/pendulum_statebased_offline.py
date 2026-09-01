@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hamilton_rl.checkpoint import make_run_dir, save_state_model
 from hamilton_rl.models import StatePHGN
 from data.pendulum import (
+    _DRAG_COEFF,
     _G,
     collect_state_data,
     collect_state_random_trajectories,
@@ -118,6 +119,225 @@ def _true_hamiltonian(states: torch.Tensor) -> np.ndarray:
     theta = states[:, 0].numpy()
     theta_dot = states[:, 1].numpy()
     return 0.5 * theta_dot**2 + 1.5 * _G * (1.0 + np.cos(theta))
+
+
+def _plot_state_phase_space_coverage(
+    episodes: list,
+    ax: plt.Axes | None = None,
+) -> plt.Figure:
+    """Scatter every visited (θ, θ̇) state in ``episodes`` to eyeball state-space coverage.
+
+    Mirrors ``_plot_phase_space_coverage`` in pendulum_offline.py, but reads
+    states directly as (θ, θ̇) rather than recovering θ from (cosθ, sinθ).
+    """
+    theta_all = torch.cat([states[:, 0] for states, _ in episodes]).numpy()
+    theta_dot_all = torch.cat([states[:, 1] for states, _ in episodes]).numpy()
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 5))
+    else:
+        fig = ax.figure
+
+    ax.scatter(theta_all, theta_dot_all, s=2, alpha=0.25, linewidths=0, color="tab:blue")
+    ax.set_xlabel("θ (rad)")
+    ax.set_ylabel("θ̇ (rad/s)")
+    ax.set_title(f"Training data phase-space coverage (N={len(theta_all):,})")
+    fig.tight_layout()
+
+    return fig
+
+
+def _state_vel_range(episodes: list, margin: float = 1.1) -> tuple[float, float]:
+    """Symmetric θ̇ plotting range derived from collected episode data."""
+    max_vel = max(states[:, 1].abs().max().item() for states, _ in episodes) * margin
+    return -max_vel, max_vel
+
+
+@torch.no_grad()
+def _plot_state_energy_landscape(
+    model: StatePHGN,
+    episodes: list,
+    min_vel: float,
+    max_vel: float,
+    landscape_resolution: int = 200,
+    device: torch.device | None = None,
+) -> plt.Figure:
+    """Compare learned H(q, p) against true pendulum energy over phase space.
+
+    Unlike the pixel pipeline's ``_plot_learned_energy_landscape``, no
+    grid-episode collection, encoder pass, or griddata interpolation is
+    needed here: (θ, θ̇) *is* the phase space, so H can be evaluated
+    directly at every point of a dense grid.
+
+    Three panels: ground-truth H from its closed form, learned H evaluated
+    on that same grid (own color scale — H is only fit through its
+    gradient, so it's identified up to an unknown affine offset/scale), and
+    the learned panel again with the training data's (θ, θ̇) coverage
+    overlaid, since agreement only means anything where the model actually
+    saw data.
+    """
+    model.eval()
+    if device is None:
+        device = next(model.parameters()).device
+
+    theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
+    theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
+    grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
+    H_true_dense = (0.5 * grid_theta_dot**2 + 1.5 * _G * (1.0 + torch.cos(grid_theta))).numpy()
+
+    q_flat = grid_theta.reshape(-1, 1).to(device)
+    p_flat = grid_theta_dot.reshape(-1, 1).to(device)
+    H_learned_dense = model.H(q_flat, p_flat).reshape(grid_theta.shape).cpu().numpy()
+
+    theta_data = torch.cat([states[:, 0] for states, _ in episodes]).numpy()
+    theta_dot_data = torch.cat([states[:, 1] for states, _ in episodes]).numpy()
+
+    extent = [-np.pi, np.pi, min_vel, max_vel]
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6), sharex=True, sharey=True)
+
+    im0 = axes[0].imshow(H_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis")
+    axes[0].set_title("Ground truth")
+    fig.colorbar(im0, ax=axes[0], label="H_true", pad=0.02)
+
+    im1 = axes[1].imshow(H_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis")
+    axes[1].set_title("Learned H")
+    fig.colorbar(im1, ax=axes[1], label="H_learned", pad=0.02)
+
+    im2 = axes[2].imshow(H_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis")
+    axes[2].scatter(theta_data, theta_dot_data, s=1, alpha=0.15, color="white")
+    axes[2].set_title("Learned H + training data coverage")
+    fig.colorbar(im2, ax=axes[2], label="H_learned", pad=0.02)
+
+    for ax in axes:
+        ax.set_xlabel("θ (rad)")
+    axes[0].set_ylabel("θ̇ (rad/s)")
+
+    r = np.corrcoef(H_true_dense.ravel(), H_learned_dense.ravel())[0, 1]
+    fig.suptitle(f"True energy vs. learned H, Pearson r={r:.3f}")
+    fig.tight_layout()
+
+    return fig
+
+
+def _plot_state_gradient_magnitude_landscape(
+    model: StatePHGN,
+    min_vel: float,
+    max_vel: float,
+    landscape_resolution: int = 200,
+    device: torch.device | None = None,
+) -> plt.Figure:
+    """Compare ‖∇H_true‖ against ‖∇H_learned‖ over phase space.
+
+    See ``_plot_state_energy_landscape`` for why no grid-episode collection
+    or interpolation is needed here, unlike the pixel version's
+    ``_plot_gradient_magnitude_landscape``. ∇H is what the dynamics actually
+    consume, so a flat/small learned gradient where the true one is large
+    indicates real underfitting rather than just an unidentified offset on H.
+    """
+    model.eval()
+    if device is None:
+        device = next(model.parameters()).device
+
+    theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
+    theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
+    grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
+
+    with torch.enable_grad():
+        q_flat = grid_theta.reshape(-1, 1).to(device).requires_grad_(True)
+        p_flat = grid_theta_dot.reshape(-1, 1).to(device).requires_grad_(True)
+        H_val = model.H(q_flat, p_flat).sum()
+        grad_q, grad_p = torch.autograd.grad(H_val, [q_flat, p_flat])
+    grad_mag_learned = (
+        torch.sqrt(grad_q**2 + grad_p**2).reshape(grid_theta.shape).detach().cpu().numpy()
+    )
+
+    grad_mag_true = torch.sqrt(
+        (1.5 * _G * torch.sin(grid_theta)) ** 2 + grid_theta_dot**2
+    ).numpy()
+
+    extent = [-np.pi, np.pi, min_vel, max_vel]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+
+    im0 = axes[0].imshow(grad_mag_true, origin="lower", aspect="auto", extent=extent, cmap="viridis")
+    axes[0].set_title("Ground truth")
+    fig.colorbar(im0, ax=axes[0], label="‖∇H_true‖", pad=0.02)
+
+    im1 = axes[1].imshow(grad_mag_learned, origin="lower", aspect="auto", extent=extent, cmap="viridis")
+    axes[1].set_title("Learned ‖∇H‖")
+    fig.colorbar(im1, ax=axes[1], label="‖∇H_learned‖", pad=0.02)
+
+    for ax in axes:
+        ax.set_xlabel("θ (rad)")
+    axes[0].set_ylabel("θ̇ (rad/s)")
+
+    r = np.corrcoef(grad_mag_true.ravel(), grad_mag_learned.ravel())[0, 1]
+    fig.suptitle(f"‖∇H_true‖ vs. ‖∇H_learned‖, Pearson r={r:.3f}")
+    fig.tight_layout()
+
+    return fig
+
+
+def _plot_state_dissipation_landscape(
+    model: StatePHGN,
+    damping: float,
+    drag: float,
+    min_vel: float,
+    max_vel: float,
+    landscape_resolution: int = 200,
+    device: torch.device | None = None,
+) -> plt.Figure:
+    """Compare the learned energy-dissipation rate against the true one over phase space.
+
+    See ``_plot_dissipation_landscape`` (pixel version) for the underlying
+    formulas — −Ḣ = ∇ₚHᵀ R_pp(z) ∇ₚH for the learned rate, vs. the env's true
+    damping·θ̇² + drag·|θ̇|³. No grid-episode collection is needed: R_pp(z)
+    and ∇H are evaluated directly on the dense (θ, θ̇) grid.
+    """
+    model.eval()
+    if device is None:
+        device = next(model.parameters()).device
+
+    theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
+    theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
+    grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
+
+    with torch.enable_grad():
+        q_flat = grid_theta.reshape(-1, 1).to(device).requires_grad_(True)
+        p_flat = grid_theta_dot.reshape(-1, 1).to(device).requires_grad_(True)
+        H_val = model.H(q_flat, p_flat).sum()
+        grad_p = torch.autograd.grad(H_val, p_flat)[0]
+    with torch.no_grad():
+        z = model._r_input(q_flat.detach(), p_flat.detach())
+        R_pp = model.get_R_pp(z)
+        Rg = model._apply_R_pp(R_pp, grad_p)
+        rate_learned = (grad_p * Rg).sum(dim=-1).reshape(grid_theta.shape).cpu().numpy()
+
+    rate_true = (damping * grid_theta_dot**2 + drag * grid_theta_dot.abs() ** 3).numpy()
+
+    extent = [-np.pi, np.pi, min_vel, max_vel]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    for ax, rate, label in (
+        (axes[0], rate_true, "true rate: damping·θ̇² + drag·|θ̇|³"),
+        (axes[1], rate_learned, "learned rate: ∇ₚHᵀ R_pp(z) ∇ₚH"),
+    ):
+        im = ax.imshow(rate, origin="lower", aspect="auto", extent=extent, cmap="magma")
+        fig.colorbar(im, ax=ax, label="−Ḣ", pad=0.02)
+        ax.set_xlabel("θ (rad)")
+        ax.set_ylabel("θ̇ (rad/s)")
+        ax.set_title(label)
+
+    eps = 1e-8
+    log_true = np.log10(rate_true + eps)
+    log_learned = np.log10(np.maximum(rate_learned, 0.0) + eps)
+    r = np.corrcoef(log_true.ravel(), log_learned.ravel())[0, 1] if np.ptp(rate_true) > 0 else float("nan")
+    axes[2].scatter(log_true.ravel(), log_learned.ravel(), s=3, alpha=0.2)
+    axes[2].set_xlabel("log₁₀ true rate")
+    axes[2].set_ylabel("log₁₀ learned rate")
+    axes[2].set_title(f"log-rate agreement, Pearson r={r:.3f}")
+
+    fig.suptitle("Energy-dissipation rate: true vs. learned R")
+    fig.tight_layout()
+    return fig
 
 
 @torch.no_grad()
@@ -559,6 +779,14 @@ def main(**kwargs):
         damping=kwargs["damping"],
     )
 
+    coverage_fig = _plot_state_phase_space_coverage(train_episodes)
+    writer.add_figure("data/phase_space_coverage", coverage_fig, 0)
+    plt.close(coverage_fig)
+
+    min_vel = max_vel = None
+    if kwargs["val_every"] > 0:
+        min_vel, max_vel = _state_vel_range(train_episodes)
+
     val_energy, val_random, val_spin = [], [], []
     if n_val > 0:
         print(
@@ -670,6 +898,27 @@ def main(**kwargs):
             )
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
+            energy_fig = _plot_state_energy_landscape(
+                model, train_episodes, min_vel=min_vel, max_vel=max_vel, device=device,
+            )
+            writer.add_figure("val/energy_landscape", energy_fig, epoch)
+            plt.close(energy_fig)
+            grad_mag_fig = _plot_state_gradient_magnitude_landscape(
+                model, min_vel=min_vel, max_vel=max_vel, device=device,
+            )
+            writer.add_figure("val/gradient_magnitude_landscape", grad_mag_fig, epoch)
+            plt.close(grad_mag_fig)
+            if model._has_dissipation:
+                dissipation_fig = _plot_state_dissipation_landscape(
+                    model,
+                    damping=kwargs["damping"],
+                    drag=_DRAG_COEFF,
+                    min_vel=min_vel,
+                    max_vel=max_vel,
+                    device=device,
+                )
+                writer.add_figure("val/dissipation_landscape", dissipation_fig, epoch)
+                plt.close(dissipation_fig)
             for val_trajs, label in (
                 (val_energy, "energy_pump"),
                 (val_random, "random"),
