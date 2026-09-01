@@ -189,7 +189,13 @@ def _plot_state_energy_landscape(
     p_flat = grid_theta_dot.reshape(-1, 1).to(device)
     H_learned_dense = model.H(q_flat, p_flat).reshape(grid_theta.shape).cpu().numpy()
 
+    # θ is periodic but not wrapped in the raw episode data (it accumulates
+    # over multi-rotation rollouts), so wrap it into [-π, π] before plotting
+    # — otherwise the scatter's autoscale, shared across all three axes via
+    # sharex/sharey, stretches the whole figure far past the actual heatmap
+    # extent and squeezes it into a narrow strip.
     theta_data = torch.cat([states[:, 0] for states, _ in episodes]).numpy()
+    theta_data = (theta_data + np.pi) % (2 * np.pi) - np.pi
     theta_dot_data = torch.cat([states[:, 1] for states, _ in episodes]).numpy()
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
@@ -210,6 +216,8 @@ def _plot_state_energy_landscape(
 
     for ax in axes:
         ax.set_xlabel("θ (rad)")
+        ax.set_xlim(-np.pi, np.pi)
+        ax.set_ylim(min_vel, max_vel)
     axes[0].set_ylabel("θ̇ (rad/s)")
 
     r = np.corrcoef(H_true_dense.ravel(), H_learned_dense.ravel())[0, 1]
