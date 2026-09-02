@@ -47,6 +47,14 @@ from data.pendulum import (
 )
 
 
+# theta_dot range used by the phase-space landscape plots. The env's
+# quadratic drag makes |theta_dot| > ~7 rare (see data.pendulum._DRAG_COEFF),
+# so a wider data-driven range mostly stretches the heatmap/color scale to
+# accommodate a handful of outlier samples. Matches pendulum_offline.py's
+# _LANDSCAPE_VEL_CLIP.
+_LANDSCAPE_VEL_CLIP = 7.0
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -145,12 +153,6 @@ def _plot_state_phase_space_coverage(
     fig.tight_layout()
 
     return fig
-
-
-def _state_vel_range(episodes: list, margin: float = 1.1) -> tuple[float, float]:
-    """Symmetric θ̇ plotting range derived from collected episode data."""
-    max_vel = max(states[:, 1].abs().max().item() for states, _ in episodes) * margin
-    return -max_vel, max_vel
 
 
 @torch.no_grad()
@@ -808,9 +810,7 @@ def main(**kwargs):
     writer.add_figure("data/phase_space_coverage", coverage_fig, 0)
     plt.close(coverage_fig)
 
-    min_vel = max_vel = None
-    if kwargs["val_every"] > 0:
-        min_vel, max_vel = _state_vel_range(train_episodes)
+    min_vel, max_vel = -_LANDSCAPE_VEL_CLIP, _LANDSCAPE_VEL_CLIP
 
     val_energy, val_random, val_spin = [], [], []
     if n_val > 0:

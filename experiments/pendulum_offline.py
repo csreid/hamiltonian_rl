@@ -105,6 +105,14 @@ from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldM
 # Shared utilities
 # ---------------------------------------------------------------------------
 
+# theta_dot range used by the phase-space landscape plots below. The env's
+# quadratic drag makes |theta_dot| > ~7 rare (see data.pendulum._DRAG_COEFF),
+# so a wider data-driven range mostly just adds a handful of outlier samples
+# that scipy.griddata then extrapolates from at the plot's edges — stretching
+# the color scale and interpolation into visually noisy, barely-sampled
+# territory. Trimming to the well-covered band keeps the heatmap legible.
+_LANDSCAPE_VEL_CLIP = 7.0
+
 
 def _safe_hist(ax, data, bins=50, **kwargs):
     """ax.hist wrapper that tolerates degenerate/non-finite data.
@@ -295,6 +303,7 @@ def _collect_grid_qp_samples(
     model: WorldModel,
     episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     device: torch.device | None = None,
+    vel_clip: float | None = _LANDSCAPE_VEL_CLIP,
 ) -> dict:
     """Encode pre-collected grid episodes (see `_collect_energy_grid_episodes`)
     through the full pipeline (encoder -> phi) to get learned (q, p).
@@ -302,6 +311,11 @@ def _collect_grid_qp_samples(
     The ground-truth energy is evaluated at the state actually reached at the
     end of each episode's zero-action rollout, not the raw seed, since that's
     the state the encoder's output corresponds to.
+
+    vel_clip drops samples with |theta_dot| > vel_clip (None keeps everything)
+    — these are rare under the env's drag and otherwise dominate downstream
+    interpolation/extrapolation and Pearson-r at the plots' sparsely-sampled
+    edges.
 
     Returns a dict with q, p (each (N, q_dim), learned latents at the end of
     context), H_true (N,), theta (N,), theta_dot (N,) — the latter two being
@@ -322,9 +336,14 @@ def _collect_grid_qp_samples(
     theta_dot = final_state[:, 2]
     H_true_vals = H_true(theta, theta_dot)
 
-    return {
-        "q": q.cpu(), "p": p.cpu(), "H_true": H_true_vals, "theta": theta, "theta_dot": theta_dot,
-    }
+    q, p = q.cpu(), p.cpu()
+    if vel_clip is not None:
+        keep = theta_dot.abs() <= vel_clip
+        q, p, theta, theta_dot, H_true_vals = (
+            q[keep], p[keep], theta[keep], theta_dot[keep], H_true_vals[keep],
+        )
+
+    return {"q": q, "p": p, "H_true": H_true_vals, "theta": theta, "theta_dot": theta_dot}
 
 
 @torch.no_grad()
@@ -332,8 +351,8 @@ def _plot_learned_energy_landscape(
     model: WorldModel,
     episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     landscape_resolution: int = 200,
-    min_vel: float | None = None,
-    max_vel: float | None = None,
+    min_vel: float = -_LANDSCAPE_VEL_CLIP,
+    max_vel: float = _LANDSCAPE_VEL_CLIP,
     device: torch.device | None = None,
 ) -> plt.Figure:
     """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
@@ -358,29 +377,23 @@ def _plot_learned_energy_landscape(
     energy is high/low — by matching colors, without implying agreement in
     magnitude.
 
-    `min_vel`/`max_vel` default to the *sampled* episodes' own
-    theta_dot range (with a small margin) rather than a fixed constant — the
-    env's old hard velocity clip is gone (replaced by a soft quadratic drag,
-    see `data.pendulum._DRAG_COEFF`), so there's no longer a physical bound
-    to assume; deriving the range from the data avoids silently cropping real
-    high-speed samples out of the heatmap.
+    `min_vel`/`max_vel` default to `_LANDSCAPE_VEL_CLIP` — the env's quadratic
+    drag makes |theta_dot| beyond that rare, so a handful of outlier samples
+    out there would otherwise dominate the interpolation/extrapolation at the
+    plot's edges instead of showing the well-covered bulk of phase space.
     """
     model.eval()
     if device is None:
         device = next(model.autoencoder.parameters()).device
 
-    samples = _collect_grid_qp_samples(model, episodes, device=device)
+    vel_clip = max(abs(min_vel), abs(max_vel))
+    samples = _collect_grid_qp_samples(model, episodes, device=device, vel_clip=vel_clip)
     H_learned = model.dynamics.hamiltonian(
         samples["q"].to(device), samples["p"].to(device)
     ).cpu().numpy()
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
     H_true_vals = samples["H_true"].cpu().numpy()
-
-    if min_vel is None or max_vel is None:
-        vel_margin = 1.1
-        max_vel = float(np.abs(theta_dot).max()) * vel_margin
-        min_vel = -max_vel
 
     theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
     theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
@@ -434,8 +447,8 @@ def _plot_gradient_magnitude_landscape(
     model: WorldModel,
     episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     landscape_resolution: int = 200,
-    min_vel: float | None = None,
-    max_vel: float | None = None,
+    min_vel: float = -_LANDSCAPE_VEL_CLIP,
+    max_vel: float = _LANDSCAPE_VEL_CLIP,
     device: torch.device | None = None,
 ) -> plt.Figure:
     """Compare ‖∇H_true‖ against ‖∇H_learned‖ on the same phase-space grid.
@@ -464,7 +477,8 @@ def _plot_gradient_magnitude_landscape(
     dyn = model.dynamics
     q_dim = dyn.latent_dim // 2
 
-    samples = _collect_grid_qp_samples(model, episodes, device=device)
+    vel_clip = max(abs(min_vel), abs(max_vel))
+    samples = _collect_grid_qp_samples(model, episodes, device=device, vel_clip=vel_clip)
     q = samples["q"].to(device)
     p = samples["p"].to(device)
     with torch.enable_grad():
@@ -477,11 +491,6 @@ def _plot_gradient_magnitude_landscape(
     theta_dot = samples["theta_dot"].cpu().numpy()
     g_theta_true, g_theta_dot_true = grad_H_true(torch.as_tensor(theta), torch.as_tensor(theta_dot))
     grad_mag_true = torch.sqrt(g_theta_true**2 + g_theta_dot_true**2).numpy()
-
-    if min_vel is None or max_vel is None:
-        vel_margin = 1.1
-        max_vel = float(np.abs(theta_dot).max()) * vel_margin
-        min_vel = -max_vel
 
     theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
     theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
