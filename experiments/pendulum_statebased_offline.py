@@ -171,12 +171,14 @@ def _plot_state_energy_landscape(
     needed here: (θ, θ̇) *is* the phase space, so H can be evaluated
     directly at every point of a dense grid.
 
-    Three panels: ground-truth H from its closed form, learned H evaluated
-    on that same grid (own color scale — H is only fit through its
-    gradient, so it's identified up to an unknown affine offset/scale), and
-    the learned panel again with the training data's (θ, θ̇) coverage
-    overlaid, since agreement only means anything where the model actually
-    saw data.
+    Four panels, 2x2: ground-truth H from its closed form, learned H
+    evaluated on that same grid (own color scale — H is only fit through its
+    gradient, so it's identified up to an unknown affine offset/scale), the
+    learned panel again with the training data's (θ, θ̇) coverage overlaid
+    (since agreement only means anything where the model actually saw
+    data), and a scatter of true vs. learned H with a line of best fit —
+    the actual regression the reported R² summarizes, since a single
+    correlation coefficient over a dense grid can look deceptively good.
     """
     model.eval()
     if device is None:
@@ -201,7 +203,8 @@ def _plot_state_energy_landscape(
     theta_dot_data = torch.cat([states[:, 1] for states, _ in episodes]).numpy()
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
-    fig, axes = plt.subplots(1, 3, figsize=(21, 6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    axes = axes.ravel()
 
     im0 = axes[0].imshow(H_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis")
     axes[0].set_title("Ground truth")
@@ -216,13 +219,36 @@ def _plot_state_energy_landscape(
     axes[2].set_title("Learned H + training data coverage")
     fig.colorbar(im2, ax=axes[2], label="H_learned", pad=0.02)
 
-    for ax in axes:
+    for ax in axes[:3]:
         ax.set_xlabel("θ (rad)")
         ax.set_xlim(-np.pi, np.pi)
         ax.set_ylim(min_vel, max_vel)
     axes[0].set_ylabel("θ̇ (rad/s)")
+    axes[2].set_ylabel("θ̇ (rad/s)")
 
-    r = np.corrcoef(H_true_dense.ravel(), H_learned_dense.ravel())[0, 1]
+    H_true_flat = H_true_dense.ravel()
+    H_learned_flat = H_learned_dense.ravel()
+    r = np.corrcoef(H_true_flat, H_learned_flat)[0, 1]
+
+    # Dense grid has landscape_resolution**2 points; subsample for a legible
+    # scatter (the fit itself uses every point, so R² isn't affected).
+    rng = np.random.default_rng(0)
+    n_scatter = min(3000, H_true_flat.size)
+    scatter_idx = rng.choice(H_true_flat.size, size=n_scatter, replace=False)
+
+    slope, intercept = np.polyfit(H_true_flat, H_learned_flat, 1)
+    fit_x = np.array([H_true_flat.min(), H_true_flat.max()])
+    ax3 = axes[3]
+    ax3.scatter(H_true_flat[scatter_idx], H_learned_flat[scatter_idx], s=4, alpha=0.2)
+    ax3.plot(
+        fit_x, slope * fit_x + intercept, color="crimson",
+        label=f"fit: y = {slope:.2f}x + {intercept:.2f}\nR² = {r**2:.3f}",
+    )
+    ax3.set_xlabel("H_true")
+    ax3.set_ylabel("H_learned")
+    ax3.set_title("True vs. learned energy")
+    ax3.legend(loc="best", fontsize=9)
+
     fig.suptitle(f"True energy vs. learned H, Pearson r={r:.3f}")
     fig.tight_layout()
 

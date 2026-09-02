@@ -357,7 +357,7 @@ def _plot_learned_energy_landscape(
 ) -> plt.Figure:
     """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
 
-    Three panels, side by side:
+    Four panels, 2x2:
       1. Ground truth: the true energy, swept densely from its closed form
          (`landscape_resolution`, independent of how many grid points were
          actually sampled/encoded through the model).
@@ -368,6 +368,9 @@ def _plot_learned_energy_landscape(
          overlaid, to show what data the interpolation was built from and
          where it's extrapolating past the convex hull of the samples (NaN,
          left transparent).
+      4. A scatter of true vs. learned H at the measured points, with a line
+         of best fit — the actual regression the reported R² summarizes,
+         since the Pearson r alone doesn't show scatter/outliers.
 
     The learned H uses its own independent color scale from the true energy
     — H is only ever constrained through its gradient during training, so
@@ -408,7 +411,8 @@ def _plot_learned_energy_landscape(
     )
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
-    fig, axes = plt.subplots(1, 3, figsize=(21, 6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    axes = axes.ravel()
 
     im0 = axes[0].imshow(
         H_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
@@ -432,11 +436,28 @@ def _plot_learned_energy_landscape(
     axes[2].set_title("Learned H (interpolated + measured points)")
     fig.colorbar(im2, ax=axes[2], label="H_learned", pad=0.02)
 
-    for ax in axes:
+    for ax in axes[:3]:
         ax.set_xlabel("θ (rad)")
+        ax.set_xlim(-np.pi, np.pi)
+        ax.set_ylim(min_vel, max_vel)
     axes[0].set_ylabel("θ̇ (rad/s)")
+    axes[2].set_ylabel("θ̇ (rad/s)")
 
     r = np.corrcoef(H_true_vals, H_learned)[0, 1]
+
+    slope, intercept = np.polyfit(H_true_vals, H_learned, 1)
+    fit_x = np.array([H_true_vals.min(), H_true_vals.max()])
+    ax3 = axes[3]
+    ax3.scatter(H_true_vals, H_learned, s=10, alpha=0.3)
+    ax3.plot(
+        fit_x, slope * fit_x + intercept, color="crimson",
+        label=f"fit: y = {slope:.2f}x + {intercept:.2f}\nR² = {r**2:.3f}",
+    )
+    ax3.set_xlabel("H_true")
+    ax3.set_ylabel("H_learned")
+    ax3.set_title("True vs. learned energy")
+    ax3.legend(loc="best", fontsize=9)
+
     fig.suptitle(f"True energy vs. learned H, Pearson r={r:.3f}")
     fig.tight_layout()
 
