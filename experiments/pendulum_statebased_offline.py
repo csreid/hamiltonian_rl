@@ -292,7 +292,7 @@ def _plot_state_gradient_magnitude_landscape(
     ).numpy()
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6))
 
     im0 = axes[0].imshow(grad_mag_true, origin="lower", aspect="auto", extent=extent, cmap="viridis")
     axes[0].set_title("Ground truth")
@@ -302,11 +302,37 @@ def _plot_state_gradient_magnitude_landscape(
     axes[1].set_title("Learned ‖∇H‖")
     fig.colorbar(im1, ax=axes[1], label="‖∇H_learned‖", pad=0.02)
 
-    for ax in axes:
+    for ax in axes[:2]:
         ax.set_xlabel("θ (rad)")
+        ax.set_xlim(-np.pi, np.pi)
+        ax.set_ylim(min_vel, max_vel)
     axes[0].set_ylabel("θ̇ (rad/s)")
 
-    r = np.corrcoef(grad_mag_true.ravel(), grad_mag_learned.ravel())[0, 1]
+    grad_mag_true_flat = grad_mag_true.ravel()
+    grad_mag_learned_flat = grad_mag_learned.ravel()
+    r = np.corrcoef(grad_mag_true_flat, grad_mag_learned_flat)[0, 1]
+
+    # Dense grid has landscape_resolution**2 points; subsample for a legible
+    # scatter (the fit itself uses every point, so R² isn't affected).
+    rng = np.random.default_rng(0)
+    n_scatter = min(3000, grad_mag_true_flat.size)
+    scatter_idx = rng.choice(grad_mag_true_flat.size, size=n_scatter, replace=False)
+
+    slope, intercept = np.polyfit(grad_mag_true_flat, grad_mag_learned_flat, 1)
+    fit_x = np.array([grad_mag_true_flat.min(), grad_mag_true_flat.max()])
+    ax2 = axes[2]
+    ax2.scatter(
+        grad_mag_true_flat[scatter_idx], grad_mag_learned_flat[scatter_idx], s=4, alpha=0.2,
+    )
+    ax2.plot(
+        fit_x, slope * fit_x + intercept, color="crimson",
+        label=f"fit: y = {slope:.2f}x + {intercept:.2f}\nR² = {r**2:.3f}",
+    )
+    ax2.set_xlabel("‖∇H_true‖")
+    ax2.set_ylabel("‖∇H_learned‖")
+    ax2.set_title("True vs. learned gradient magnitude")
+    ax2.legend(loc="best", fontsize=9)
+
     fig.suptitle(f"‖∇H_true‖ vs. ‖∇H_learned‖, Pearson r={r:.3f}")
     fig.tight_layout()
 

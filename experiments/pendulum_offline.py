@@ -527,7 +527,8 @@ def _plot_gradient_magnitude_landscape(
     )
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
-    fig, axes = plt.subplots(1, 3, figsize=(21, 6), sharex=True, sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    axes = axes.ravel()
 
     im0 = axes[0].imshow(
         grad_mag_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
@@ -551,11 +552,28 @@ def _plot_gradient_magnitude_landscape(
     axes[2].set_title("Learned ‖∇H‖ (interpolated + measured points)")
     fig.colorbar(im2, ax=axes[2], label="‖∇H_learned‖", pad=0.02)
 
-    for ax in axes:
+    for ax in axes[:3]:
         ax.set_xlabel("θ (rad)")
+        ax.set_xlim(-np.pi, np.pi)
+        ax.set_ylim(min_vel, max_vel)
     axes[0].set_ylabel("θ̇ (rad/s)")
+    axes[2].set_ylabel("θ̇ (rad/s)")
 
     r = np.corrcoef(grad_mag_true, grad_mag_learned)[0, 1]
+
+    slope, intercept = np.polyfit(grad_mag_true, grad_mag_learned, 1)
+    fit_x = np.array([grad_mag_true.min(), grad_mag_true.max()])
+    ax3 = axes[3]
+    ax3.scatter(grad_mag_true, grad_mag_learned, s=10, alpha=0.3)
+    ax3.plot(
+        fit_x, slope * fit_x + intercept, color="crimson",
+        label=f"fit: y = {slope:.2f}x + {intercept:.2f}\nR² = {r**2:.3f}",
+    )
+    ax3.set_xlabel("‖∇H_true‖")
+    ax3.set_ylabel("‖∇H_learned‖")
+    ax3.set_title("True vs. learned gradient magnitude")
+    ax3.legend(loc="best", fontsize=9)
+
     fig.suptitle(f"‖∇H_true‖ vs. ‖∇H_learned‖, Pearson r={r:.3f}")
     fig.tight_layout()
 
