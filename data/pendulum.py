@@ -127,6 +127,32 @@ def analytic_pendulum_step(
     return q, p
 
 
+def H_true(q: torch.Tensor, p: torch.Tensor, g: float = _G) -> torch.Tensor:
+    """Canonical Hamiltonian H(q, p) = T(p) + V(q) matching ``analytic_pendulum_step``."""
+    return 0.5 * p**2 + 1.5 * g * (1.0 + torch.cos(q))
+
+
+def grad_H_true(
+    q: torch.Tensor, p: torch.Tensor, g: float = _G
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(∂H/∂q, ∂H/∂p) = (-1.5·g·sinθ, θ̇), matching ``_grad_V``."""
+    return _grad_V(q, g), p
+
+
+def dissipation_rate_true(p: torch.Tensor, damping: float, drag: float) -> torch.Tensor:
+    """Energy dissipation rate damping·p² + drag·|p|³ of the linear+quadratic drag."""
+    return damping * p**2 + drag * p.abs() ** 3
+
+
+def R_pp_true(p: torch.Tensor, damping: float, drag: float) -> torch.Tensor:
+    """Effective scalar R_pp(z) such that ṗ_diss = -R_pp·∂H/∂p = -R_pp·p
+    reproduces the linear damping + quadratic drag dissipative flow."""
+    return damping + drag * p.abs()
+
+
+B_TRUE = 3.0  # true control gain: ṗ += 3·u
+
+
 def analytic_pendulum_step_inverse(
     theta: torch.Tensor,
     theta_dot: torch.Tensor,

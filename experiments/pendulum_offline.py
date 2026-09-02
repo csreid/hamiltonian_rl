@@ -50,7 +50,8 @@ Phase 3 (phase3 subcommand):
         signals but with stop-grad targets, so gradients flow only through
         the prediction path;
       - much lower default LR than Phases 1-2, per-module param groups, and
-        --freeze-physics / --freeze-encoder switches for constrained runs.
+        --freeze-encoder / --freeze-hamiltonian / --freeze-r / --freeze-b
+        switches for constrained runs.
     h is used deterministically (h = mu, no reparameterization/KL), matching
     how the encoder is consumed in Phase 2 and at inference.
 
@@ -84,11 +85,14 @@ from tqdm import tqdm
 
 from data.pendulum import (
     PendulumMultiRolloutDataset,
+    H_true,
     collect_random_trajectories,
     collect_seeded_random_rollouts,
     collect_spin_trajectories,
     collect_val_trajectories,
     collect_zero_trajectories_targeted,
+    dissipation_rate_true,
+    grad_H_true,
     _DRAG_COEFF,
     _G,
     _MAX_SPEED,
@@ -316,11 +320,11 @@ def _collect_grid_qp_samples(
     final_state = states[:, -1]
     theta = torch.atan2(final_state[:, 1], final_state[:, 0])
     theta_dot = final_state[:, 2]
-    # Canonical convention matching the env's EOM (ṗ = 1.5·g·sin θ, see
-    # data/pendulum.py): T = θ̇²/2 pairs with V = 1.5·g·(1 + cos θ).
-    H_true = 0.5 * theta_dot**2 + 1.5 * _G * (1.0 + torch.cos(theta))
+    H_true_vals = H_true(theta, theta_dot)
 
-    return {"q": q.cpu(), "p": p.cpu(), "H_true": H_true, "theta": theta, "theta_dot": theta_dot}
+    return {
+        "q": q.cpu(), "p": p.cpu(), "H_true": H_true_vals, "theta": theta, "theta_dot": theta_dot,
+    }
 
 
 @torch.no_grad()
@@ -371,7 +375,7 @@ def _plot_learned_energy_landscape(
     ).cpu().numpy()
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
-    H_true = samples["H_true"].cpu().numpy()
+    H_true_vals = samples["H_true"].cpu().numpy()
 
     if min_vel is None or max_vel is None:
         vel_margin = 1.1
@@ -381,7 +385,7 @@ def _plot_learned_energy_landscape(
     theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
     theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
     grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
-    H_true_dense = (0.5 * grid_theta_dot**2 + 1.5 * _G * (1.0 + torch.cos(grid_theta))).numpy()
+    H_true_dense = H_true(grid_theta, grid_theta_dot).numpy()
 
     H_learned_dense = griddata(
         points=np.stack([theta, theta_dot], axis=-1),
@@ -419,7 +423,7 @@ def _plot_learned_energy_landscape(
         ax.set_xlabel("θ (rad)")
     axes[0].set_ylabel("θ̇ (rad/s)")
 
-    r = np.corrcoef(H_true, H_learned)[0, 1]
+    r = np.corrcoef(H_true_vals, H_learned)[0, 1]
     fig.suptitle(f"True energy vs. learned H, Pearson r={r:.3f}")
     fig.tight_layout()
 
@@ -471,7 +475,8 @@ def _plot_gradient_magnitude_landscape(
 
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
-    grad_mag_true = np.sqrt((1.5 * _G * np.sin(theta)) ** 2 + theta_dot**2)
+    g_theta_true, g_theta_dot_true = grad_H_true(torch.as_tensor(theta), torch.as_tensor(theta_dot))
+    grad_mag_true = torch.sqrt(g_theta_true**2 + g_theta_dot_true**2).numpy()
 
     if min_vel is None or max_vel is None:
         vel_margin = 1.1
@@ -481,9 +486,8 @@ def _plot_gradient_magnitude_landscape(
     theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
     theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
     grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
-    grad_mag_true_dense = torch.sqrt(
-        (1.5 * _G * torch.sin(grid_theta)) ** 2 + grid_theta_dot**2
-    ).numpy()
+    g_theta_dense, g_theta_dot_dense = grad_H_true(grid_theta, grid_theta_dot)
+    grad_mag_true_dense = torch.sqrt(g_theta_dense**2 + g_theta_dot_dense**2).numpy()
 
     grad_mag_learned_dense = griddata(
         points=np.stack([theta, theta_dot], axis=-1),
@@ -1618,7 +1622,7 @@ def _train_epoch_phase2(
             loss = loss + l1_weight * l1_loss
             total_hamiltonian_l1 = total_hamiltonian_l1 + l1_loss.detach()
 
-        if structural_reg_weight > 0 and dyn_model.learn_structure:
+        if structural_reg_weight > 0 and dyn_model.r_parameters():
             # J is a fixed buffer in HamiltonianFlowModel — only R is learned,
             # so penalizing ‖J‖² would just add a constant 2·q_dim to the loss.
             if dyn_model.state_dep_r:
@@ -1818,7 +1822,7 @@ def _plot_dissipation_landscape(
 
     theta = samples["theta"].numpy()
     theta_dot = samples["theta_dot"].numpy()
-    rate_true = damping * theta_dot**2 + drag * np.abs(theta_dot) ** 3
+    rate_true = dissipation_rate_true(samples["theta_dot"], damping, drag).numpy()
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
     for ax, rate, label in (
@@ -2567,13 +2571,26 @@ def phase1_cmd(**kwargs):
               help="Integration step size (should match the env frame interval)")
 @click.option("--separable/--no-separable", default=True, show_default=True,
               help="Use a separable Hamiltonian H = T(p) + V(q); required for --integrator leapfrog")
-@click.option("--learn-structure/--no-learn-structure", default=True, show_default=True,
-              help="Learn R/B matrices; --no-learn-structure fixes R from the data damping, B=1")
+@click.option("--h-source", type=click.Choice(["learned", "canonical"]), default="learned",
+              show_default=True,
+              help="'canonical' fixes the physical pair's H to the true pendulum's "
+                   "closed-form Hamiltonian; nuisance dims (if latent_dim > 2) stay learned")
+@click.option("--r-source", type=click.Choice(["learned", "fixed_damping", "canonical"]),
+              default="learned", show_default=True,
+              help="'fixed_damping' fixes the physical pair's R to damping*I; 'canonical' "
+                   "fixes it to the true damping+drag; nuisance dims (if any) stay learned")
+@click.option("--b-source", type=click.Choice(["learned", "fixed_ones", "canonical"]),
+              default="learned", show_default=True,
+              help="'canonical' fixes the physical pair's B to the true control gain (B=3); "
+                   "nuisance dims (if any) stay learned")
+@click.option("--drag", type=float, default=_DRAG_COEFF, show_default=True,
+              help="Quadratic drag coefficient used by --r-source=canonical")
 @click.option("--state-dep-r/--no-state-dep-r", default=False, show_default=True,
-              help="Parameterize the dissipation R as a function of the latent phase-space "
-                   "point z = (q, p) via a small MLP (R_pp(z) = L(z)L(z)ᵀ, PSD everywhere) "
-                   "instead of a constant matrix — needed for state-dependent dissipation "
-                   "like the env's quadratic drag. Requires --learn-structure.")
+              help="Parameterize a *learned* dissipation block as a function of the latent "
+                   "phase-space point z = (q, p) via a small MLP (R_pp(z) = L(z)L(z)ᵀ, PSD "
+                   "everywhere) instead of a constant matrix — needed for a learned R to "
+                   "express state-dependent dissipation like the env's quadratic drag. "
+                   "Canonical R (--r-source=canonical) is always state-dependent regardless.")
 @click.option("--integrator", type=click.Choice(["rk4", "leapfrog"]), default="leapfrog",
               show_default=True,
               help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
@@ -2583,7 +2600,8 @@ def phase1_cmd(**kwargs):
 @click.option("--batch-size", type=int, default=8, show_default=True)
 @click.option("--lr", type=float, default=1e-4, show_default=True)
 @click.option("--structural-lr", type=float, default=1e-2, show_default=True,
-              help="Learning rate for the R/B structure matrices (only with --learn-structure)")
+              help="Learning rate for the R/B structure matrices (only for whichever of "
+                   "R/B is actually learned)")
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 @click.option("--quadratic-t/--no-quadratic-t", default=True, show_default=True,
               help="Kinetic energy as a PSD quadratic form T(p) = ½ pᵀM⁻¹p with learned "
@@ -2594,7 +2612,8 @@ def phase1_cmd(**kwargs):
 @click.option("--l1-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on Hamiltonian network weights; encourages simpler dynamics")
 @click.option("--structural-reg-weight", type=float, default=0.0, show_default=True,
-              help="Frobenius norm penalty on the learned dissipation R (Phase 2, learn-structure only); prevents it from growing unbounded")
+              help="Frobenius norm penalty on the learned dissipation R (only meaningful "
+                   "when R is at least partly learned); prevents it from growing unbounded")
 @click.option("--teacher-force-weight", type=float, default=1.0, show_default=True,
               help="Weight on teacher-forced 1-step loss (set 0 to disable)")
 @click.option("--closed-loop-weight", type=float, default=1.0, show_default=True,
@@ -2763,9 +2782,12 @@ def phase2_cmd(**kwargs):
         latent_dim=latent_dim,
         control_dim=1,
         separable=kwargs["separable"],
-        learn_structure=kwargs["learn_structure"],
+        h_source=kwargs["h_source"],
+        r_source=kwargs["r_source"],
+        b_source=kwargs["b_source"],
         dt=kwargs["dt"],
         damping=data_cfg.get("damping", 0.0),
+        drag=kwargs["drag"],
         integrator=kwargs["integrator"],
         quadratic_t=kwargs["quadratic_t"],
         state_dep_r=kwargs["state_dep_r"],
@@ -2784,22 +2806,14 @@ def phase2_cmd(**kwargs):
 
     world_model.dynamics = dyn_model
 
-    if kwargs["learn_structure"]:
-        optimizer = torch.optim.Adam([
-            {
-                "params": (
-                    list(dyn_model.phi.parameters())
-                    + list(dyn_model.hamiltonian.parameters())
-                ),
-                "lr": kwargs["lr"],
-            },
-            {
-                "params": dyn_model.structural_parameters(),
-                "lr": kwargs["structural_lr"],
-            },
-        ])
-    else:
-        optimizer = torch.optim.Adam(dyn_model.parameters(), lr=kwargs["lr"])
+    opt_groups = [{
+        "params": list(dyn_model.phi.parameters()) + list(dyn_model.hamiltonian.parameters()),
+        "lr": kwargs["lr"],
+    }]
+    structural_params = dyn_model.structural_parameters()
+    if structural_params:
+        opt_groups.append({"params": structural_params, "lr": kwargs["structural_lr"]})
+    optimizer = torch.optim.Adam(opt_groups)
 
     # Store both phase2 CLI kwargs and the phase1 arch/data params that govern the run
     hparams = {
@@ -2881,12 +2895,7 @@ def phase2_cmd(**kwargs):
             writer.add_scalar("phase2/seq_len", seq_len, epoch)
             writer.add_scalar("phase2/ema_loss", ema_loss, epoch)
             writer.add_scalar("phase2/ema_cl", ema_cl, epoch)
-            if kwargs["learn_structure"]:
-                writer.add_scalar(
-                    "phase2/structure/B_norm",
-                    dyn_model.get_B().norm().item(),
-                    epoch,
-                )
+            writer.add_scalar("phase2/structure/B_norm", dyn_model.get_B().norm().item(), epoch)
             tqdm.write(
                 f"  epoch {epoch + 1:4d}"
                 f"  seq_len={seq_len:3d}"
@@ -3007,14 +3016,18 @@ def phase2_cmd(**kwargs):
 @click.option("--encoder-lr", type=float, default=None,
               help="LR for the encoder (default: same as --lr)")
 @click.option("--structural-lr", type=float, default=1e-4, show_default=True,
-              help="LR for the R/B structure matrices (learn-structure checkpoints only)")
+              help="LR for whichever of R/B is learned in the loaded Phase 2 checkpoint")
 @click.option("--freeze-encoder", is_flag=True, default=False, show_default=True,
               help="Keep the Phase-1 encoder frozen; finetunes decoder/flows/dynamics "
                    "only (useful when the fold/Markov probes say the representation "
                    "is fine and the win is decoder drift-tolerance)")
-@click.option("--freeze-physics", is_flag=True, default=False, show_default=True,
-              help="Freeze H and R/B; finetunes only encoder/f_psi/decoder/phi, provably "
-                   "preserving the learned energy landscape and dissipation")
+@click.option("--freeze-hamiltonian", is_flag=True, default=False, show_default=True,
+              help="Freeze H (no-op if the checkpoint already fixed it to canonical); "
+                   "finetunes everything else")
+@click.option("--freeze-r", is_flag=True, default=False, show_default=True,
+              help="Freeze R (no-op if the checkpoint already fixed it); finetunes everything else")
+@click.option("--freeze-b", is_flag=True, default=False, show_default=True,
+              help="Freeze B (no-op if the checkpoint already fixed it); finetunes everything else")
 @click.option("--grad-clip", type=float, default=1.0, show_default=True)
 # loss weights
 @click.option("--recon-weight", type=float, default=1.0, show_default=True,
@@ -3197,13 +3210,18 @@ def phase3_cmd(**kwargs):
 
     # Freezing + per-module param groups. requires_grad_(False) (not just
     # optimizer exclusion) so autograd skips the frozen subgraphs entirely.
+    # Freezing a component that's already fixed to canonical/constant (no
+    # learned params) is simply a no-op here.
     if kwargs["freeze_encoder"]:
         phase1_model.encoder.requires_grad_(False)
-    if kwargs["freeze_physics"]:
+    if kwargs["freeze_hamiltonian"]:
         dyn_model.hamiltonian.requires_grad_(False)
-        if dyn_model.learn_structure:
-            for prm in dyn_model.structural_parameters():
-                prm.requires_grad_(False)
+    if kwargs["freeze_r"]:
+        for prm in dyn_model.r_parameters():
+            prm.requires_grad_(False)
+    if kwargs["freeze_b"]:
+        for prm in dyn_model.b_parameters():
+            prm.requires_grad_(False)
 
     encoder_lr = kwargs["encoder_lr"] if kwargs["encoder_lr"] is not None else kwargs["lr"]
     # next_frame_decoder is deliberately absent: no Phase 3 loss touches it.
@@ -3218,13 +3236,16 @@ def phase3_cmd(**kwargs):
         ),
         "lr": kwargs["lr"],
     })
-    if not kwargs["freeze_physics"]:
-        groups.append({"params": list(dyn_model.hamiltonian.parameters()), "lr": kwargs["lr"]})
-        if dyn_model.learn_structure:
-            groups.append({
-                "params": dyn_model.structural_parameters(),
-                "lr": kwargs["structural_lr"],
-            })
+    if not kwargs["freeze_hamiltonian"]:
+        h_params = list(dyn_model.hamiltonian.parameters())
+        if h_params:
+            groups.append({"params": h_params, "lr": kwargs["lr"]})
+    structural_params = (
+        ([] if kwargs["freeze_r"] else dyn_model.r_parameters())
+        + ([] if kwargs["freeze_b"] else dyn_model.b_parameters())
+    )
+    if structural_params:
+        groups.append({"params": structural_params, "lr": kwargs["structural_lr"]})
     optimizer = torch.optim.Adam(groups)
     n_trainable = sum(p.numel() for g in groups for p in g["params"])
     print(f"Phase 3 trainable parameters: {n_trainable:,}")
@@ -3307,12 +3328,7 @@ def phase3_cmd(**kwargs):
             writer.add_scalar("phase3/seq_len", seq_len, epoch)
             writer.add_scalar("phase3/ema_loss", ema_loss, epoch)
             writer.add_scalar("phase3/ema_cl_pixel", ema_cl, epoch)
-            if dyn_model.learn_structure:
-                writer.add_scalar(
-                    "phase3/structure/B_norm",
-                    dyn_model.get_B().norm().item(),
-                    epoch,
-                )
+            writer.add_scalar("phase3/structure/B_norm", dyn_model.get_B().norm().item(), epoch)
             tqdm.write(
                 f"  epoch {epoch + 1:4d}"
                 f"  seq_len={seq_len:3d}"

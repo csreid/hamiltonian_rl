@@ -684,11 +684,28 @@ def _log_rollout_videos(
 @click.option("--dt", type=float, default=0.05, show_default=True)
 @click.option("--separable/--no-separable", default=True, show_default=True)
 @click.option(
-    "--learn-structure/--no-learn-structure",
-    default=True,
+    "--h-source",
+    type=click.Choice(["learned", "canonical"]),
+    default="learned",
     show_default=True,
-    help="Learn R/b (J is always canonical); --no-learn-structure fixes R=[[0,0],[0,damping]], b=3",
+    help="'canonical' fixes H to the true pendulum's closed-form Hamiltonian",
 )
+@click.option(
+    "--r-source",
+    type=click.Choice(["learned", "fixed_damping", "canonical"]),
+    default="learned",
+    show_default=True,
+    help="'fixed_damping' fixes R to damping*I; 'canonical' fixes R to the true damping+drag",
+)
+@click.option(
+    "--b-source",
+    type=click.Choice(["learned", "fixed_ones", "canonical"]),
+    default="learned",
+    show_default=True,
+    help="'canonical' fixes b to the true control gain (b=3)",
+)
+@click.option("--drag", type=float, default=_DRAG_COEFF, show_default=True,
+              help="Quadratic drag coefficient used by --r-source=canonical")
 @click.option(
     "--quadratic-t/--no-quadratic-t",
     default=True,
@@ -700,7 +717,7 @@ def _log_rollout_videos(
     is_flag=True,
     default=False,
     show_default=True,
-    help="R_pp(z) from a small MLP over the current state, instead of a constant matrix (requires --learn-structure)",
+    help="Learned R uses R_pp(z) from a small MLP over the current state, instead of a constant matrix",
 )
 @click.option(
     "--integrator",
@@ -832,8 +849,11 @@ def main(**kwargs):
         dt=kwargs["dt"],
         control_dim=1,
         separable=kwargs["separable"],
-        learn_structure=kwargs["learn_structure"],
+        h_source=kwargs["h_source"],
+        r_source=kwargs["r_source"],
+        b_source=kwargs["b_source"],
         damping=kwargs["damping"],
+        drag=kwargs["drag"],
         quadratic_t=kwargs["quadratic_t"],
         state_dep_r=kwargs["state_dep_r"],
         integrator=kwargs["integrator"],
@@ -849,20 +869,19 @@ def main(**kwargs):
         "max_steps": kwargs["max_steps"],
         "damping": kwargs["damping"],
     }
-    if kwargs["learn_structure"]:
-        optimizer = torch.optim.Adam(
-            [
-                {"params": model.hamiltonian.parameters(), "lr": kwargs["h_lr"]},
-                {
-                    "params": model.structural_parameters(),
-                    "lr": kwargs["structural_lr"],
-                },
-            ]
+    groups = []
+    h_params = list(model.hamiltonian.parameters())
+    if h_params:
+        groups.append({"params": h_params, "lr": kwargs["h_lr"]})
+    struct_params = model.structural_parameters()
+    if struct_params:
+        groups.append({"params": struct_params, "lr": kwargs["structural_lr"]})
+    if not groups:
+        raise ValueError(
+            "h_source/r_source/b_source are all fixed — nothing to train "
+            "(at least one must be 'learned')"
         )
-    else:
-        optimizer = torch.optim.Adam(
-            model.hamiltonian.parameters(), lr=kwargs["h_lr"]
-        )
+    optimizer = torch.optim.Adam(groups)
     best_loss = float("inf")
 
     full_seq_len = train_episodes[0][1].shape[0]
