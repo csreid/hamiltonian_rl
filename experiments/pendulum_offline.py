@@ -115,7 +115,12 @@ def _safe_hist(ax, data, bins=50, **kwargs):
         return None
     if finite.min() == finite.max():
         bins = 1
-    return ax.hist(finite, bins=bins, **kwargs)
+    try:
+        return ax.hist(finite, bins=bins, **kwargs)
+    except ValueError:
+        # Range is nonzero but too small relative to bin count for numpy to
+        # place `bins` distinct finite-sized edges (float precision limit).
+        return ax.hist(finite, bins=1, **kwargs)
 
 
 def _log_latent_variance(
