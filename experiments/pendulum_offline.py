@@ -2,7 +2,11 @@
 
 Phase 1 (phase1 subcommand):
     Train the LSTM autoencoder (encoder + f_psi + decoder) for reconstruction.
-    Loss = MSE(decoder(f_psi(z)[:q_dim]), frame) + kl_weight * KL.
+    Loss = MSE(decoder(f_psi(z[:, :q_dim])), frame) + kl_weight * KL.
+    Only the first half of z (z_q) ever reaches the current-frame decoder;
+    next_frame_decoder alone sees the full z, so the second half (z_p) is
+    trained only to help predict the next frame — the intended alignment
+    with phase-space q/p, carried through to Phase 2 (see phi_q/phi_p).
     Training data is many short, purely-random-action rollouts seeded across
     (theta, theta_dot) phase space (collect_seeded_random_rollouts); each
     epoch samples fresh random windows from a fresh random rollout
@@ -60,7 +64,7 @@ Inference (dreaming) — same pipeline after Phase 2 or Phase 3:
     q, p = Phi(h_{ctx-1})                               [Phase 2 forward]
     q_k, p_k = HamiltonianRollout(q, p, actions)        [Phase 2 dynamics]
     h_k  = Phi^{-1}(q_k, p_k)                          [Phase 2 inverse]
-    q_dec= f_psi(h_k)[:q_dim]                           [Phase 1 f_psi]
+    q_dec= f_psi(h_k[:, :q_dim])                        [Phase 1 f_psi]
     frame= decoder(q_dec)                               [Phase 1 decoder]
 """
 
@@ -633,8 +637,8 @@ def _train_epoch_phase1(
             z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
 
         def _decode(z: torch.Tensor, B: int, T: int):
-            s = model.f_psi(z.reshape(B * T, -1))
-            return model.decoder(s[:, :q_dim]).reshape(B, T, *frames.shape[2:])
+            s = model.f_psi(z.reshape(B * T, -1)[:, :q_dim])
+            return model.decoder(s).reshape(B, T, *frames.shape[2:])
 
         # Current frame reconstruction
         pred_curr = _decode(z_all, B_size, T_full + 1)
@@ -743,8 +747,8 @@ def _eval_loss_phase1(
         frames = frames_all[i:i + chunk_size].to(device)  # (n, T+1, C, H, W)
         n_chunk, T1 = frames.shape[:2]
         mu_all, _ = model.encoder.forward_all(frames)
-        s_all = model.f_psi(mu_all.reshape(n_chunk * T1, -1))
-        pred = model.decoder(s_all[:, :q_dim])
+        s_all = model.f_psi(mu_all.reshape(n_chunk * T1, -1)[:, :q_dim])
+        pred = model.decoder(s_all)
         mse = F.mse_loss(pred, frames.reshape(n_chunk * T1, *frames.shape[2:]))
         total_perframe += mse.item() * n_chunk
     return {"phase1/val_recon": total_perframe / len(val_trajs)}
@@ -766,9 +770,8 @@ def _log_reconstruction_lstm_video(
     q_dim = model.latent_dim // 2
 
     mu_all, _ = model.encoder.forward_all(ctx)
-    s_all = model.f_psi(mu_all.squeeze(0))
-    z_dec = s_all[:, :q_dim]
-    recon = model.decoder(z_dec).cpu()
+    s_all = model.f_psi(mu_all.squeeze(0)[:, :q_dim])
+    recon = model.decoder(s_all).cpu()
 
     gt = frames
     gt_ann = torch.stack([_annotate_frame(gt[i], f"{i}") for i in range(len(gt))])
@@ -1094,6 +1097,10 @@ def _log_latent_scatter_phase1(
     trajectories across all policies) and evaluated on the pooled val split
     (odd-indexed), so all policies share one regression. Points are colored
     by the policy that produced them.
+
+    s_all = f_psi(h_q) only ever sees the first half of h (see f_psi's
+    docstring), so a low θ̇ R² here is expected/healthy — velocity should
+    live in h_p, which this probe never looks at.
     """
     model.eval()
     per_policy_s, per_policy_st = {}, {}
@@ -1102,7 +1109,7 @@ def _log_latent_scatter_phase1(
         for frames, actions, states in val_trajs:
             ctx = frames.unsqueeze(0).to(device)
             mu_all, _ = model.encoder.forward_all(ctx)
-            s_all = model.f_psi(mu_all.squeeze(0)).cpu()
+            s_all = model.f_psi(mu_all.squeeze(0)[:, :model.q_dim]).cpu()
             all_s.append(s_all)
             all_st.append(states.float())
         per_policy_s[label] = all_s
@@ -1158,7 +1165,7 @@ def _log_h_state_regression_coeffs_phase1(
 ) -> None:
     """Bar charts of bidirectional linear-probe coefficients between raw h_t and state.
 
-    Unlike `_log_latent_scatter_phase1` (which probes s_all = f_psi(h_t)), this
+    Unlike `_log_latent_scatter_phase1` (which probes s_all = f_psi(h_q)), this
     probes h_t = mu_all directly — the exact quantity Phase 2 re-encodes
     from windows of the cached episode frames. `_log_latent_scatter_phase1`'s R² only shows whether state is
     *recoverable* from h (h → state); it says nothing about whether h contains
@@ -1600,9 +1607,9 @@ def _train_epoch_phase2(
         else:
             h_in = h_all
         h_flat = h_in.reshape(B_size * W, D)
-        s_flat, log_det_flat = dyn_model.phi.forward_with_logdet(h_flat)
-        q_all = s_flat[:, :q_dim].reshape(B_size, W, q_dim)  # (B, W, q_dim)
-        p_all = s_flat[:, q_dim:].reshape(B_size, W, q_dim)
+        q_flat, p_flat, log_det_flat = dyn_model.encode_with_logdet(h_flat)
+        q_all = q_flat.reshape(B_size, W, q_dim)  # (B, W, q_dim)
+        p_all = p_flat.reshape(B_size, W, q_dim)
         log_det_all = log_det_flat.reshape(B_size, W)          # (B, W)
         logdet_metric = log_det_all.detach().pow(2).mean()     # save before backward
 
@@ -1656,9 +1663,9 @@ def _train_epoch_phase2(
                 # Clean re-encode: the balance must see the data manifold, not
                 # the jitter (see docstring).
                 with torch.no_grad():
-                    s_clean = dyn_model.phi(h_all.reshape(B_size * W, D))
-                q_eb = s_clean[:, :q_dim].reshape(B_size, W, q_dim)
-                p_eb = s_clean[:, q_dim:].reshape(B_size, W, q_dim)
+                    q_clean, p_clean = dyn_model.encode(h_all.reshape(B_size * W, D))
+                q_eb = q_clean.reshape(B_size, W, q_dim)
+                p_eb = p_clean.reshape(B_size, W, q_dim)
             else:
                 q_eb, p_eb = q_all, p_all
             eb_loss = _energy_balance_loss(dyn_model, q_eb, p_eb, actions_win)
@@ -2092,17 +2099,17 @@ def _train_epoch_phase3(
         # --- Reconstruction anchor ---
         rec_idx = torch.arange(0, W, decode_stride, device=device)
         h_rec = h_all[:, rec_idx].reshape(B_size * len(rec_idx), D)
-        s_psi = ae.f_psi(h_rec)
-        recon_pred = ae.decoder(s_psi[:, :q_dim])
+        s_psi = ae.f_psi(h_rec[:, :q_dim])
+        recon_pred = ae.decoder(s_psi)
         recon_target = frames_win[:, rec_idx].reshape(
             B_size * len(rec_idx), *frames_win.shape[2:]
         )
         recon = F.mse_loss(recon_pred, recon_target)
 
         # --- phi over the whole window, with logdet regulariser ---
-        s_flat, log_det_flat = dyn.phi.forward_with_logdet(h_flat)
-        q_all = s_flat[:, :q_dim].reshape(B_size, W, q_dim)
-        p_all = s_flat[:, q_dim:].reshape(B_size, W, q_dim)
+        q_flat, p_flat, log_det_flat = dyn.encode_with_logdet(h_flat)
+        q_all = q_flat.reshape(B_size, W, q_dim)
+        p_all = p_flat.reshape(B_size, W, q_dim)
         logdet_metric = log_det_flat.detach().pow(2).mean()  # save before backward
         logdet_reg = logdet_weight * log_det_flat.pow(2).mean()
 
@@ -2142,8 +2149,8 @@ def _train_epoch_phase3(
         # Pixel closed-loop — the dreaming objective
         pix_idx = torch.arange(0, T, decode_stride, device=device)
         h_pix = h_cl_pred[:, pix_idx].reshape(B_size * len(pix_idx), D)
-        s_pix = ae.f_psi(h_pix)
-        frames_cl_pred = ae.decoder(s_pix[:, :q_dim]).reshape(
+        s_pix = ae.f_psi(h_pix[:, :q_dim])
+        frames_cl_pred = ae.decoder(s_pix).reshape(
             B_size, len(pix_idx), *frames_win.shape[2:]
         )
         frames_cl_target = frames_win[:, k + 1:k + 1 + T][:, pix_idx]
@@ -2248,8 +2255,8 @@ def _eval_loss_phase3(
 
     total_sq = 0.0
     for i in range(0, N * n_steps, dec_chunk):
-        s_psi = ae.f_psi(h_cl[i:i + dec_chunk])
-        pred = ae.decoder(s_psi[:, :q_dim])
+        s_psi = ae.f_psi(h_cl[i:i + dec_chunk, :q_dim])
+        pred = ae.decoder(s_psi)
         total_sq += F.mse_loss(
             pred, gt_flat[i:i + dec_chunk].to(device), reduction="sum"
         ).item()
@@ -2855,7 +2862,11 @@ def phase2_cmd(**kwargs):
     world_model.dynamics = dyn_model
 
     opt_groups = [{
-        "params": list(dyn_model.phi.parameters()) + list(dyn_model.hamiltonian.parameters()),
+        "params": (
+            list(dyn_model.phi_q.parameters())
+            + list(dyn_model.phi_p.parameters())
+            + list(dyn_model.hamiltonian.parameters())
+        ),
         "lr": kwargs["lr"],
     }]
     structural_params = dyn_model.structural_parameters()
@@ -3280,7 +3291,8 @@ def phase3_cmd(**kwargs):
         "params": (
             list(phase1_model.f_psi.parameters())
             + list(phase1_model.decoder.parameters())
-            + list(dyn_model.phi.parameters())
+            + list(dyn_model.phi_q.parameters())
+            + list(dyn_model.phi_p.parameters())
         ),
         "lr": kwargs["lr"],
     })

@@ -5,12 +5,14 @@ Two independently trained halves plus a wrapper that stitches them:
     TemporalAutoencoder       Phase 1 — pixels ↔ latent h_t
         encoder             causal LSTM over per-frame CNN features → (mu, logvar),
                             or a memoryless two-frame stack (encoder_type="framestack")
-        f_psi               normalizing flow h → s (decoder input is s[:q_dim])
+        f_psi               normalizing flow h_q → s, h_q = h[:, :dim/2] (decoder input is s)
         decoder             q → frame
-        next_frame_decoder  (h_t, a_t) → frame_{t+1} (auxiliary predictive head)
+        next_frame_decoder  (h_t, a_t) → frame_{t+1} (auxiliary predictive head;
+                            the only place h_p = h[:, dim/2:] gets a training signal)
 
     HamiltonianFlowModel  Phase 2 — port-Hamiltonian dynamics on precomputed h_t
-        phi                 normalizing flow h ↔ (q, p)
+        phi_q, phi_p        independent normalizing flows h_q ↔ q, h_p ↔ p
+                            (block-diagonal — no mixing across the h_q/h_p split)
         hamiltonian         H(q, p), optionally separable T(p) + V(q)
         J/R/B               canonical symplectic J; learned or fixed dissipation
                             (optionally state-dependent, R = R(z)) and control
@@ -711,7 +713,12 @@ class TemporalAutoencoder(nn.Module):
     """Phase 1 model: temporal encoder + normalizing flow + CNN decoders. No dynamics.
 
     The latent h_t produced by the encoder is what the Phase 2 dynamics model
-    (HamiltonianFlowModel) consumes.  Decoding goes h → f_psi(h)[:q_dim] → frame.
+    (HamiltonianFlowModel) consumes.  Decoding goes h_q = h[:, :q_dim] →
+    f_psi(h_q) → frame — only the first half of h ever reaches the current-
+    frame decoder, so it's structurally pressured to hold position-like
+    information (a single frame can't reveal velocity). next_frame_decoder
+    sees the full h_t, so h_p = h[:, q_dim:] gets its only training signal
+    from predicting the next frame.
 
     Args:
         latent_dim:   flat latent dimension of h_t (decoder sees latent_dim // 2)
@@ -773,7 +780,7 @@ class TemporalAutoencoder(nn.Module):
             )
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type!r}")
-        self.f_psi = NormalizingFlow(latent_dim)
+        self.f_psi = NormalizingFlow(q_dim)
         self.decoder = FlexDecoder(
             q_dim=q_dim, pos_ch=pos_ch, img_ch=img_ch, img_size=img_size
         )
@@ -787,9 +794,14 @@ class TemporalAutoencoder(nn.Module):
         return self.latent_dim // 2
 
     def decode_latent(self, h: torch.Tensor) -> torch.Tensor:
-        """h (B, latent_dim) → frame (B, C, H, W) via f_psi + decoder."""
-        s = self.f_psi(h)
-        return self.decoder(s[:, :self.q_dim])
+        """h (B, latent_dim) → frame (B, C, H, W) via f_psi(h_q) + decoder.
+
+        Only the first half of h (h_q) ever reaches the decoder — a single
+        frame can only tell you position, never velocity, so the current-
+        frame path is structurally blind to the second half (h_p).
+        """
+        s = self.f_psi(h[:, :self.q_dim])
+        return self.decoder(s)
 
 
 # ---------------------------------------------------------------------------
@@ -984,12 +996,17 @@ class HamiltonianFlowModel(nn.Module):
             "state_dep_r": state_dep_r,
         }
         q_dim = latent_dim // 2
+        p_dim = latent_dim - q_dim
         self.q_dim = q_dim
         self.n_phys = min(N_PHYS, q_dim) if block_mode else q_dim
         n_nuis = q_dim - self.n_phys
         self._n_nuis = n_nuis
 
-        self.phi = NormalizingFlow(latent_dim)
+        # Independent flows over h_q = h[:, :q_dim] and h_p = h[:, q_dim:] —
+        # block-diagonal by construction, so q can only ever come from h_q and
+        # p only from h_p (matching the same split Phase 1's f_psi enforces).
+        self.phi_q = NormalizingFlow(q_dim)
+        self.phi_p = NormalizingFlow(p_dim)
 
         # ── H ──
         if not block_mode:
@@ -1369,20 +1386,23 @@ class HamiltonianFlowModel(nn.Module):
     # ── Phase-space helpers ─────────────────────────────────────────────────
 
     def encode(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """h_t → (q, p) via Φ."""
-        s = self.phi(h)
+        """h_t → (q, p) via block-diagonal (phi_q, phi_p)."""
         q_dim = self.latent_dim // 2
-        return s[:, :q_dim], s[:, q_dim:]
+        q = self.phi_q(h[:, :q_dim])
+        p = self.phi_p(h[:, q_dim:])
+        return q, p
 
     def encode_with_logdet(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """h_t → (q, p, log_det) via Φ. log_det is per-sample log|det J_Φ|."""
-        s, log_det = self.phi.forward_with_logdet(h)
+        """h_t → (q, p, log_det) via (phi_q, phi_p). log_det is per-sample log|det J|,
+        summed across the two independent blocks."""
         q_dim = self.latent_dim // 2
-        return s[:, :q_dim], s[:, q_dim:], log_det
+        q, log_det_q = self.phi_q.forward_with_logdet(h[:, :q_dim])
+        p, log_det_p = self.phi_p.forward_with_logdet(h[:, q_dim:])
+        return q, p, log_det_q + log_det_p
 
     def decode(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-        """(q, p) → h_t via Φ⁻¹."""
-        return self.phi.inverse(torch.cat([q, p], dim=-1))
+        """(q, p) → h_t via (phi_q⁻¹, phi_p⁻¹), concatenated back to h_q ++ h_p."""
+        return torch.cat([self.phi_q.inverse(q), self.phi_p.inverse(p)], dim=-1)
 
 
 # ---------------------------------------------------------------------------
