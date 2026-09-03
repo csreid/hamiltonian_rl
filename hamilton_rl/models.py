@@ -909,11 +909,19 @@ class HamiltonianFlowModel(nn.Module):
     Any h/r/b_source other than "learned" only ever applies to a designated
     N_PHYS-dimensional "physical" sub-block of the (q, p) phase space — the
     true pendulum is 1-DOF, but latent_dim may be much wider to give Phase 1
-    room for a richer embedding. The remaining "nuisance" dimensions always
-    keep their own learned H/R/B, block-separate from the physical pair (see
-    BlockHamiltonian). When h_source == r_source == b_source == "learned"
-    (the default), this reduces exactly to a single monolithic learned
-    H/R/B over the whole space, as before.
+    room for a richer embedding. The remaining "nuisance" dimensions keep
+    their own learned H/R/B, block-separate from the physical pair (see
+    BlockHamiltonian) — EXCEPT that whichever of h/r/b_source == "canonical"
+    has its nuisance block dropped too (H: omitted from the sum; R, B: fixed
+    at zero, not learned). Without this, a wide nuisance block gives the
+    optimizer a free, unconstrained MLP to route real dynamics through
+    instead of the pinned physical block, silently defeating the point of
+    "canonical" — it would report a fit while the physical sub-block goes
+    unused. "fixed_damping"/"fixed_ones" (r/b only) do NOT drop their
+    nuisance block, since they're not asserting the true physics, only a
+    fixed structural form for the physical block. When h_source ==
+    r_source == b_source == "learned" (the default), this reduces exactly
+    to a single monolithic learned H/R/B over the whole space, as before.
     """
 
     def __init__(
@@ -996,7 +1004,7 @@ class HamiltonianFlowModel(nn.Module):
             )
             nuis_h = (
                 MLPHamiltonianNet(2 * n_nuis, separable=True, quadratic_t=quadratic_t)
-                if n_nuis > 0
+                if n_nuis > 0 and h_source != "canonical"
                 else None
             )
             self.hamiltonian = BlockHamiltonian(phys_h, nuis_h, self.n_phys)
@@ -1030,7 +1038,9 @@ class HamiltonianFlowModel(nn.Module):
             else:  # canonical
                 self._r_canonical = CanonicalDissipation(damping, drag)
             self._r_nuis = (
-                LearnedDissipationBlock(n_nuis, latent_dim, state_dep_r) if n_nuis > 0 else None
+                LearnedDissipationBlock(n_nuis, latent_dim, state_dep_r)
+                if n_nuis > 0 and r_source != "canonical"
+                else None
             )
 
             if b_source == "learned":
@@ -1043,8 +1053,11 @@ class HamiltonianFlowModel(nn.Module):
                     "B_phys_fixed", B_TRUE * torch.ones(self.n_phys, control_dim)
                 )
             if n_nuis > 0:
-                self.B_nuis = nn.Parameter(torch.zeros(n_nuis, control_dim))
-                nn.init.normal_(self.B_nuis, std=1e-2)
+                if b_source == "canonical":
+                    self.register_buffer("B_nuis_fixed", torch.zeros(n_nuis, control_dim))
+                else:
+                    self.B_nuis = nn.Parameter(torch.zeros(n_nuis, control_dim))
+                    nn.init.normal_(self.B_nuis, std=1e-2)
 
             self._has_dissipation = (
                 r_source in ("learned", "canonical")
@@ -1097,6 +1110,11 @@ class HamiltonianFlowModel(nn.Module):
         if self._r_nuis is not None:
             z_in = z if self._learned_state_dep_r else None
             r_pp_nuis = self._r_nuis.R_pp(z_in)
+        elif self._n_nuis > 0:
+            # r_source == "canonical" dropped the learned nuisance block entirely
+            # (no free MLP left to route dissipation through) — nuisance dims get
+            # exactly zero dissipation, not just "unspecified".
+            r_pp_nuis = self.J_fixed.new_zeros(self._n_nuis, self._n_nuis)
 
         return _block_diag_pp(r_pp_phys, r_pp_nuis)
 
@@ -1112,7 +1130,8 @@ class HamiltonianFlowModel(nn.Module):
             return self.B
         b_phys = self.B_phys if self.b_source == "learned" else self.B_phys_fixed
         if self._n_nuis > 0:
-            return torch.cat([b_phys, self.B_nuis], dim=0)
+            b_nuis = self.B_nuis_fixed if self.b_source == "canonical" else self.B_nuis
+            return torch.cat([b_phys, b_nuis], dim=0)
         return b_phys
 
     def r_parameters(self) -> list[nn.Parameter]:
@@ -1129,7 +1148,7 @@ class HamiltonianFlowModel(nn.Module):
         if not self.block_mode:
             return [self.B]
         params = [self.B_phys] if self.b_source == "learned" else []
-        if self._n_nuis > 0:
+        if self._n_nuis > 0 and self.b_source != "canonical":
             params.append(self.B_nuis)
         return params
 
