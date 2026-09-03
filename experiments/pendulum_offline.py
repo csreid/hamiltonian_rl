@@ -3013,7 +3013,7 @@ def phase2_cmd(**kwargs):
                         val_traj=val_trajs[0],
                         writer=writer,
                         epoch=epoch,
-                        seq_len=seq_len,
+                        seq_len=full_seq_len,
                         context_frames=kwargs["val_context_frames"],
                         tag=f"val/dreamed_phase2/{label}",
                     )
@@ -3023,7 +3023,7 @@ def phase2_cmd(**kwargs):
                     val_traj=train_traj,
                     writer=writer,
                     epoch=epoch,
-                    seq_len=seq_len,
+                    seq_len=full_seq_len,
                     context_frames=kwargs["val_context_frames"],
                     tag=f"train/dreamed_phase2/sample_{i}",
                 )
@@ -3454,7 +3454,7 @@ def phase3_cmd(**kwargs):
                     val_traj=val_trajs[0],
                     writer=writer,
                     epoch=epoch,
-                    seq_len=seq_len,
+                    seq_len=full_seq_len,
                     context_frames=kwargs["val_context_frames"],
                     tag=f"val/dreamed_phase3/{label}",
                 )
@@ -3481,7 +3481,7 @@ def phase3_cmd(**kwargs):
                     val_traj=train_traj,
                     writer=writer,
                     epoch=epoch,
-                    seq_len=seq_len,
+                    seq_len=full_seq_len,
                     context_frames=kwargs["val_context_frames"],
                     tag=f"train/dreamed_phase3/sample_{i}",
                 )
