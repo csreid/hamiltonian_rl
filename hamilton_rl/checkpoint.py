@@ -169,3 +169,50 @@ def load_state_model(path, device: torch.device | None = None):
     model.eval()
     model.data_config = ckpt["config"].get("data") or {}
     return model
+
+
+def save_projected_model(
+    run_dir: Path,
+    stem: str,
+    model,
+    projection: torch.Tensor,
+    hparams: dict,
+    metrics: dict,
+    epoch: int,
+    data_config: dict | None = None,
+) -> None:
+    """Save a HamiltonianFlowModel trained on a noisy random-linear-projection
+    proxy for a pixel encoder's latent (see
+    ``experiments/pendulum_projected_offline.py``). ``projection`` is the
+    fixed (D, 2) matrix mapping ground-truth (θ, θ̇) into the D-dim latent —
+    saved alongside the model so eval can reproduce the exact same latent
+    space."""
+    payload = {
+        "format_version": FORMAT_VERSION,
+        "kind": "projected_model",
+        "config": {
+            "model": model.config,
+            "data": data_config or {},
+        },
+        "model": model.state_dict(),
+        "projection": projection,
+        "hparams": hparams,
+        "metrics": metrics,
+        "epoch": epoch,
+    }
+    torch.save(payload, Path(run_dir) / f"{stem}.pt")
+    _write_yaml_sidecar(Path(run_dir), stem, hparams, metrics)
+
+
+def load_projected_model(path, device: torch.device | None = None):
+    """Load a unified checkpoint into a (HamiltonianFlowModel, projection) pair."""
+    from hamilton_rl.models import HamiltonianFlowModel
+
+    ckpt = _load_checked(path, "projected_model", device)
+    model = HamiltonianFlowModel(**ckpt["config"]["model"])
+    model.load_state_dict(ckpt["model"])
+    if device is not None:
+        model = model.to(device)
+    model.eval()
+    model.data_config = ckpt["config"].get("data") or {}
+    return model, ckpt["projection"]
