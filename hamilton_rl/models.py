@@ -1631,10 +1631,13 @@ class StatePHGN(nn.Module):
         if self.r_source == "fixed_damping":
             return self.R_pp_fixed
         if self.r_source == "canonical":
-            if z is None:
-                p = self.J_fixed.new_zeros(1, self.P_DIM)
-            else:
-                p = z[..., self.Q_ENC_DIM :]
+            # Unbatched (P_DIM,) at the z=None baseline -> R_pp (P_DIM, P_DIM);
+            # batched (B, P_DIM) when z is given -> R_pp (B, P_DIM, P_DIM).
+            p = (
+                self.J_fixed.new_zeros(self.P_DIM)
+                if z is None
+                else z[..., self.Q_ENC_DIM :]
+            )
             return self._r_canonical.R_pp(p)
         z_in = z if self._learned_state_dep_r else None
         return self._r.R_pp(z_in)
