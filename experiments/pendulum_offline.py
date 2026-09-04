@@ -1447,6 +1447,7 @@ def _energy_balance_loss(
     q_all: torch.Tensor,
     p_all: torch.Tensor,
     actions_win: torch.Tensor,
+    grad_to_phi: bool = False,
 ) -> torch.Tensor:
     """Port-Hamiltonian energy-balance consistency along encoded real trajectories.
 
@@ -1465,17 +1466,31 @@ def _energy_balance_loss(
     identity holds for any PSD R(z): state-dependent (drag-like) damping is
     constrained exactly, not approximated.
 
-    z is detached, so the balance shapes H, R, and B only; if it also reached
-    phi, the coordinates could warp to make the books balance instead of the
-    physics. It is a consistency constraint, not conservation — H ≡ const
-    satisfies it trivially — so it supplements the prediction losses and can
-    never replace them.
+    By default z is detached, so the balance shapes H, R, and B only; if it
+    also reached phi, the coordinates could warp to make the books balance
+    instead of the physics. It is a consistency constraint, not conservation
+    — H ≡ const satisfies it trivially — so with a *learned* H this term
+    alone can never replace the prediction losses.
+
+    grad_to_phi=True skips that detach and lets the loss shape phi as well.
+    This is the point when H (and thus this identity) is pinned to a fixed,
+    nontrivial physical form (h_source="canonical") rather than learned: the
+    "H could flatten itself" degeneracy is closed off, so backpropagating
+    into phi turns the identity into an actual coordinate-recovery signal —
+    the encoded (q, p) are pulled toward whatever frame the true trajectory
+    data actually satisfies energy balance in. Only use this with a learned H
+    if you intend exactly the flattening failure mode described above.
 
     q_all/p_all: (B, W, q_dim) encoded states; actions_win: (B, W-1) controls.
     """
     B_size, W, q_dim = q_all.shape
-    z = torch.cat([q_all, p_all], dim=-1).reshape(B_size * W, 2 * q_dim).detach()
-    z = z.requires_grad_(True)
+    z = torch.cat([q_all, p_all], dim=-1).reshape(B_size * W, 2 * q_dim)
+    if grad_to_phi:
+        # z already requires grad through phi (non-leaf); requires_grad_ can
+        # only be called on leaf tensors.
+        assert z.requires_grad, "grad_to_phi=True but q_all/p_all carry no grad to phi"
+    else:
+        z = z.detach().requires_grad_(True)
     H = dyn_model.hamiltonian(z[:, :q_dim], z[:, q_dim:])  # (B*W,)
     grad_H = torch.autograd.grad(H.sum(), z, create_graph=True)[0]
     g_p = grad_H[:, q_dim:]
@@ -1511,6 +1526,7 @@ def _train_epoch_phase2(
     closed_loop_gamma: float = 1.0,
     structural_reg_weight: float = 0.0,
     energy_balance_weight: float = 0.0,
+    energy_balance_grad_to_phi: bool = False,
     huber_delta: float = 0.0,
     h_noise_std: float = 0.0,
     h_noise_scale: torch.Tensor | None = None,
@@ -1559,7 +1575,15 @@ def _train_epoch_phase2(
     consistency loss (see _energy_balance_loss) over the encoded window. With
     h-noise augmentation active, the balance is evaluated on a clean no-grad
     re-encoding: on jittered z, H's spread across the jitter joins the loss
-    floor, rewarding exactly the flattened H the term exists to prevent.
+    floor, rewarding exactly the flattened H the term exists to prevent. This
+    clean re-encode is itself no-grad, so energy_balance_grad_to_phi has no
+    effect while h_noise_std > 0 — the two are mutually exclusive.
+
+    energy_balance_grad_to_phi lets the energy-balance loss backprop into phi
+    instead of shaping H/R/B alone (see _energy_balance_loss). Only meaningful
+    — and only safe from the "H flattens itself" degeneracy — when H is fixed
+    to a nontrivial closed form (h_source="canonical"); with a learned H this
+    just reintroduces that degeneracy.
 
     If h_noise_std > 0, zero-mean Gaussian noise is added to the h values fed
     into phi (both teacher-forced and closed-loop seeds), while the prediction
@@ -1668,7 +1692,13 @@ def _train_epoch_phase2(
                 p_eb = p_clean.reshape(B_size, W, q_dim)
             else:
                 q_eb, p_eb = q_all, p_all
-            eb_loss = _energy_balance_loss(dyn_model, q_eb, p_eb, actions_win)
+            eb_loss = _energy_balance_loss(
+                dyn_model,
+                q_eb,
+                p_eb,
+                actions_win,
+                grad_to_phi=energy_balance_grad_to_phi and h_noise_std == 0,
+            )
             loss = loss + energy_balance_weight * eb_loss
             total_energy_balance = total_energy_balance + eb_loss.detach()
 
@@ -2032,6 +2062,7 @@ def _train_epoch_phase3(
     h_cl_weight: float,
     closed_loop_gamma: float,
     energy_balance_weight: float = 0.0,
+    energy_balance_grad_to_phi: bool = False,
     huber_delta: float = 0.0,
     decode_stride: int = 1,
 ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
@@ -2064,7 +2095,10 @@ def _train_epoch_phase3(
     steps stop dominating the gradient; the h-space losses stay MSE (they are
     stop-grad auxiliaries on a different error scale). energy_balance_weight
     > 0 adds the port-Hamiltonian energy-balance consistency loss (see
-    _energy_balance_loss) on detached encoded states, shaping H/R/B only.
+    _energy_balance_loss) on the encoded states, by default detached so it
+    shapes H/R/B only; energy_balance_grad_to_phi lets it also backprop into
+    phi (and, here, the encoder) — see _energy_balance_loss's docstring for
+    when that's safe (h_source="canonical", not a learned H).
     decode_stride > 1 decodes only every decode_stride-th window frame (recon)
     and rollout step (pixel_cl) to bound decoder activation memory at long
     curriculum horizons; the h-space losses still cover every step.
@@ -2175,7 +2209,9 @@ def _train_epoch_phase3(
         )
 
         if energy_balance_weight > 0:
-            eb_loss = _energy_balance_loss(dyn, q_all, p_all, actions_win)
+            eb_loss = _energy_balance_loss(
+                dyn, q_all, p_all, actions_win, grad_to_phi=energy_balance_grad_to_phi
+            )
             loss = loss + energy_balance_weight * eb_loss
             total_energy_balance = total_energy_balance + eb_loss.detach()
 
@@ -2689,6 +2725,14 @@ def phase1_cmd(**kwargs):
                    "dissipation -gradpH^T R(z) gradpH plus input power the model "
                    "itself claims. Anchors H and R at every timestep independent of "
                    "rollout horizon. 0 disables.")
+@click.option("--energy-balance-grad-to-phi/--no-energy-balance-grad-to-phi", default=False,
+              show_default=True,
+              help="Let the energy-balance loss backprop into phi (the h<->(q,p) flow) "
+                   "instead of only shaping H/R/B. Safe (and the point) when H is pinned "
+                   "to a fixed nontrivial form (--h-source=canonical); with a learned H "
+                   "this reopens the 'H flattens itself' degeneracy the detach exists to "
+                   "prevent. No effect while --h-noise-std > 0 (balance runs on a no-grad "
+                   "clean re-encode there).")
 @click.option("--h-noise-std", type=float, default=0.0, show_default=True,
               help="Zero-mean Gaussian noise added to h inputs (augmentation; targets "
                    "stay clean), as a multiplier on each h-dim's spread across the cache. "
@@ -2910,6 +2954,7 @@ def phase2_cmd(**kwargs):
             closed_loop_gamma=kwargs["closed_loop_gamma"],
             structural_reg_weight=kwargs["structural_reg_weight"],
             energy_balance_weight=kwargs["energy_balance_weight"],
+            energy_balance_grad_to_phi=kwargs["energy_balance_grad_to_phi"],
             huber_delta=kwargs["huber_delta"],
             h_noise_std=kwargs["h_noise_std"],
             h_noise_scale=h_noise_scale,
@@ -3110,8 +3155,13 @@ def phase2_cmd(**kwargs):
                    "losses stay MSE. 0 = plain MSE.")
 @click.option("--energy-balance-weight", type=float, default=1.0, show_default=True,
               help="Weight on the port-Hamiltonian energy-balance consistency loss "
-                   "(as Phase 2), on detached encoded states so it shapes H/R/B only. "
-                   "0 disables.")
+                   "(as Phase 2), by default on detached encoded states so it shapes "
+                   "H/R/B only. 0 disables.")
+@click.option("--energy-balance-grad-to-phi/--no-energy-balance-grad-to-phi", default=False,
+              show_default=True,
+              help="Let the energy-balance loss backprop into phi/encoder instead of "
+                   "only shaping H/R/B (as Phase 2's flag). Safe with a canonical H; "
+                   "reopens the 'H flattens itself' degeneracy with a learned H.")
 @click.option("--decode-stride", type=int, default=1, show_default=True,
               help="Decode only every Nth window frame (recon) and rollout step "
                    "(pixel loss) to bound decoder memory at long horizons; h-space "
@@ -3345,6 +3395,7 @@ def phase3_cmd(**kwargs):
             h_cl_weight=kwargs["h_cl_weight"],
             closed_loop_gamma=kwargs["closed_loop_gamma"],
             energy_balance_weight=kwargs["energy_balance_weight"],
+            energy_balance_grad_to_phi=kwargs["energy_balance_grad_to_phi"],
             huber_delta=kwargs["huber_delta"],
             decode_stride=kwargs["decode_stride"],
         )
