@@ -634,37 +634,40 @@ def main(**kwargs):
                         dyn_model, cheater, phase1_model, val_trajs, device
                     ).items():
                         writer.add_scalar(f"{k}/{label}", v, epoch)
-            if not kwargs["skip_foreplay"]:
-                state_episodes = [
-                    (
-                        torch.cat(
-                            [torch.atan2(s[:, 1:2], s[:, 0:1]), s[:, 2:3]], dim=-1
-                        ),
-                        a,
-                    )
-                    for (_frames, a, s) in (val_energy + val_random + val_spin)
-                ]
-                if state_episodes:
-                    energy_fig = _plot_state_energy_landscape(
-                        dyn_model, state_episodes, -_LANDSCAPE_VEL_CLIP, _LANDSCAPE_VEL_CLIP,
+            # Pure StatePHGN diagnostics — evaluate H/R directly on a dense
+            # (theta, theta_dot) grid, no cheater/rollout involved, so these
+            # are meaningful (if uninformative pre-training) even under
+            # --skip-foreplay.
+            state_episodes = [
+                (
+                    torch.cat(
+                        [torch.atan2(s[:, 1:2], s[:, 0:1]), s[:, 2:3]], dim=-1
+                    ),
+                    a,
+                )
+                for (_frames, a, s) in (val_energy + val_random + val_spin)
+            ]
+            if state_episodes:
+                energy_fig = _plot_state_energy_landscape(
+                    dyn_model, state_episodes, -_LANDSCAPE_VEL_CLIP, _LANDSCAPE_VEL_CLIP,
+                    device=device,
+                )
+                writer.add_figure("val/energy_landscape", energy_fig, epoch)
+                plt.close(energy_fig)
+                grad_fig = _plot_state_gradient_magnitude_landscape(
+                    dyn_model, -_LANDSCAPE_VEL_CLIP, _LANDSCAPE_VEL_CLIP, device=device,
+                )
+                writer.add_figure("val/gradient_magnitude_landscape", grad_fig, epoch)
+                plt.close(grad_fig)
+                if dyn_model._has_dissipation:
+                    dissipation_fig = _plot_state_dissipation_landscape(
+                        dyn_model, damping=data_cfg.get("damping", 0.0),
+                        drag=data_cfg.get("drag", _DRAG_COEFF),
+                        min_vel=-_LANDSCAPE_VEL_CLIP, max_vel=_LANDSCAPE_VEL_CLIP,
                         device=device,
                     )
-                    writer.add_figure("val/energy_landscape", energy_fig, epoch)
-                    plt.close(energy_fig)
-                    grad_fig = _plot_state_gradient_magnitude_landscape(
-                        dyn_model, -_LANDSCAPE_VEL_CLIP, _LANDSCAPE_VEL_CLIP, device=device,
-                    )
-                    writer.add_figure("val/gradient_magnitude_landscape", grad_fig, epoch)
-                    plt.close(grad_fig)
-                    if dyn_model._has_dissipation:
-                        dissipation_fig = _plot_state_dissipation_landscape(
-                            dyn_model, damping=data_cfg.get("damping", 0.0),
-                            drag=data_cfg.get("drag", _DRAG_COEFF),
-                            min_vel=-_LANDSCAPE_VEL_CLIP, max_vel=_LANDSCAPE_VEL_CLIP,
-                            device=device,
-                        )
-                        writer.add_figure("val/dissipation_landscape", dissipation_fig, epoch)
-                        plt.close(dissipation_fig)
+                    writer.add_figure("val/dissipation_landscape", dissipation_fig, epoch)
+                    plt.close(dissipation_fig)
 
         if (
             kwargs["checkpoint_every"] > 0
