@@ -37,6 +37,11 @@ State model (ground-truth phase-space pipeline — ``save_state_model`` /
       "hparams": {...}, "metrics": {...}, "epoch": int,
     }
 
+Point-mass state model (``save_point_mass_state_model`` / ``load_point_mass_state_model``)
+mirrors the state model format exactly (``kind: "point_mass_state_model"``,
+``config["model"]`` are ``PointMassPHGN`` ctor args) for
+``experiments/point_mass_offline.py``'s ground-truth phase-space pipeline.
+
 Both also get a YAML sidecar (hparams + metrics only) for human eyeballing.
 """
 
@@ -163,6 +168,46 @@ def load_state_model(path, device: torch.device | None = None):
 
     ckpt = _load_checked(path, "state_model", device)
     model = StatePHGN(**ckpt["config"]["model"])
+    model.load_state_dict(ckpt["model"])
+    if device is not None:
+        model = model.to(device)
+    model.eval()
+    model.data_config = ckpt["config"].get("data") or {}
+    return model
+
+
+def save_point_mass_state_model(
+    run_dir: Path,
+    stem: str,
+    model,
+    hparams: dict,
+    metrics: dict,
+    epoch: int,
+    data_config: dict | None = None,
+) -> None:
+    """Save a PointMassPHGN (ground-truth phase-space dynamics) as one .pt file."""
+    payload = {
+        "format_version": FORMAT_VERSION,
+        "kind": "point_mass_state_model",
+        "config": {
+            "model": model.config,
+            "data": data_config or {},
+        },
+        "model": model.state_dict(),
+        "hparams": hparams,
+        "metrics": metrics,
+        "epoch": epoch,
+    }
+    torch.save(payload, Path(run_dir) / f"{stem}.pt")
+    _write_yaml_sidecar(Path(run_dir), stem, hparams, metrics)
+
+
+def load_point_mass_state_model(path, device: torch.device | None = None):
+    """Load a unified checkpoint into a PointMassPHGN."""
+    from hamilton_rl.models import PointMassPHGN
+
+    ckpt = _load_checked(path, "point_mass_state_model", device)
+    model = PointMassPHGN(**ckpt["config"]["model"])
     model.load_state_dict(ckpt["model"])
     if device is not None:
         model = model.to(device)

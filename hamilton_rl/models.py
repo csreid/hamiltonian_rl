@@ -37,6 +37,11 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from data.pendulum import _DRAG_COEFF, _G, B_TRUE, R_pp_true
+from data.point_mass import _DRAG_COEFF as _PM_DRAG_COEFF
+from data.point_mass import _K_WALL as _PM_K_WALL
+from data.point_mass import _L_WALL as _PM_L_WALL
+from data.point_mass import B_TRUE as _PM_B_TRUE
+from data.point_mass import R_pp_true as _pm_R_pp_true
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +560,49 @@ class CanonicalDissipation(nn.Module):
         return R_pp_true(p, self.damping, self.drag).unsqueeze(-1)
 
 
+class CanonicalHamiltonianPointMass(nn.Module):
+    """H(q, p) = T(p) + V(q) fixed to the true point mass's closed-form Hamiltonian.
+
+    Parameterless — the point-mass analog of ``CanonicalHamiltonian``, for a
+    2-DOF (q, p) = ((x, y), (vx, vy)) block, matching
+    ``data.point_mass.H_true``/``analytic_point_mass_step``. ``kinetic``/
+    ``potential`` sum over the 2 physical dims with ``keepdim=True`` so
+    ``forward``'s final ``squeeze(-1)`` collapses to one scalar per sample
+    exactly as ``CanonicalHamiltonian`` does for its 1-DOF block, and so
+    ``BlockHamiltonian`` (which calls ``potential``/``kinetic`` directly,
+    without going through ``forward``) sees the same (..., 1) contract as its
+    other blocks.
+    """
+
+    def kinetic(self, p: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (p**2).sum(dim=-1, keepdim=True)
+
+    def potential(self, q: torch.Tensor, k: float = _PM_K_WALL, L: float = _PM_L_WALL) -> torch.Tensor:
+        beyond = (q.abs() - L).clamp_min(0.0)
+        return (0.25 * k * beyond**4).sum(dim=-1, keepdim=True)
+
+    def forward(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        return (self.kinetic(p) + self.potential(q)).squeeze(-1)
+
+
+class CanonicalDissipationPointMass(nn.Module):
+    """R_pp(z) fixed to the true point mass's linear damping + quadratic drag.
+
+    Parameterless. Point-mass analog of ``CanonicalDissipation``: given p of
+    shape (..., 2), returns R_pp of shape (..., 2, 2) — already the right
+    shape from ``data.point_mass.R_pp_true`` (diagonal, decoupled per axis),
+    unlike the 1-DOF pendulum version which needs an extra ``unsqueeze(-1)``.
+    """
+
+    def __init__(self, damping: float, drag: float):
+        super().__init__()
+        self.damping = damping
+        self.drag = drag
+
+    def R_pp(self, p: torch.Tensor) -> torch.Tensor:
+        return _pm_R_pp_true(p, self.damping, self.drag)
+
+
 class BlockHamiltonian(nn.Module):
     """H(q, p) = H_phys(q[..., :n_phys], p[..., :n_phys]) + H_nuisance(q[..., n_phys:], p[..., n_phys:]).
 
@@ -811,6 +859,27 @@ class TemporalAutoencoder(nn.Module):
 
 N_PHYS = 1  # the true pendulum's DOF — size of the "physical" q/p sub-block
 
+# Registry of "canonical" physics a HamiltonianFlowModel's physical block can
+# be pinned to, selected by the ``physics`` ctor arg (a plain string, so it
+# round-trips through the checkpoint config with no pickled callables). Each
+# entry supplies the physical DOF count, the parameterless canonical H/R
+# modules, and the true control gain — add an entry here for a new
+# environment rather than duplicating HamiltonianFlowModel.
+_PHYSICS_REGISTRY: dict[str, dict] = {
+    "pendulum": {
+        "n_phys": N_PHYS,
+        "hamiltonian_cls": CanonicalHamiltonian,
+        "dissipation_cls": CanonicalDissipation,
+        "b_true": B_TRUE,
+    },
+    "point_mass": {
+        "n_phys": 2,
+        "hamiltonian_cls": CanonicalHamiltonianPointMass,
+        "dissipation_cls": CanonicalDissipationPointMass,
+        "b_true": _PM_B_TRUE,
+    },
+}
+
 
 def _block_diag_pp(a: torch.Tensor, b: torch.Tensor | None) -> torch.Tensor:
     """Assemble a block-diagonal momentum matrix from two (possibly batched) blocks.
@@ -912,6 +981,10 @@ class HamiltonianFlowModel(nn.Module):
                      (matches data.pendulum's true dissipation)
         quadratic_t: if True (requires separable), kinetic energy is a PSD
                      quadratic form T(p) = ½ pᵀM⁻¹p with learned constant mass
+        physics:     which environment's true physics "canonical" h/r/b_source
+                     are pinned to — "pendulum" (default, 1-DOF) or
+                     "point_mass" (2-DOF) — see ``_PHYSICS_REGISTRY``. Ignored
+                     when h_source == r_source == b_source == "learned".
         state_dep_r: if True, learned R blocks use a state-dependent
                      R_pp(z) = L(z) L(z)ᵀ (small MLP) instead of a constant
                      matrix — needed for a *learned* R to express something
@@ -919,9 +992,11 @@ class HamiltonianFlowModel(nn.Module):
                      always state-dependent regardless of this flag.
 
     Any h/r/b_source other than "learned" only ever applies to a designated
-    N_PHYS-dimensional "physical" sub-block of the (q, p) phase space — the
-    true pendulum is 1-DOF, but latent_dim may be much wider to give Phase 1
-    room for a richer embedding. The remaining "nuisance" dimensions keep
+    "physical" sub-block of the (q, p) phase space, sized and pinned to a
+    concrete environment's true physics by the ``physics`` arg (see
+    ``_PHYSICS_REGISTRY`` — "pendulum", 1-DOF, or "point_mass", 2-DOF), but
+    latent_dim may be much wider to give Phase 1 room for a richer embedding.
+    The remaining "nuisance" dimensions keep
     their own learned H/R/B, block-separate from the physical pair (see
     BlockHamiltonian) — EXCEPT that whichever of h/r/b_source == "canonical"
     has its nuisance block dropped too (H: omitted from the sum; R, B: fixed
@@ -950,8 +1025,11 @@ class HamiltonianFlowModel(nn.Module):
         integrator: str = "rk4",
         quadratic_t: bool = False,
         state_dep_r: bool = False,
+        physics: str = "pendulum",
     ):
         super().__init__()
+        if physics not in _PHYSICS_REGISTRY:
+            raise ValueError(f"physics must be one of {list(_PHYSICS_REGISTRY)}, got {physics!r}")
         if integrator not in ("rk4", "leapfrog"):
             raise ValueError(f"integrator must be 'rk4' or 'leapfrog', got {integrator!r}")
         if integrator == "leapfrog" and not separable:
@@ -981,6 +1059,8 @@ class HamiltonianFlowModel(nn.Module):
         self.integrator = integrator
         self._learned_state_dep_r = state_dep_r
         self.block_mode = block_mode
+        self.physics = physics
+        _phys_cfg = _PHYSICS_REGISTRY[physics]
         self.config = {
             "latent_dim": latent_dim,
             "control_dim": control_dim,
@@ -994,11 +1074,12 @@ class HamiltonianFlowModel(nn.Module):
             "integrator": integrator,
             "quadratic_t": quadratic_t,
             "state_dep_r": state_dep_r,
+            "physics": physics,
         }
         q_dim = latent_dim // 2
         p_dim = latent_dim - q_dim
         self.q_dim = q_dim
-        self.n_phys = min(N_PHYS, q_dim) if block_mode else q_dim
+        self.n_phys = min(_phys_cfg["n_phys"], q_dim) if block_mode else q_dim
         n_nuis = q_dim - self.n_phys
         self._n_nuis = n_nuis
 
@@ -1015,7 +1096,7 @@ class HamiltonianFlowModel(nn.Module):
             )
         else:
             phys_h = (
-                CanonicalHamiltonian()
+                _phys_cfg["hamiltonian_cls"]()
                 if h_source == "canonical"
                 else MLPHamiltonianNet(2 * self.n_phys, separable=True, quadratic_t=quadratic_t)
             )
@@ -1053,7 +1134,7 @@ class HamiltonianFlowModel(nn.Module):
                     "_r_phys_fixed", damping * torch.eye(self.n_phys)
                 )
             else:  # canonical
-                self._r_canonical = CanonicalDissipation(damping, drag)
+                self._r_canonical = _phys_cfg["dissipation_cls"](damping, drag)
             self._r_nuis = (
                 LearnedDissipationBlock(n_nuis, latent_dim, state_dep_r)
                 if n_nuis > 0 and r_source != "canonical"
@@ -1064,10 +1145,15 @@ class HamiltonianFlowModel(nn.Module):
                 self.B_phys = nn.Parameter(torch.zeros(self.n_phys, control_dim))
                 nn.init.normal_(self.B_phys, std=1e-2)
             elif b_source == "fixed_ones":
-                self.register_buffer("B_phys_fixed", torch.ones(self.n_phys, control_dim))
+                # Diagonal, not all-ones: for a multi-DOF physical block (e.g.
+                # the point mass's 2 decoupled axes), an all-ones matrix would
+                # spuriously couple every control input into every physical
+                # dim. torch.eye reduces to the old scalar behavior when
+                # n_phys == control_dim == 1 (the pendulum).
+                self.register_buffer("B_phys_fixed", torch.eye(self.n_phys, control_dim))
             else:  # canonical
                 self.register_buffer(
-                    "B_phys_fixed", B_TRUE * torch.ones(self.n_phys, control_dim)
+                    "B_phys_fixed", _phys_cfg["b_true"] * torch.eye(self.n_phys, control_dim)
                 )
             if n_nuis > 0:
                 if b_source == "canonical":
@@ -1773,6 +1859,328 @@ class StatePHGN(nn.Module):
         so the composite stays 2nd-order and reduces to pure symplectic
         leapfrog when R = 0.
         """
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, dt / 2)
+
+        Bu = u @ self.get_b().T  # constant force on p (zero-order hold)
+        p = p - (dt / 2) * self._grad_V(q) + (dt / 2) * Bu
+        q = q + dt * self._grad_T(p)
+        p = p - (dt / 2) * self._grad_V(q) + (dt / 2) * Bu
+
+        if self._has_dissipation:
+            q, p = self._dissipation_substep(q, p, dt / 2)
+        return q, p
+
+    # ── Public step ─────────────────────────────────────────────────────────
+
+    @torch.enable_grad()
+    def step(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        u: torch.Tensor,
+        dt: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One integration step of dz/dt = (J − R) ∇H + control.
+
+        Dispatches on self.integrator: 'rk4' (classic 4-stage, works for any
+        structure) or 'leapfrog' (Strang-split symplectic Störmer-Verlet;
+        requires separable H).
+        """
+        if dt is None:
+            dt = self.dt
+        if self.integrator == "leapfrog":
+            return self._leapfrog_step(q, p, u, dt)
+        return self._rk4_step(q, p, u, dt)
+
+
+# ---------------------------------------------------------------------------
+# PointMassPHGN — same port-Hamiltonian ODE, ground-truth point-mass state
+# ---------------------------------------------------------------------------
+
+
+class PointMassPHGN(nn.Module):
+    """Controlled port-Hamiltonian model operating on ground-truth point-mass state.
+
+    Phase space: z = (x, y, vx, vy) with q = z[:2], p = z[2:]
+    ODE: dz/dt = (J − R(z)) ∇H(z) + [0, B] u
+
+    The point-mass analog of ``StatePHGN`` — same structure, same
+    RK4/leapfrog integration, same h/r/b_source plumbing — but with
+    ``Q_DIM = P_DIM = 2`` and no angle to encode (``encode_q`` is the
+    identity: there's nothing analogous to ``StatePHGN``'s sin/cos wrap,
+    which is the entire point of this environment). See ``StatePHGN`` for the
+    full design rationale; only the differences are re-documented here.
+
+    Args:
+        hidden_dim:   width of Hamiltonian MLP hidden layers
+        dt:           integration step size (matches data.point_mass, 0.05)
+        control_dim:  dimension of control input u (2 for the point mass)
+        separable:    use T(p) + V(q) Hamiltonian decomposition
+        quadratic_t:  T(p) = ½pᵀM⁻¹p with a learned constant mass, instead of
+                      a free MLP (requires separable=True)
+        state_dep_r:  learned R uses R_pp(z) from a small MLP over the current
+                      state instead of a constant matrix. Canonical R is
+                      always state-dependent regardless of this flag.
+        integrator:   "auto" (leapfrog if separable else rk4), "rk4", or
+                      "leapfrog" (requires separable=True)
+        h_source:     "learned" (MLP) or "canonical" (fixed to the true point
+                      mass's closed-form H)
+        r_source:     "learned", "fixed_damping", or "canonical" (fixed to
+                      the true point mass's linear damping + quadratic drag)
+        b_source:     "learned", "fixed_ones", or "canonical" (fixed to the
+                      true per-axis control gain, B_TRUE * I₂)
+        damping:      dissipation coefficient used by r_source="fixed_damping"
+                      and (together with drag) by r_source="canonical"
+        drag:         quadratic-drag coefficient used by r_source="canonical"
+    """
+
+    Q_DIM = 2
+    P_DIM = 2
+    STATE_DIM = 4  # Q_DIM + P_DIM
+    Q_ENC_DIM = 2  # (x, y) — no encoding needed, unlike the pendulum's sin/cos
+
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        dt: float = 0.05,
+        control_dim: int = 2,
+        separable: bool = True,
+        h_source: str = "learned",
+        r_source: str = "learned",
+        b_source: str = "learned",
+        damping: float = 0.0,
+        drag: float = _PM_DRAG_COEFF,
+        quadratic_t: bool = True,
+        state_dep_r: bool = False,
+        integrator: str = "auto",
+    ):
+        super().__init__()
+        if integrator not in ("auto", "rk4", "leapfrog"):
+            raise ValueError(f"integrator must be 'auto', 'rk4' or 'leapfrog', got {integrator!r}")
+        if integrator == "leapfrog" and not separable:
+            raise ValueError(
+                "leapfrog requires a separable Hamiltonian H = T(p) + V(q); "
+                "pass separable=True or integrator='rk4'."
+            )
+        for name, value, choices in (
+            ("h_source", h_source, ("learned", "canonical")),
+            ("r_source", r_source, ("learned", "fixed_damping", "canonical")),
+            ("b_source", b_source, ("learned", "fixed_ones", "canonical")),
+        ):
+            if value not in choices:
+                raise ValueError(f"{name} must be one of {choices}, got {value!r}")
+        if integrator == "auto":
+            integrator = "leapfrog" if separable else "rk4"
+
+        self.dt = dt
+        self.control_dim = control_dim
+        self.h_source = h_source
+        self.r_source = r_source
+        self.b_source = b_source
+        self.separable = separable
+        self._learned_state_dep_r = state_dep_r
+        self.integrator = integrator
+        self.config = {
+            "hidden_dim": hidden_dim,
+            "dt": dt,
+            "control_dim": control_dim,
+            "separable": separable,
+            "h_source": h_source,
+            "r_source": r_source,
+            "b_source": b_source,
+            "damping": damping,
+            "drag": drag,
+            "quadratic_t": quadratic_t,
+            "state_dep_r": state_dep_r,
+            "integrator": integrator,  # resolved value, never "auto"
+        }
+
+        self.hamiltonian = (
+            CanonicalHamiltonianPointMass()
+            if h_source == "canonical"
+            else _HamiltonianMLP(
+                q_enc_dim=self.Q_ENC_DIM,
+                p_dim=self.P_DIM,
+                hidden=hidden_dim,
+                separable=separable,
+                quadratic_t=quadratic_t,
+            )
+        )
+
+        # J is ALWAYS the canonical symplectic structure — see StatePHGN's
+        # get_J docstring for why a learned constant J buys nothing here.
+        J_fixed = torch.zeros(self.STATE_DIM, self.STATE_DIM)
+        J_fixed[: self.Q_DIM, self.Q_DIM :] = torch.eye(self.Q_DIM)
+        J_fixed[self.Q_DIM :, : self.Q_DIM] = -torch.eye(self.Q_DIM)
+        self.register_buffer("J_fixed", J_fixed)
+
+        if r_source == "learned":
+            self._r = LearnedDissipationBlock(
+                self.P_DIM, self.Q_ENC_DIM + self.P_DIM, state_dep_r
+            )
+        elif r_source == "fixed_damping":
+            self.register_buffer("R_pp_fixed", damping * torch.eye(self.P_DIM))
+        else:  # canonical
+            self._r_canonical = CanonicalDissipationPointMass(damping, drag)
+
+        if b_source == "learned":
+            self.b = nn.Parameter(torch.zeros(self.P_DIM, control_dim))
+            nn.init.normal_(self.b, std=1e-2)
+        elif b_source == "fixed_ones":
+            # eye, not ones: the point mass's 2 axes are decoupled, so a
+            # naive fixed baseline shouldn't route x-force into y-momentum.
+            self.register_buffer("b_fixed", torch.eye(self.P_DIM, control_dim))
+        else:  # canonical
+            self.register_buffer("b_fixed", _PM_B_TRUE * torch.eye(self.P_DIM, control_dim))
+
+        self._has_dissipation = (
+            r_source in ("learned", "canonical") or (r_source == "fixed_damping" and damping > 0)
+        )
+
+    # ── Structure matrix helpers ────────────────────────────────────────────
+
+    def get_J(self) -> torch.Tensor:
+        return self.J_fixed
+
+    @property
+    def state_dep_r(self) -> bool:
+        return self._learned_state_dep_r or self.r_source == "canonical"
+
+    def get_R_pp(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Momentum-block of R — the only part that can be nonzero.
+
+        (P_DIM, P_DIM), or (B, P_DIM, P_DIM) for state-dependent R with z
+        given (see ``_r_input`` for the z convention).
+        """
+        if self.r_source == "fixed_damping":
+            return self.R_pp_fixed
+        if self.r_source == "canonical":
+            p = (
+                self.J_fixed.new_zeros(self.P_DIM)
+                if z is None
+                else z[..., self.Q_ENC_DIM :]
+            )
+            return self._r_canonical.R_pp(p)
+        z_in = z if self._learned_state_dep_r else None
+        return self._r.R_pp(z_in)
+
+    def get_R(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        R_pp = self.get_R_pp(z)
+        R = R_pp.new_zeros(*R_pp.shape[:-2], self.STATE_DIM, self.STATE_DIM)
+        R[..., self.Q_DIM :, self.Q_DIM :] = R_pp
+        return R
+
+    def get_b(self) -> torch.Tensor:
+        return self.b if self.b_source == "learned" else self.b_fixed
+
+    def structural_parameters(self) -> list[nn.Parameter]:
+        """The learned structure parameters (R and b) — for the structural_lr group."""
+        r_params = list(self._r.parameters()) if self.r_source == "learned" else []
+        b_params = [self.b] if self.b_source == "learned" else []
+        return r_params + b_params
+
+    def _apply_R_pp(self, R_pp: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """R_pp @ v per sample."""
+        if R_pp.dim() == 2:
+            return v @ R_pp  # R_pp symmetric
+        return (R_pp @ v.unsqueeze(-1)).squeeze(-1)
+
+    # ── Phase-space helpers ─────────────────────────────────────────────────
+
+    def split(self, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split flat state s (B, 4) → q (B, 2), p (B, 2)."""
+        return s[:, : self.Q_DIM], s[:, self.Q_DIM :]
+
+    @staticmethod
+    def encode_q(q: torch.Tensor) -> torch.Tensor:
+        """Identity — (x, y) has no periodicity to encode, unlike θ."""
+        return q
+
+    def H(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        return self.hamiltonian(self.encode_q(q), p)
+
+    def _r_input(self, q: torch.Tensor, p: torch.Tensor) -> torch.Tensor | None:
+        return torch.cat([self.encode_q(q), p], dim=-1) if self.state_dep_r else None
+
+    # ── Dynamics (RK4) ──────────────────────────────────────────────────────
+
+    @torch.enable_grad()
+    def _dynamics(
+        self,
+        q: torch.Tensor,
+        p: torch.Tensor,
+        u: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(J − R(z)) ∇H at z = (q, p), written blockwise for canonical J:
+
+            q̇ = ∂H/∂p,   ṗ = −∂H/∂q − R_pp(z) ∂H/∂p + B u
+        """
+        q_ = q.clone().requires_grad_(True)
+        p_ = p.clone().requires_grad_(True)
+        H_val = self.H(q_, p_).sum()
+        g_q, g_p = torch.autograd.grad(H_val, [q_, p_], create_graph=self.training)
+        dq = g_p
+        dp = -g_q
+        if self._has_dissipation:
+            R_pp = self.get_R_pp(self._r_input(q, p))
+            dp = dp - self._apply_R_pp(R_pp, g_p)
+        Bu = u @ self.get_b().T  # (B, P_DIM)
+        dp = dp + Bu
+        return dq, dp
+
+    def _rk4_step(
+        self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Classic 4-stage explicit RK4 on the full field (J − R(z))∇H + Bu."""
+        dq1, dp1 = self._dynamics(q, p, u)
+        dq2, dp2 = self._dynamics(q + 0.5 * dt * dq1, p + 0.5 * dt * dp1, u)
+        dq3, dp3 = self._dynamics(q + 0.5 * dt * dq2, p + 0.5 * dt * dp2, u)
+        dq4, dp4 = self._dynamics(q + dt * dq3, p + dt * dp3, u)
+        q_next = q + (dt / 6.0) * (dq1 + 2 * dq2 + 2 * dq3 + dq4)
+        p_next = p + (dt / 6.0) * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
+        return q_next, p_next
+
+    # ── Dynamics (leapfrog) ─────────────────────────────────────────────────
+
+    @torch.enable_grad()
+    def _grad_V(self, q: torch.Tensor) -> torch.Tensor:
+        """∇V(q) alone — skips the kinetic net entirely (separable H only)."""
+        q_ = q.clone().requires_grad_(True)
+        V_val = self.hamiltonian.potential(self.encode_q(q_)).sum()
+        return torch.autograd.grad(V_val, q_, create_graph=self.training)[0]
+
+    @torch.enable_grad()
+    def _grad_T(self, p: torch.Tensor) -> torch.Tensor:
+        """∇T(p) alone — skips the potential net entirely (separable H only)."""
+        p_ = p.clone().requires_grad_(True)
+        T_val = self.hamiltonian.kinetic(p_).sum()
+        return torch.autograd.grad(T_val, p_, create_graph=self.training)[0]
+
+    def _dissipation_substep(
+        self, q: torch.Tensor, p: torch.Tensor, tau: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Substep of the dissipative flow ż = −R∇H over (possibly negative) time tau.
+
+        See ``StatePHGN._dissipation_substep`` for the exactness discussion —
+        identical here, just over a 2-vector momentum.
+        """
+        kin = self.hamiltonian.kinetic
+        R_pp = self.get_R_pp(self._r_input(q, p))
+        if isinstance(kin, QuadraticKinetic):
+            A = R_pp @ kin.M_inv()
+            if A.dim() == 2:
+                return q, p @ torch.matrix_exp(-tau * A).T
+            return q, (torch.matrix_exp(-tau * A) @ p.unsqueeze(-1)).squeeze(-1)
+        g_T = self._grad_T(p)
+        if R_pp.dim() == 2:
+            return q, p - tau * g_T @ R_pp  # R_pp symmetric
+        return q, p - tau * (R_pp @ g_T.unsqueeze(-1)).squeeze(-1)
+
+    def _leapfrog_step(
+        self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Strang split: D(dt/2) ∘ Leapfrog(dt) ∘ D(dt/2). See ``StatePHGN._leapfrog_step``."""
         if self._has_dissipation:
             q, p = self._dissipation_substep(q, p, dt / 2)
 
