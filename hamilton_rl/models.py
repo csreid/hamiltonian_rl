@@ -990,6 +990,16 @@ class HamiltonianFlowModel(nn.Module):
                      matrix — needed for a *learned* R to express something
                      like the env's quadratic drag ṗ ∝ −p|p|. Canonical R is
                      always state-dependent regardless of this flag.
+        active_phase_dims: ablation — if set to K, only the first K of the
+                     q_dim canonical pairs (q_1..K, p_1..K) are ever fed as
+                     input to H/R; the rest are masked to zero before every
+                     hamiltonian/kinetic/potential/R_pp call, which by itself
+                     already zeroes ∂H/∂z there (H has no dependence left on a
+                     masked coordinate). controlled_step/reverse_step also
+                     hard-freeze those dims to their pre-step value, as a
+                     backstop against a learned, state-dependent R or B
+                     leaking a nonzero rate into them some other way. None
+                     (default) disables the ablation — every dim stays active.
 
     Any h/r/b_source other than "learned" only ever applies to a designated
     "physical" sub-block of the (q, p) phase space, sized and pinned to a
@@ -1026,6 +1036,7 @@ class HamiltonianFlowModel(nn.Module):
         quadratic_t: bool = False,
         state_dep_r: bool = False,
         physics: str = "pendulum",
+        active_phase_dims: int | None = None,
     ):
         super().__init__()
         if physics not in _PHYSICS_REGISTRY:
@@ -1075,6 +1086,7 @@ class HamiltonianFlowModel(nn.Module):
             "quadratic_t": quadratic_t,
             "state_dep_r": state_dep_r,
             "physics": physics,
+            "active_phase_dims": active_phase_dims,
         }
         q_dim = latent_dim // 2
         p_dim = latent_dim - q_dim
@@ -1082,6 +1094,20 @@ class HamiltonianFlowModel(nn.Module):
         self.n_phys = min(_phys_cfg["n_phys"], q_dim) if block_mode else q_dim
         n_nuis = q_dim - self.n_phys
         self._n_nuis = n_nuis
+
+        self.active_phase_dims = active_phase_dims
+        if active_phase_dims is not None:
+            if active_phase_dims <= 0 or active_phase_dims > min(q_dim, p_dim):
+                raise ValueError(
+                    f"active_phase_dims must be in [1, min(q_dim, p_dim)] = "
+                    f"[1, {min(q_dim, p_dim)}], got {active_phase_dims}"
+                )
+            active_mask_q = torch.zeros(q_dim)
+            active_mask_q[:active_phase_dims] = 1.0
+            active_mask_p = torch.zeros(p_dim)
+            active_mask_p[:active_phase_dims] = 1.0
+            self.register_buffer("_active_mask_q", active_mask_q)
+            self.register_buffer("_active_mask_p", active_mask_p)
 
         # Independent flows over h_q = h[:, :q_dim] and h_p = h[:, q_dim:] —
         # block-diagonal by construction, so q can only ever come from h_q and
@@ -1259,6 +1285,36 @@ class HamiltonianFlowModel(nn.Module):
         """The learned structure parameters (R and B) — for the structural_lr group."""
         return self.r_parameters() + self.b_parameters()
 
+    def _masked_q(self, q: torch.Tensor) -> torch.Tensor:
+        """q with dims >= active_phase_dims zeroed (no-op unless the ablation is set)."""
+        return q * self._active_mask_q if self.active_phase_dims is not None else q
+
+    def _masked_p(self, p: torch.Tensor) -> torch.Tensor:
+        """p with dims >= active_phase_dims zeroed (no-op unless the ablation is set)."""
+        return p * self._active_mask_p if self.active_phase_dims is not None else p
+
+    def _masked_z(self, z: torch.Tensor) -> torch.Tensor:
+        """cat(q, p) with dims >= active_phase_dims zeroed in each half."""
+        if self.active_phase_dims is None:
+            return z
+        return torch.cat([self._masked_q(z[..., : self.q_dim]), self._masked_p(z[..., self.q_dim :])], dim=-1)
+
+    def _freeze_inactive(
+        self, q0: torch.Tensor, p0: torch.Tensor, q1: torch.Tensor, p1: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hard-override dims >= active_phase_dims to their pre-step value.
+
+        Masking H/R's *input* already zeroes ∂H/∂z for those dims, but a
+        state-dependent R or a learned B could still couple a nonzero rate
+        into them (e.g. an R_pp row mixing an inactive dim with an active
+        one). This is the actual guarantee that they're constants of motion.
+        """
+        if self.active_phase_dims is None:
+            return q1, p1
+        q_out = torch.where(self._active_mask_q.bool(), q1, q0)
+        p_out = torch.where(self._active_mask_p.bool(), p1, p0)
+        return q_out, p_out
+
     def _apply_R_pp(self, z: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """R_pp(z) @ v per sample; z = cat(q, p) is only consulted when R is state-dependent."""
         R_pp = self.get_R_pp(z if self.state_dep_r else None)
@@ -1283,13 +1339,13 @@ class HamiltonianFlowModel(nn.Module):
         """
         half = self.latent_dim // 2
         z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
-        H_val = self.hamiltonian(z_[:, :half], z_[:, half:]).sum()
+        H_val = self.hamiltonian(self._masked_q(z_[:, :half]), self._masked_p(z_[:, half:])).sum()
         grad_H = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
         g_q, g_p = grad_H[:, :half], grad_H[:, half:]
         dq = g_p
         dp = -g_q
         if self._has_dissipation:
-            dp = dp - self._apply_R_pp(z_, g_p)
+            dp = dp - self._apply_R_pp(self._masked_z(z_), g_p)
         return dq, dp
 
     def _controlled_dynamics(
@@ -1321,8 +1377,10 @@ class HamiltonianFlowModel(nn.Module):
         if dt is None:
             dt = self.dt
         if self.integrator == "leapfrog":
-            return self._leapfrog_step(q, p, u, dt)
-        return self._rk4_step(q, p, u, dt)
+            q_next, p_next = self._leapfrog_step(q, p, u, dt)
+        else:
+            q_next, p_next = self._rk4_step(q, p, u, dt)
+        return self._freeze_inactive(q, p, q_next, p_next)
 
     def _rk4_step(
         self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float
@@ -1346,7 +1404,7 @@ class HamiltonianFlowModel(nn.Module):
         """
         half = self.latent_dim // 2
         z_ = torch.cat([q, p], dim=-1).requires_grad_(True)
-        H_val = self.hamiltonian(z_[:, :half], z_[:, half:]).sum()
+        H_val = self.hamiltonian(self._masked_q(z_[:, :half]), self._masked_p(z_[:, half:])).sum()
         g = torch.autograd.grad(H_val, z_, create_graph=self.training)[0]
         return g[:, :half], g[:, half:]
 
@@ -1354,14 +1412,14 @@ class HamiltonianFlowModel(nn.Module):
     def _grad_V(self, q: torch.Tensor) -> torch.Tensor:
         """∇V(q) alone — skips the kinetic net entirely (separable H only)."""
         q_ = q.clone().requires_grad_(True)
-        V_val = self.hamiltonian.potential(q_).sum()
+        V_val = self.hamiltonian.potential(self._masked_q(q_)).sum()
         return torch.autograd.grad(V_val, q_, create_graph=self.training)[0]
 
     @torch.enable_grad()
     def _grad_T(self, p: torch.Tensor) -> torch.Tensor:
         """∇T(p) alone — skips the potential net entirely (separable H only)."""
         p_ = p.clone().requires_grad_(True)
-        T_val = self.hamiltonian.kinetic(p_).sum()
+        T_val = self.hamiltonian.kinetic(self._masked_p(p_)).sum()
         return torch.autograd.grad(T_val, p_, create_graph=self.training)[0]
 
     def _dissipation_substep(
@@ -1391,7 +1449,7 @@ class HamiltonianFlowModel(nn.Module):
         Euler, whose tau < 0 step inverts the forward one only to O(tau²).
         """
         kin = self.hamiltonian.kinetic
-        z = torch.cat([q, p], dim=-1) if self.state_dep_r else None
+        z = self._masked_z(torch.cat([q, p], dim=-1)) if self.state_dep_r else None
         R_pp = self.get_R_pp(z)
         if isinstance(kin, QuadraticKinetic):
             A = R_pp @ kin.M_inv()  # (d, d) or (B, d, d)
@@ -1450,8 +1508,10 @@ class HamiltonianFlowModel(nn.Module):
         if dt is None:
             dt = self.dt
         if self.integrator == "leapfrog":
-            return self._leapfrog_step_inverse(q, p, u, dt)
-        return self._rk4_step(q, p, u, -dt)
+            q_prev, p_prev = self._leapfrog_step_inverse(q, p, u, dt)
+        else:
+            q_prev, p_prev = self._rk4_step(q, p, u, -dt)
+        return self._freeze_inactive(q, p, q_prev, p_prev)
 
     def _leapfrog_step_inverse(
         self, q: torch.Tensor, p: torch.Tensor, u: torch.Tensor, dt: float

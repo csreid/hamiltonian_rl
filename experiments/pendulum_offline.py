@@ -2686,6 +2686,12 @@ def phase1_cmd(**kwargs):
               show_default=True,
               help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
                    "separable H) or 'rk4' (classic 4-stage, works for any structure)")
+@click.option("--active-phase-dims", type=int, default=None,
+              help="Ablation: restrict H/R to the first K canonical (q_i, p_i) pairs of the "
+                   "post-flow phase space as input; the remaining q_dim - K pairs are masked "
+                   "out of every physics-parameter computation and hard-frozen to a constant "
+                   "value each step (exact constants of motion), instead of contributing to "
+                   "the learned dynamics. Default (unset) leaves every dim active.")
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=8, show_default=True)
@@ -2890,6 +2896,7 @@ def phase2_cmd(**kwargs):
         integrator=kwargs["integrator"],
         quadratic_t=kwargs["quadratic_t"],
         state_dep_r=kwargs["state_dep_r"],
+        active_phase_dims=kwargs["active_phase_dims"],
     ).to(device)
     print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
 
