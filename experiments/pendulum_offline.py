@@ -1155,6 +1155,91 @@ def _log_latent_scatter_phase1(
 
 
 @torch.no_grad()
+def _log_half_latent_probes_phase1(
+    model: TemporalAutoencoder,
+    val_traj_sets: list,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    tag: str = "val/half_latent_probe",
+) -> None:
+    """Fresh linear probes of h_q and h_p separately onto (position, velocity).
+
+    Phase 1's split hypothesis: h_q = h[:, :q_dim] is decoded to the *current*
+    frame via f_psi, while the full h is decoded to the *next* frame, so h_p
+    should only need to carry velocity. Unlike `_log_latent_scatter_phase1`
+    (which probes f_psi(h_q), the learned decoder path), this fits its own
+    lstsq probes directly on raw h_q and raw h_p, each against ground-truth
+    (cos θ, sin θ, θ̇), and lays the four resulting panels out as a 2x2 grid:
+    row = which latent half is probed, column = which physical quantity is
+    the target. If the hypothesis holds, only the h_q→position and h_p→
+    velocity panels should show high R²; the off-diagonal panels are the
+    interesting failure mode to watch.
+    """
+    model.eval()
+    per_policy_hq, per_policy_hp, per_policy_st = {}, {}, {}
+    for val_trajs, label in val_traj_sets:
+        all_hq, all_hp, all_st = [], [], []
+        for frames, actions, states in val_trajs:
+            ctx = frames.unsqueeze(0).to(device)
+            mu_all, _ = model.encoder.forward_all(ctx)
+            mu_all = mu_all.squeeze(0).cpu()
+            all_hq.append(mu_all[:, :model.q_dim])
+            all_hp.append(mu_all[:, model.q_dim:])
+            all_st.append(states.float())
+        per_policy_hq[label] = all_hq
+        per_policy_hp[label] = all_hp
+        per_policy_st[label] = all_st
+
+    # Same even/odd trajectory split as `_log_latent_scatter_phase1`.
+    train_hq = torch.cat([h for hs in per_policy_hq.values() for h in hs[0::2]], dim=0)
+    train_hp = torch.cat([h for hs in per_policy_hp.values() for h in hs[0::2]], dim=0)
+    train_st = torch.cat([s for ss in per_policy_st.values() for s in ss[0::2]], dim=0)
+    A_q = torch.linalg.lstsq(train_hq, train_st).solution
+    A_p = torch.linalg.lstsq(train_hp, train_st).solution
+
+    val_pred_q, val_pred_p, val_true = {}, {}, {}
+    for label in per_policy_hq:
+        val_hq = torch.cat(per_policy_hq[label][1::2], dim=0)
+        val_hp = torch.cat(per_policy_hp[label][1::2], dim=0)
+        val_st = torch.cat(per_policy_st[label][1::2], dim=0)
+        val_pred_q[label] = (val_hq @ A_q).numpy()
+        val_pred_p[label] = (val_hp @ A_p).numpy()
+        val_true[label] = val_st.numpy()
+
+    colors = plt.get_cmap("tab10").colors
+    groups = [("q (cos θ, sin θ)", [0, 1]), ("p (θ̇)", [2])]
+    halves = [("first half h_q", val_pred_q), ("second half h_p", val_pred_p)]
+
+    fig, axes = plt.subplots(2, 2, figsize=(9, 8))
+    for row, (half_name, val_pred) in enumerate(halves):
+        for col, (group_name, idxs) in enumerate(groups):
+            ax = axes[row, col]
+            all_true_g, all_pred_g = [], []
+            for j, label in enumerate(val_pred):
+                true_g = val_true[label][:, idxs].reshape(-1)
+                pred_g = val_pred[label][:, idxs].reshape(-1)
+                ax.scatter(true_g, pred_g, s=2, alpha=0.3, color=colors[j % len(colors)], label=label, linewidths=0)
+                all_true_g.append(true_g)
+                all_pred_g.append(pred_g)
+            true_g = np.concatenate(all_true_g)
+            pred_g = np.concatenate(all_pred_g)
+            lo, hi = min(true_g.min(), pred_g.min()), max(true_g.max(), pred_g.max())
+            ax.plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
+            ss_res = ((true_g - pred_g) ** 2).sum()
+            ss_tot = ((true_g - true_g.mean()) ** 2).sum()
+            r2 = 1 - ss_res / (ss_tot + 1e-8)
+            ax.set_xlabel("True")
+            ax.set_ylabel("Predicted")
+            ax.set_title(f"{half_name} → {group_name}  R²={r2:.3f}")
+    axes[0, 0].legend(markerscale=4, fontsize=8)
+    fig.suptitle(f"Half-latent → (q, p) linear probes, held-out trajectories (epoch {epoch + 1})")
+    fig.tight_layout()
+    writer.add_figure(tag, fig, epoch)
+    plt.close(fig)
+
+
+@torch.no_grad()
 def _log_h_state_regression_coeffs_phase1(
     model: TemporalAutoencoder,
     val_trajs: list,
@@ -2596,6 +2681,10 @@ def phase1_cmd(**kwargs):
             scatter_sets = [(vt, label) for vt, label in policy_val_trajs if len(vt) >= 2]
             if scatter_sets:
                 _log_latent_scatter_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+                _log_half_latent_probes_phase1(
                     model=model, val_traj_sets=scatter_sets,
                     device=device, writer=writer, epoch=epoch,
                 )
