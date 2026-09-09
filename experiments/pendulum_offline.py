@@ -2465,6 +2465,8 @@ def cli():
                    ">= --max-steps")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
+@click.option("--drag", type=float, default=_DRAG_COEFF, show_default=True,
+              help="Quadratic (Rayleigh) drag coefficient")
 @click.option("--zero-action", is_flag=True, default=False, show_default=True,
               help="Diagnostic: collect training rollouts with a constant 0 "
                    "torque instead of uniform-random actions, degenerating "
@@ -2569,6 +2571,7 @@ def phase1_cmd(**kwargs):
         rollout_len=rollout_len,
         img_size=kwargs["img_size"],
         damping=kwargs["damping"],
+        drag=kwargs["drag"],
         zero_action=kwargs["zero_action"],
     )
 
@@ -2644,7 +2647,7 @@ def phase1_cmd(**kwargs):
     # Phase 2 and the dashboard can reproduce matching data.
     data_config = {k: kwargs[k] for k in (
         "n_windows", "n_samples", "img_size", "energy_k",
-        "max_steps", "damping",
+        "max_steps", "damping", "drag",
     )}
     data_config["rollout_len"] = rollout_len
     world_model = WorldModel(model, dynamics=None, data_config=data_config)
