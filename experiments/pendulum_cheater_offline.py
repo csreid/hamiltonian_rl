@@ -58,6 +58,7 @@ from data.pendulum import (
     _DRAG_COEFF,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
+from hamilton_rl.cli_config import config_option
 from hamilton_rl.models import HamiltonianFlowModel, WorldModel
 from experiments.pendulum_offline import (
     _collect_energy_grid_episodes,
@@ -359,6 +360,7 @@ def _save_bridge(run_dir: Path, stem: str, bridge: PhaseSpaceBridge, hidden_dim:
 
 
 @click.command()
+@config_option
 @click.option("--phase1-run", type=str, required=True,
               help="Path to a Phase 1 run directory (models/pendulum_offline_phase1/<run>); "
                    "loads best.pt (falling back to final.pt) and rollout_cache.pt")

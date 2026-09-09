@@ -58,6 +58,7 @@ from experiments.pendulum_offline import (  # noqa: E402
     _log_hparams_text,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir  # noqa: E402
+from hamilton_rl.cli_config import config_option  # noqa: E402
 from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldModel  # noqa: E402
 
 
@@ -285,6 +286,7 @@ def cli():
 
 
 @cli.command("phase1")
+@config_option
 @click.option("--resume-from", type=str, default=None,
               help="Path to a checkpoint (.pt) whose autoencoder weights to warm-start from")
 # data
@@ -606,6 +608,7 @@ def _eval_loss_phase2(
 
 
 @cli.command("phase2")
+@config_option
 @click.option("--phase1-run", type=str, required=True,
               help="Run dir from phase1 (models/point_mass_offline_phase1/<timestamp>)")
 @click.option("--separable/--no-separable", default=True, show_default=True)
@@ -834,6 +837,7 @@ def _train_epoch_phase3(
 
 
 @cli.command("phase3")
+@config_option
 @click.option("--phase2-run", type=str, required=True)
 @click.option("--phase1-run", type=str, required=True, help="Run dir holding rollout_cache.pt")
 @click.option("--epochs", type=int, default=1000, show_default=True)

@@ -102,6 +102,7 @@ from data.pendulum import (
     _MAX_SPEED,
 )
 from hamilton_rl.checkpoint import load_world_model, make_run_dir
+from hamilton_rl.cli_config import config_option
 from hamilton_rl.models import HamiltonianFlowModel, TemporalAutoencoder, WorldModel
 
 
@@ -2443,6 +2444,7 @@ def cli():
 
 
 @cli.command("phase1")
+@config_option
 @click.option("--resume-from", type=str, default=None,
               help="Path to a checkpoint (.pt) whose autoencoder weights to warm-start "
                    "from; training still writes to a fresh run dir, and the optimizer "
@@ -2796,6 +2798,7 @@ def phase1_cmd(**kwargs):
 
 
 @cli.command("phase2")
+@config_option
 # input — architecture + data params are loaded from the Phase 1 checkpoint
 @click.option("--phase1-run", type=str, required=True,
               help="Path to a Phase 1 run directory; loads best.pt (arch/data config + "
@@ -3252,6 +3255,7 @@ def phase2_cmd(**kwargs):
 
 
 @cli.command("phase3")
+@config_option
 # input — everything (arch, data params, both sets of weights) comes from the
 # Phase 2 checkpoint; the rollout cache is found via the Phase 1 run recorded
 # in its hparams

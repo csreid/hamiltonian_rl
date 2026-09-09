@@ -39,6 +39,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hamilton_rl.checkpoint import make_run_dir, save_projected_model
+from hamilton_rl.cli_config import config_option
 from hamilton_rl.models import HamiltonianFlowModel
 from data.pendulum import (
     _DRAG_COEFF,
@@ -461,6 +462,7 @@ def _plot_dissipation_landscape(
 
 
 @click.command()
+@config_option
 # data
 @click.option("--n-episodes", type=int, default=200, show_default=True)
 @click.option("--epsilon", type=float, default=0.1, show_default=True,

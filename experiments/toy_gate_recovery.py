@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hamilton_rl.cli_config import config_option
 from hamilton_rl.models import HardConcreteGate
 
 
@@ -209,6 +210,7 @@ def main_impl(
 
 
 @click.command()
+@config_option
 @click.option("--true-dim", type=int, default=3, show_default=True)
 @click.option("--observed-dim", type=int, default=64, show_default=True)
 @click.option("--latent-dim", type=int, default=16, show_default=True)

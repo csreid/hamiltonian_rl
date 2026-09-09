@@ -44,6 +44,7 @@ from data.pendulum import (
     collect_zero_trajectories,
 )
 from hamilton_rl.checkpoint import load_world_model
+from hamilton_rl.cli_config import config_option
 
 _POLICIES = {
     "random": collect_random_trajectories,
@@ -225,6 +226,7 @@ def main_impl(
 
 
 @click.command()
+@config_option
 @click.option("--checkpoint", required=True, help="Path to a Phase 1 (or full) world-model checkpoint.pt")
 @click.option("--episodes-per-policy", type=int, default=40, show_default=True,
               help="Episodes collected per policy (random/spin/energy/zero)")

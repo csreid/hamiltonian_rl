@@ -41,6 +41,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hamilton_rl.checkpoint import load_world_model
+from hamilton_rl.cli_config import config_option
 from data.pendulum import (
     collect_random_trajectories,
     collect_spin_trajectories,
@@ -168,6 +169,7 @@ def run(
 
 
 @click.command()
+@config_option
 @click.option("--phase2-checkpoint", required=True, type=str,
               help="Path to a Phase 2/3 world-model checkpoint (.pt) with dynamics filled in.")
 @click.option("--n-val", default=20, show_default=True, help="Episodes per policy type.")

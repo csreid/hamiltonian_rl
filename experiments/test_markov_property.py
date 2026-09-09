@@ -40,6 +40,7 @@ from data.pendulum import (
     collect_val_trajectories,
 )
 from hamilton_rl.checkpoint import load_world_model
+from hamilton_rl.cli_config import config_option
 
 _POLICIES = {
     "random": collect_random_trajectories,
@@ -132,6 +133,7 @@ def main_impl(
 
 
 @click.command()
+@config_option
 @click.option("--checkpoint", required=True, help="Path to a Phase 1 (or full) world-model checkpoint.pt")
 @click.option("--policy", type=click.Choice(sorted(_POLICIES)), default="random", show_default=True)
 @click.option("--max-steps", type=int, default=200, show_default=True)

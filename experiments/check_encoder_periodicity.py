@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pendulum_offline import _DRAG_COEFF, _collect_energy_grid_episodes, _collect_grid_qp_samples
 from hamilton_rl.checkpoint import load_world_model
+from hamilton_rl.cli_config import config_option
 
 
 def _pca_2d(x: np.ndarray) -> np.ndarray:
@@ -173,6 +174,7 @@ def run(
 
 
 @click.command()
+@config_option
 @click.option("--phase2-checkpoint", required=True, type=str,
               help="Path to a Phase 2/3 world-model checkpoint (.pt) with dynamics filled in.")
 @click.option("--resolution", default=20, show_default=True,
