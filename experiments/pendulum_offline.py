@@ -478,8 +478,11 @@ def _plot_gradient_magnitude_landscape(
     min_vel: float = -_LANDSCAPE_VEL_CLIP,
     max_vel: float = _LANDSCAPE_VEL_CLIP,
     device: torch.device | None = None,
-) -> plt.Figure:
+) -> tuple[plt.Figure, float]:
     """Compare ‖∇H_true‖ against ‖∇H_learned‖ on the same phase-space grid.
+
+    Returns the figure and the Pearson r between true and learned gradient
+    magnitude at the measured points (so callers can log R² = r**2).
 
     Unlike H itself, ∇H is exactly what the dynamics consume — it is what's
     actually being fit by the prediction losses (and, since it is squared
@@ -584,7 +587,7 @@ def _plot_gradient_magnitude_landscape(
     fig.suptitle(f"‖∇H_true‖ vs. ‖∇H_learned‖, Pearson r={r:.3f}")
     fig.tight_layout()
 
-    return fig
+    return fig, r
 
 # ---------------------------------------------------------------------------
 # Phase 1: autoencoder training
@@ -3171,10 +3174,11 @@ def phase2_cmd(**kwargs):
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
             writer.add_scalar("val/energy_landscape_r2", energy_r ** 2, epoch)
             plt.close(energy_fig)
-            grad_mag_fig = _plot_gradient_magnitude_landscape(
+            grad_mag_fig, grad_mag_r = _plot_gradient_magnitude_landscape(
                 world_model, energy_grid_episodes, device=device,
             )
             writer.add_figure("val/gradient_magnitude_landscape", grad_mag_fig, epoch)
+            writer.add_scalar("val/gradient_magnitude_landscape_r2", grad_mag_r ** 2, epoch)
             plt.close(grad_mag_fig)
             if dyn_model._has_dissipation:
                 dissipation_fig = _plot_dissipation_landscape(
@@ -3617,10 +3621,11 @@ def phase3_cmd(**kwargs):
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
             writer.add_scalar("val/energy_landscape_r2", energy_r ** 2, epoch)
             plt.close(energy_fig)
-            grad_mag_fig = _plot_gradient_magnitude_landscape(
+            grad_mag_fig, grad_mag_r = _plot_gradient_magnitude_landscape(
                 world_model, energy_grid_episodes, device=device,
             )
             writer.add_figure("val/gradient_magnitude_landscape", grad_mag_fig, epoch)
+            writer.add_scalar("val/gradient_magnitude_landscape_r2", grad_mag_r ** 2, epoch)
             plt.close(grad_mag_fig)
             if dyn_model._has_dissipation:
                 dissipation_fig = _plot_dissipation_landscape(

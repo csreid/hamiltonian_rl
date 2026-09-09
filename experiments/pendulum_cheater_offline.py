@@ -627,10 +627,11 @@ def main(**kwargs):
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
             writer.add_scalar("val/energy_landscape_r2", energy_r ** 2, epoch)
             plt.close(energy_fig)
-            grad_mag_fig = _plot_gradient_magnitude_landscape(
+            grad_mag_fig, grad_mag_r = _plot_gradient_magnitude_landscape(
                 world_model, energy_grid_episodes, device=device,
             )
             writer.add_figure("val/gradient_magnitude_landscape", grad_mag_fig, epoch)
+            writer.add_scalar("val/gradient_magnitude_landscape_r2", grad_mag_r ** 2, epoch)
             plt.close(grad_mag_fig)
             if dyn_model._has_dissipation:
                 dissipation_fig = _plot_dissipation_landscape(
