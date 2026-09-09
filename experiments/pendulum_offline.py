@@ -2459,6 +2459,13 @@ def cli():
                    ">= --max-steps")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
+@click.option("--zero-action", is_flag=True, default=False, show_default=True,
+              help="Diagnostic: collect training rollouts with a constant 0 "
+                   "torque instead of uniform-random actions, degenerating "
+                   "to the uncontrolled pendulum. This makes Phase 2's B "
+                   "matrix unidentifiable (no action variation to learn it "
+                   "from) but isolates whether the learned energy landscape "
+                   "is clean without an actuation term.")
 # model architecture
 @click.option("--pos-ch", type=int, default=8, show_default=True)
 @click.option("--feat-dim", type=int, default=256, show_default=True)
@@ -2556,6 +2563,7 @@ def phase1_cmd(**kwargs):
         rollout_len=rollout_len,
         img_size=kwargs["img_size"],
         damping=kwargs["damping"],
+        zero_action=kwargs["zero_action"],
     )
 
     # Save the raw rollouts (frames, actions, ground-truth state) right away —

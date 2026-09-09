@@ -589,6 +589,7 @@ def collect_seeded_random_rollouts(
     img_size: int,
     damping: float = 0.0,
     drag: float = _DRAG_COEFF,
+    zero_action: bool = False,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """Many short, purely-random-action rollouts seeded across phase space.
 
@@ -601,6 +602,13 @@ def collect_seeded_random_rollouts(
     uniform-random policy — no scripted phases, no dithering needed (dithering
     existed only to break the old MPPI-balance policy's state->action
     collinearity; a random policy has none).
+
+    ``zero_action=True`` replaces the uniform-random torque with a constant 0
+    — the uncontrolled pendulum. This degrades Phase 2's B-matrix fit (there's
+    no action variation to identify it from) but is useful as a diagnostic:
+    it isolates whether the learned energy landscape is clean when dynamics
+    are the pendulum's pure conservative/dissipative physics, with no
+    actuation term to potentially confound H.
 
     Returns a list of ``n_seeds`` (frames, actions, states) tuples, each with
     the same per-tuple shapes as ``_collect_episodes``:
@@ -622,7 +630,7 @@ def collect_seeded_random_rollouts(
             states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
 
             for _ in range(rollout_len):
-                action = float(np.random.uniform(-2.0, 2.0))
+                action = 0.0 if zero_action else float(np.random.uniform(-2.0, 2.0))
                 obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
                 theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
                 frames.append(torch.from_numpy(obs).float() / 255.0)
