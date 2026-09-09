@@ -621,10 +621,11 @@ def main(**kwargs):
             # phase1 encoder + phi (H/R evaluated on grid episodes' encoded
             # points) — no dependency on the cheat/rollout losses, so these
             # stay on even under --skip-foreplay.
-            energy_fig = _plot_learned_energy_landscape(
+            energy_fig, energy_r = _plot_learned_energy_landscape(
                 world_model, energy_grid_episodes, device=device,
             )
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
+            writer.add_scalar("val/energy_landscape_r2", energy_r ** 2, epoch)
             plt.close(energy_fig)
             grad_mag_fig = _plot_gradient_magnitude_landscape(
                 world_model, energy_grid_episodes, device=device,

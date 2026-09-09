@@ -358,8 +358,11 @@ def _plot_learned_energy_landscape(
     min_vel: float = -_LANDSCAPE_VEL_CLIP,
     max_vel: float = _LANDSCAPE_VEL_CLIP,
     device: torch.device | None = None,
-) -> plt.Figure:
+) -> tuple[plt.Figure, float]:
     """Compare learned H(q, p) against true pendulum energy on a phase-space grid.
+
+    Returns the figure and the Pearson r between true and learned H at the
+    measured points (so callers can log R² = r**2 to track it over training).
 
     Four panels, 2x2:
       1. Ground truth: the true energy, swept densely from its closed form
@@ -465,7 +468,7 @@ def _plot_learned_energy_landscape(
     fig.suptitle(f"True energy vs. learned H, Pearson r={r:.3f}")
     fig.tight_layout()
 
-    return fig
+    return fig, r
 
 
 def _plot_gradient_magnitude_landscape(
@@ -3162,10 +3165,11 @@ def phase2_cmd(**kwargs):
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
             _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
-            energy_fig = _plot_learned_energy_landscape(
+            energy_fig, energy_r = _plot_learned_energy_landscape(
                 world_model, energy_grid_episodes, device=device,
             )
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
+            writer.add_scalar("val/energy_landscape_r2", energy_r ** 2, epoch)
             plt.close(energy_fig)
             grad_mag_fig = _plot_gradient_magnitude_landscape(
                 world_model, energy_grid_episodes, device=device,
@@ -3607,10 +3611,11 @@ def phase3_cmd(**kwargs):
             # the learned physics for pixel accuracy, and these are how you see
             # it happening (energy-landscape r, dissipation r, R structure).
             _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
-            energy_fig = _plot_learned_energy_landscape(
+            energy_fig, energy_r = _plot_learned_energy_landscape(
                 world_model, energy_grid_episodes, device=device,
             )
             writer.add_figure("val/energy_landscape", energy_fig, epoch)
+            writer.add_scalar("val/energy_landscape_r2", energy_r ** 2, epoch)
             plt.close(energy_fig)
             grad_mag_fig = _plot_gradient_magnitude_landscape(
                 world_model, energy_grid_episodes, device=device,
