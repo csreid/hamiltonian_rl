@@ -602,6 +602,7 @@ def _train_epoch_phase1(
     gate_weight: float = 0.0,
     max_context_len: int = 0,
     deterministic: bool = False,
+    time_reversal_weight: float = 0.0,
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
 
@@ -614,9 +615,22 @@ def _train_epoch_phase1(
     (non-probabilistic) autoencoder latent. logvar_head is still computed by
     the encoder (unused) so model architecture/checkpoints stay identical
     either way — only the training-time treatment of h changes.
+
+    time_reversal_weight > 0 adds a data-augmentation pass: the frame
+    sequence is re-encoded in reverse order, giving the causal LSTM an
+    entirely different history at each step. Under time reversal a physical
+    trajectory's position is unchanged but its momentum flips sign
+    (q(-t)=q(t), p(-t)=-p(t)), so the reversed encoding's q-half is trained
+    to match the (time-flipped) forward-pass q, and its p-half to match the
+    negated (time-flipped) forward-pass p — reinforcing the q/p split
+    without needing a separate physics label. The reversed encoding is also
+    run through the current-frame decoder (against the reversed frames), but
+    deliberately *not* through next_frame_decoder: "next frame" under a
+    reversed action sequence isn't a real physical transition (the actions
+    weren't negated to match), so that signal would be wrong.
     """
     model.train()
-    total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_gate = total_loss = 0.0
+    total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_gate = total_time_reversal = total_loss = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
@@ -664,6 +678,32 @@ def _train_epoch_phase1(
             kl = _kl(mu_all, logvar_all)
 
         loss = recon + recon_next + kl_weight * kl
+
+        # Time-reversal augmentation: re-encode the frames in reverse order
+        # and require q to match the (time-flipped) forward q and p to match
+        # its negation. See the docstring above for why next_frame_decoder is
+        # excluded.
+        if time_reversal_weight > 0:
+            frames_rev = frames.flip(dims=[1])
+            mu_rev_all, logvar_rev_all = model.encoder.forward_all(frames_rev)
+            if deterministic:
+                z_rev_all = mu_rev_all
+            else:
+                logvar_rev_all = logvar_rev_all.clamp(-10, 2)
+                z_rev_all = mu_rev_all + torch.randn_like(mu_rev_all) * (0.5 * logvar_rev_all).exp()
+
+            pred_curr_rev = _decode(z_rev_all, B_size, T_full + 1)
+            recon_rev = F.mse_loss(pred_curr_rev, frames_rev)
+
+            target_q = mu_all[:, :, :q_dim].flip(dims=[1]).detach()
+            target_p = -mu_all[:, :, q_dim:].flip(dims=[1]).detach()
+            time_reversal_consistency = (
+                F.mse_loss(mu_rev_all[:, :, :q_dim], target_q)
+                + F.mse_loss(mu_rev_all[:, :, q_dim:], target_p)
+            )
+            time_reversal = recon_rev + time_reversal_consistency
+            loss = loss + time_reversal_weight * time_reversal
+            total_time_reversal = total_time_reversal + time_reversal.detach()
 
         # Sparsity regulariser: L1 on the latent mean pushes irrelevant
         # dimensions to exactly 0 (unlike the KL term, which only pulls
@@ -721,6 +761,7 @@ def _train_epoch_phase1(
         "phase1/temporal_reg": float(total_temporal) / n,
         "phase1/sparsity": float(total_sparsity) / n,
         "phase1/gate_l0": float(total_gate) / n,
+        "phase1/time_reversal": float(total_time_reversal) / n,
         "phase1/effective_dim": (
             model.encoder.gate.effective_dim() if model.encoder.gate is not None else float("nan")
         ),
@@ -2450,6 +2491,10 @@ def cli():
               help="Expected h-space distance per timestep")
 @click.option("--sparsity-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on latent mean, pushes irrelevant dims to 0 (0 to disable)")
+@click.option("--time-reversal-weight", type=float, default=0.0, show_default=True,
+              help="Weight on the time-reversal augmentation: re-encode frames "
+                   "in reverse order and require q unchanged / p negated "
+                   "relative to the forward encoding (0 to disable)")
 @click.option("--use-gate", is_flag=True, default=False, show_default=True,
               help="Replace/augment L1 sparsity with a learned per-dim L0 "
                    "hard-concrete gate on the latent mean")
@@ -2617,6 +2662,7 @@ def phase1_cmd(**kwargs):
             gate_weight=gate_weight_epoch,
             max_context_len=kwargs["max_context_len"],
             deterministic=kwargs["deterministic"],
+            time_reversal_weight=kwargs["time_reversal_weight"],
         )
         metrics["phase1/gate_weight_effective"] = gate_weight_epoch
 
