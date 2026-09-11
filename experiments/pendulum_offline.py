@@ -1,4 +1,21 @@
-"""Offline Pendulum world-model training — three-phase regimen.
+"""Offline Pendulum world-model training — three-phase regimen, plus a
+single-run joint alternative (joint subcommand).
+
+Joint (joint subcommand):
+    Trains the autoencoder (encoder + f_psi + decoder) and the Hamiltonian
+    dynamics model (Phi + H + J/R/B) together from scratch, on the same
+    encoded window each batch, instead of staging them into three separate
+    runs. The dynamics loss weight ramps linearly from
+    --dynamics-weight-start to --dynamics-weight-end over
+    --dynamics-curriculum-epochs epochs (see
+    _train_epoch_joint), so early training looks like Phase 1's pure
+    reconstruction and the dynamics loss's pull on the encoder grows over
+    the course of training — instead of Phase 2 having to recover
+    phase-space structure from a latent that was frozen before it ever had
+    to support Hamiltonian dynamics. Unlike Phase 3, it has no anti-collapse
+    guards (stop-grad targets, a separate reconstruction anchor weight); the
+    always-on reconstruction loss is the only thing keeping h from
+    collapsing, so a slow dynamics-weight ramp matters more here.
 
 Phase 1 (phase1 subcommand):
     Train the LSTM autoencoder (encoder + f_psi + decoder) for reconstruction.
@@ -1567,6 +1584,190 @@ def _log_cnn_feature_fold_probe_phase1(
 # ---------------------------------------------------------------------------
 # Episode cache (between phases)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Joint: curriculum-blended autoencoder + dynamics training
+# ---------------------------------------------------------------------------
+
+
+def _train_epoch_joint(
+    world_model: WorldModel,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    dynamics_weight: float,
+    kl_weight: float,
+    free_bits: float,
+    grad_clip: float,
+    device: torch.device,
+    seq_len: int,
+    seed_ctx_len: int,
+    logdet_weight: float,
+    teacher_force_weight: float = 1.0,
+    closed_loop_weight: float = 1.0,
+    closed_loop_gamma: float = 1.0,
+    deterministic: bool = False,
+) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
+    """One epoch of blended autoencoder + Hamiltonian-dynamics training.
+
+    Unlike the staged phase1 -> phase2 -> phase3 pipeline, the encoder and
+    the dynamics model (phi, H, J/R/B) are trained together from the start,
+    on the *same* encoded window each batch (one encoder forward pass feeds
+    both the reconstruction and the dynamics losses, rather than Phase 2
+    re-encoding a frozen Phase 1 encoder's output later). `dynamics_weight`
+    is a scalar the caller ramps linearly over epochs (see joint_cmd), so
+    early epochs look like pure reconstruction training and the dynamics
+    loss's pull on the encoder grows over the course of training instead of
+    only appearing after the encoder is frozen and re-purposed post hoc.
+
+    Reconstruction (current-frame + next-frame decoding, KL) is computed
+    over the whole loaded window, exactly as in Phase 1. Dynamics
+    (teacher-forced + closed-loop, over a [seed_ctx_len, seed_ctx_len +
+    seq_len) sub-window with a curriculum on seq_len) mirrors Phase 2, but
+    reuses the same mu_all this batch already computed instead of a second
+    encoder pass. The closed-loop seed uses h = mu (not the sampled z), so
+    the dynamics loss isn't also fighting VAE reparameterization noise.
+
+    No anti-collapse guards (stop-grad targets, a separate reconstruction
+    anchor weight) — the always-on reconstruction loss above is the only
+    thing keeping h from collapsing under the dynamics loss's pressure, so
+    the dynamics_weight ramp needs to be slow enough that reconstruction has
+    already gotten traction before dynamics pressure grows large.
+    """
+    model, dyn_model = world_model.autoencoder, world_model.dynamics
+    model.train()
+    dyn_model.train()
+    q_dim = model.latent_dim // 2
+    ctx = seed_ctx_len
+
+    total_recon = total_recon_next = total_kl = 0.0
+    total_tf = total_cl = total_logdet_reg = total_dynamics = total_loss = 0.0
+    total_q_var = total_p_var = None
+
+    for frames, actions, _ in loader:
+        frames = frames.to(device)    # (B, T_full+1, C, H, W)
+        actions = actions.to(device)  # (B, T_full)
+        B_size, T1 = frames.shape[:2]
+        T_full = T1 - 1
+
+        mu_all, logvar_all = model.encoder.forward_all(frames)  # (B, T1, D)
+        D = mu_all.shape[-1]
+
+        if deterministic:
+            z_all = mu_all
+            kl = torch.zeros((), device=device)
+        else:
+            logvar_all = logvar_all.clamp(-10, 2)
+            z_all = mu_all + torch.randn_like(mu_all) * (0.5 * logvar_all).exp()
+            kl = (
+                (-0.5 * (1 + logvar_all - mu_all.pow(2) - logvar_all.exp()))
+                .clamp(min=free_bits)
+                .sum(dim=-1)
+                .mean()
+            )
+
+        # --- Reconstruction (Phase-1 style), over the full window ---
+        s_all = model.f_psi(z_all.reshape(B_size * T1, -1)[:, :q_dim])
+        pred_curr = model.decoder(s_all).reshape(B_size, T1, *frames.shape[2:])
+        recon = F.mse_loss(pred_curr, frames)
+
+        h_curr = z_all[:, :-1].reshape(B_size * T_full, -1)
+        a_curr = actions.reshape(B_size * T_full, 1)
+        pred_next = model.next_frame_decoder(h_curr, a_curr).reshape(
+            B_size, T_full, *frames.shape[2:]
+        )
+        recon_next = F.mse_loss(pred_next, frames[:, 1:])
+
+        loss = recon + recon_next + kl_weight * kl
+
+        # --- Dynamics (Phase-2 style), on a sub-window of this batch's own
+        # encoding (h = mu_all, not the sampled z) ---
+        W = min(ctx + seq_len, T1)
+        max_s = T1 - W
+        s = int(torch.randint(0, max_s + 1, (1,)).item()) if max_s > 0 else 0
+        h_win = mu_all[:, s:s + W]
+        actions_win = actions[:, s:s + W - 1]
+
+        q_flat, p_flat, log_det_flat = dyn_model.encode_with_logdet(
+            h_win.reshape(B_size * W, D)
+        )
+        q_win = q_flat.reshape(B_size, W, q_dim)
+        p_win = p_flat.reshape(B_size, W, q_dim)
+        log_det_win = log_det_flat.reshape(B_size, W)
+        logdet_reg = logdet_weight * log_det_win.pow(2).mean()
+
+        T_tf = W - 1
+        q_tf = q_win[:, :T_tf].reshape(B_size * T_tf, q_dim)
+        p_tf = p_win[:, :T_tf].reshape(B_size * T_tf, q_dim)
+        a_tf = actions_win.reshape(B_size * T_tf, 1)
+        q_tf_next, p_tf_next = dyn_model.controlled_step(q_tf, p_tf, a_tf)
+        h_tf_pred = dyn_model.decode(q_tf_next, p_tf_next)
+        h_tf_target = h_win[:, 1:].reshape(B_size * T_tf, D)
+        tf_loss = F.mse_loss(h_tf_pred, h_tf_target)
+
+        k = ctx - 1
+        T = W - ctx
+        q, p = q_win[:, k], p_win[:, k]
+        q_k_log, p_k_log = q.detach(), p.detach()
+        if T > 0:
+            qs_steps, ps_steps = [], []
+            for t in range(T):
+                q, p = dyn_model.controlled_step(q, p, actions_win[:, k + t:k + t + 1])
+                qs_steps.append(q)
+                ps_steps.append(p)
+            q_traj = torch.stack(qs_steps, dim=1)  # (B, T, q_dim)
+            p_traj = torch.stack(ps_steps, dim=1)
+            h_cl_pred = dyn_model.decode(
+                q_traj.reshape(B_size * T, q_dim), p_traj.reshape(B_size * T, q_dim)
+            ).reshape(B_size, T, D)
+            h_cl_target = h_win[:, k + 1:k + 1 + T]
+            per_step_loss = (h_cl_pred - h_cl_target).pow(2).mean(dim=(0, 2))
+            step_weights = closed_loop_gamma ** torch.arange(T, device=device, dtype=per_step_loss.dtype)
+            cl_loss = (per_step_loss * step_weights).sum() / step_weights.sum()
+        else:
+            q_traj, p_traj = q_k_log.unsqueeze(1), p_k_log.unsqueeze(1)
+            cl_loss = torch.zeros((), device=device)
+
+        dynamics_loss = logdet_reg + teacher_force_weight * tf_loss + closed_loop_weight * cl_loss
+        loss = loss + dynamics_weight * dynamics_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(dyn_model.parameters()), grad_clip
+            )
+        optimizer.step()
+
+        total_recon = total_recon + recon.detach()
+        total_recon_next = total_recon_next + recon_next.detach()
+        total_kl = total_kl + kl.detach()
+        total_tf = total_tf + tf_loss.detach()
+        total_cl = total_cl + cl_loss.detach()
+        total_logdet_reg = total_logdet_reg + log_det_win.detach().pow(2).mean()
+        total_dynamics = total_dynamics + dynamics_loss.detach()
+        total_loss = total_loss + loss.detach()
+        with torch.no_grad():
+            q_var, p_var = _log_latent_variance(
+                torch.cat([q_k_log.unsqueeze(1), q_traj], dim=1) if T > 0 else q_k_log.unsqueeze(1),
+                torch.cat([p_k_log.unsqueeze(1), p_traj], dim=1) if T > 0 else p_k_log.unsqueeze(1),
+            )
+            total_q_var = q_var if total_q_var is None else total_q_var + q_var
+            total_p_var = p_var if total_p_var is None else total_p_var + p_var
+
+    n = len(loader)
+    metrics = {
+        "joint/loss": float(total_loss) / n,
+        "joint/recon": float(total_recon) / n,
+        "joint/recon_next": float(total_recon_next) / n,
+        "joint/kl": float(total_kl) / n,
+        "joint/dynamics": float(total_dynamics) / n,
+        "joint/tf_loss": float(total_tf) / n,
+        "joint/cl_loss": float(total_cl) / n,
+        "joint/logdet_reg": float(total_logdet_reg) / n,
+        "joint/dynamics_weight": dynamics_weight,
+    }
+    return metrics, total_q_var / n, total_p_var / n
 
 
 # ---------------------------------------------------------------------------
@@ -3711,6 +3912,393 @@ def phase3_cmd(**kwargs):
         ):
             world_model.save(run_dir, "best", hparams, metrics, epoch)
             best_loss = metrics["phase3/loss"]
+
+    world_model.save(run_dir, "final", hparams, metrics, epoch)
+
+    writer.close()
+    print("\nDone. Run: tensorboard --logdir runs")
+    os._exit(0)
+
+
+@cli.command("joint")
+@config_option
+@click.option("--resume-from", type=str, default=None,
+              help="Path to a world-model checkpoint (.pt) to warm-start both the "
+                   "autoencoder and (if present) dynamics weights from; training "
+                   "still writes to a fresh run dir, and the optimizer and epoch "
+                   "count both restart from scratch")
+# data
+@click.option("--n-windows", type=int, default=200, show_default=True,
+              help="Random rollout windows sampled per training epoch")
+@click.option("--img-size", type=int, default=64, show_default=True)
+@click.option("--energy-k", type=float, default=1.0, show_default=True,
+              help="Gain for energy-pumping controller (val episodes only)")
+@click.option("--max-steps", type=int, default=200, show_default=True,
+              help="Steps per training window (val episodes default to 2x this)")
+@click.option("--n-samples", type=int, default=2000, show_default=True,
+              help="Total env-step budget for training data collection, split "
+                   "across many short random rollouts seeded across phase "
+                   "space (see collect_seeded_random_rollouts); "
+                   "n_seeds = n_samples // rollout_len")
+@click.option("--rollout-len", type=int, default=0, show_default=True,
+              help="Steps per seeded rollout (0 = 2x --max-steps); must be "
+                   ">= --max-steps")
+@click.option("--damping", type=float, default=0.0, show_default=True,
+              help="Linear viscous damping coefficient")
+@click.option("--drag", type=float, default=_DRAG_COEFF, show_default=True,
+              help="Quadratic (Rayleigh) drag coefficient")
+# autoencoder architecture
+@click.option("--pos-ch", type=int, default=8, show_default=True)
+@click.option("--feat-dim", type=int, default=256, show_default=True)
+@click.option("--latent-dim", type=int, default=32, show_default=True)
+@click.option("--lstm-layers", type=int, default=1, show_default=True,
+              help="Number of stacked LSTM layers in the encoder (lstm encoder only)")
+@click.option("--encoder-type", type=click.Choice(["lstm", "framestack"]), default="lstm",
+              show_default=True)
+# dynamics architecture
+@click.option("--dt", type=float, default=0.05, show_default=True,
+              help="Integration timestep for the Hamiltonian flow")
+@click.option("--separable/--no-separable", default=True, show_default=True)
+@click.option("--h-source", type=click.Choice(["learned", "canonical"]), default="learned",
+              show_default=True)
+@click.option("--r-source", type=click.Choice(["learned", "fixed_damping", "canonical"]),
+              default="learned", show_default=True)
+@click.option("--b-source", type=click.Choice(["learned", "fixed_ones", "canonical"]),
+              default="learned", show_default=True)
+@click.option("--state-dep-r/--no-state-dep-r", default=False, show_default=True)
+@click.option("--integrator", type=click.Choice(["rk4", "leapfrog"]), default="leapfrog",
+              show_default=True)
+# training
+@click.option("--epochs", type=int, default=3000, show_default=True)
+@click.option("--batch-size", type=int, default=8, show_default=True)
+@click.option("--lr", type=float, default=1e-4, show_default=True)
+@click.option("--structural-lr", type=float, default=1e-2, show_default=True,
+              help="LR for dynamics R/B structural params, separate from --lr")
+@click.option("--grad-clip", type=float, default=1.0, show_default=True)
+@click.option("--kl-weight", type=float, default=1e-3, show_default=True)
+@click.option("--free-bits", type=float, default=0.5, show_default=True)
+@click.option("--deterministic", is_flag=True, default=False, show_default=True,
+              help="Ablation: skip VAE reparameterization/KL entirely and train h "
+                   "as a plain deterministic autoencoder latent")
+@click.option("--logdet-weight", type=float, default=1e-3, show_default=True)
+@click.option("--teacher-force-weight", type=float, default=1.0, show_default=True)
+@click.option("--closed-loop-weight", type=float, default=1.0, show_default=True)
+@click.option("--closed-loop-gamma", type=float, default=1.0, show_default=True)
+@click.option("--seed-ctx-len", type=int, default=3, show_default=True,
+              help="Context frames feeding phi's seed for the closed-loop rollout")
+@click.option("--seq-len-start", type=int, default=5, show_default=True,
+              help="Initial closed-loop rollout length")
+@click.option("--max-seq-len", type=int, default=0, show_default=True,
+              help="Cap on closed-loop rollout length (0 = full window)")
+@click.option("--seq-len-advance-threshold", type=float, default=0.005, show_default=True,
+              help="EMA closed-loop loss below which seq_len advances by 1")
+@click.option("--dynamics-weight-start", type=float, default=0.0, show_default=True,
+              help="Dynamics loss weight at epoch 0")
+@click.option("--dynamics-weight-end", type=float, default=1.0, show_default=True,
+              help="Dynamics loss weight at the end of the curriculum ramp "
+                   "(held constant after)")
+@click.option("--dynamics-curriculum-epochs", type=int, default=500, show_default=True,
+              help="Epochs over which the dynamics loss weight ramps linearly "
+                   "from --dynamics-weight-start to --dynamics-weight-end "
+                   "(0 = jump straight to --dynamics-weight-end from epoch 0)")
+@click.option("--ema-alpha", type=float, default=0.99, show_default=True)
+@click.option("--convergence-patience", type=int, default=0, show_default=True,
+              help="Epochs of stable EMA before stopping; 0 disables")
+@click.option("--convergence-threshold", type=float, default=1e-4, show_default=True)
+# logging
+@click.option("--log-every", type=int, default=5, show_default=True)
+@click.option("--val-every", type=int, default=10, show_default=True,
+              help="Epochs between validation plots (0 to disable)")
+@click.option("--n-val-episodes", type=int, default=-1, show_default=True,
+              help="Val episodes per type (-1 = n_windows // 2)")
+@click.option("--val-max-steps", type=int, default=0, show_default=True,
+              help="Steps per val episode (0 = 2x --max-steps)")
+@click.option("--val-context-frames", type=int, default=5, show_default=True)
+@click.option("--checkpoint-every", type=int, default=10, show_default=True)
+def joint_cmd(**kwargs):
+    """Joint: train the autoencoder and Hamiltonian dynamics together, with a
+    linear curriculum ramping the dynamics loss weight from 0 up to
+    --dynamics-weight over --dynamics-curriculum-epochs epochs.
+
+    Replaces the staged phase1 -> phase2 -> phase3 pipeline with a single
+    run: early epochs are effectively phase-1-style reconstruction (dynamics
+    weight ~0), and dynamics pressure on the encoder grows smoothly instead
+    of being introduced only after the encoder is already frozen (phase 2)
+    or only lightly nudged post hoc (phase 3). See _train_epoch_joint for
+    the per-batch loss.
+    """
+    assert kwargs["img_size"] % 8 == 0
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    print(f"Device: {device}")
+
+    writer = SummaryWriter(comment="_pendulum_offline_joint")
+    run_dir = make_run_dir("pendulum_offline_joint")
+
+    n_val_episodes = kwargs["n_val_episodes"]
+    if n_val_episodes < 0:
+        n_val_episodes = kwargs["n_windows"] // 2
+    n_val = n_val_episodes if kwargs["val_every"] > 0 else 0
+    val_steps = kwargs["val_max_steps"] or kwargs["max_steps"] * 2
+    rollout_len = kwargs["rollout_len"] or kwargs["max_steps"] * 2
+
+    n_seeds = max(1, kwargs["n_samples"] // rollout_len)
+    print(f"\nCollecting {n_seeds} seeded random rollouts of {rollout_len} steps each...")
+    rollouts = collect_seeded_random_rollouts(
+        n_samples=kwargs["n_samples"],
+        rollout_len=rollout_len,
+        img_size=kwargs["img_size"],
+        damping=kwargs["damping"],
+        drag=kwargs["drag"],
+    )
+    rollout_cache_path = run_dir / "rollout_cache.pt"
+    torch.save(rollouts, rollout_cache_path)
+    print(f"Saved rollout cache ({len(rollouts)} rollouts x {rollout_len} steps) to {rollout_cache_path}")
+    _log_training_rollout(rollouts, writer)
+
+    val_energy, val_random, val_spin = [], [], []
+    energy_grid_episodes = []
+    if n_val > 0:
+        print(f"Collecting {n_val} val episodes per type ({val_steps} steps each)...")
+        val_energy = collect_val_trajectories(
+            n_episodes=n_val, img_size=kwargs["img_size"],
+            max_steps=val_steps, energy_k=kwargs["energy_k"], damping=kwargs["damping"],
+        )
+        val_random = collect_random_trajectories(
+            n_episodes=n_val, img_size=kwargs["img_size"],
+            max_steps=val_steps, damping=kwargs["damping"],
+        )
+        val_spin = collect_spin_trajectories(
+            n_episodes=n_val, img_size=kwargs["img_size"],
+            max_steps=val_steps, damping=kwargs["damping"],
+        )
+        print("Collecting grid episodes for energy-landscape logging...")
+        energy_grid_episodes = _collect_energy_grid_episodes(
+            img_size=kwargs["img_size"], damping=kwargs["damping"], drag=kwargs["drag"],
+            context_frames=kwargs["val_context_frames"],
+        )
+
+    coverage_fig = _plot_phase_space_coverage(rollouts)
+    writer.add_figure("data/phase_space_coverage", coverage_fig, 0)
+    plt.close(coverage_fig)
+
+    dataset = PendulumMultiRolloutDataset(
+        rollouts, window_len=kwargs["max_steps"], n_windows=kwargs["n_windows"],
+    )
+    loader = DataLoader(
+        dataset, batch_size=kwargs["batch_size"], shuffle=False,
+        num_workers=0, pin_memory=device.type == "cuda",
+    )
+    print(f"Dataset: {len(dataset)} windows/epoch of {dataset.window_len} steps")
+    train_sample_trajs = [dataset[i] for i in range(min(3, len(dataset)))]
+
+    model = TemporalAutoencoder(
+        latent_dim=kwargs["latent_dim"],
+        feat_dim=kwargs["feat_dim"],
+        pos_ch=kwargs["pos_ch"],
+        img_size=kwargs["img_size"],
+        control_dim=1,
+        num_layers=kwargs["lstm_layers"],
+        encoder_type=kwargs["encoder_type"],
+    ).to(device)
+    dyn_model = HamiltonianFlowModel(
+        latent_dim=kwargs["latent_dim"],
+        control_dim=1,
+        separable=kwargs["separable"],
+        h_source=kwargs["h_source"],
+        r_source=kwargs["r_source"],
+        b_source=kwargs["b_source"],
+        dt=kwargs["dt"],
+        damping=kwargs["damping"],
+        drag=kwargs["drag"],
+        integrator=kwargs["integrator"],
+        state_dep_r=kwargs["state_dep_r"],
+    ).to(device)
+    print(
+        f"Model parameters: autoencoder={sum(p.numel() for p in model.parameters()):,}"
+        f"  dynamics={sum(p.numel() for p in dyn_model.parameters()):,}"
+    )
+
+    if kwargs["resume_from"]:
+        print(f"Resuming weights from {kwargs['resume_from']}...")
+        resume_model = load_world_model(kwargs["resume_from"], device)
+        model.load_state_dict(resume_model.autoencoder.state_dict())
+        if resume_model.dynamics is not None:
+            dyn_model.load_state_dict(resume_model.dynamics.state_dict())
+        del resume_model
+
+    data_config = {k: kwargs[k] for k in (
+        "n_windows", "n_samples", "img_size", "energy_k",
+        "max_steps", "damping", "drag",
+    )}
+    data_config["rollout_len"] = rollout_len
+    world_model = WorldModel(model, dyn_model, data_config=data_config)
+
+    opt_groups = [{
+        "params": (
+            list(model.parameters())
+            + list(dyn_model.phi_q.parameters())
+            + list(dyn_model.phi_p.parameters())
+            + list(dyn_model.hamiltonian.parameters())
+        ),
+        "lr": kwargs["lr"],
+    }]
+    structural_params = dyn_model.structural_parameters()
+    if structural_params:
+        opt_groups.append({"params": structural_params, "lr": kwargs["structural_lr"]})
+    optimizer = torch.optim.Adam(opt_groups)
+
+    hparams = {k: v for k, v in kwargs.items()}
+    _log_hparams_text(writer, hparams)
+    _log_hparams_table(writer, hparams, {})
+
+    window_len = dataset.window_len
+    full_seq_len = window_len - kwargs["seed_ctx_len"] + 1
+    if kwargs["max_seq_len"] > 0:
+        full_seq_len = min(full_seq_len, kwargs["max_seq_len"])
+    seq_len = min(kwargs["seq_len_start"], full_seq_len)
+    ema_loss = None
+    ema_cl = None
+    best_loss = float("inf")
+    converge_streak = 0
+
+    print("\n=== Joint: curriculum-blended autoencoder + dynamics training ===")
+    for epoch in tqdm(range(kwargs["epochs"]), desc="Joint", dynamic_ncols=True):
+        curriculum_epochs = kwargs["dynamics_curriculum_epochs"]
+        w_start, w_end = kwargs["dynamics_weight_start"], kwargs["dynamics_weight_end"]
+        ramp = min(1.0, epoch / curriculum_epochs) if curriculum_epochs > 0 else 1.0
+        dynamics_weight_epoch = w_start + (w_end - w_start) * ramp
+        metrics, q_var_vec, p_var_vec = _train_epoch_joint(
+            world_model=world_model,
+            loader=loader,
+            optimizer=optimizer,
+            dynamics_weight=dynamics_weight_epoch,
+            kl_weight=kwargs["kl_weight"],
+            free_bits=kwargs["free_bits"],
+            grad_clip=kwargs["grad_clip"],
+            device=device,
+            seq_len=seq_len,
+            seed_ctx_len=kwargs["seed_ctx_len"],
+            logdet_weight=kwargs["logdet_weight"],
+            teacher_force_weight=kwargs["teacher_force_weight"],
+            closed_loop_weight=kwargs["closed_loop_weight"],
+            closed_loop_gamma=kwargs["closed_loop_gamma"],
+            deterministic=kwargs["deterministic"],
+        )
+
+        alpha = kwargs["ema_alpha"]
+        prev_ema = ema_loss
+        ema_loss = (
+            metrics["joint/loss"]
+            if ema_loss is None
+            else alpha * ema_loss + (1.0 - alpha) * metrics["joint/loss"]
+        )
+        ema_cl = (
+            metrics["joint/cl_loss"]
+            if ema_cl is None
+            else alpha * ema_cl + (1.0 - alpha) * metrics["joint/cl_loss"]
+        )
+
+        if prev_ema is not None and kwargs["convergence_patience"] > 0:
+            rel_change = abs(ema_loss - prev_ema) / (abs(prev_ema) + 1e-8)
+            if rel_change < kwargs["convergence_threshold"]:
+                converge_streak += 1
+                if converge_streak >= kwargs["convergence_patience"]:
+                    tqdm.write(
+                        f"  Joint converged at epoch {epoch + 1}"
+                        f" (EMA Δ={rel_change:.2e}, streak={converge_streak})"
+                    )
+                    break
+            else:
+                converge_streak = 0
+
+        if ema_cl < kwargs["seq_len_advance_threshold"] and seq_len < full_seq_len:
+            seq_len += 1
+
+        if (epoch + 1) % kwargs["log_every"] == 0:
+            for k, v in metrics.items():
+                writer.add_scalar(k, v, epoch)
+            writer.add_histogram("joint/q_var", q_var_vec, epoch)
+            writer.add_histogram("joint/p_var", p_var_vec, epoch)
+            writer.add_scalar("joint/seq_len", seq_len, epoch)
+            writer.add_scalar("joint/ema_loss", ema_loss, epoch)
+            writer.add_scalar("joint/ema_cl", ema_cl, epoch)
+            tqdm.write(
+                f"  epoch {epoch + 1:4d}"
+                f"  dyn_w={dynamics_weight_epoch:.3f}"
+                f"  seq_len={seq_len:3d}"
+                f"  loss={metrics['joint/loss']:.4f}"
+                f"  recon={metrics['joint/recon']:.4f}"
+                f"  tf={metrics['joint/tf_loss']:.4f}"
+                f"  cl={metrics['joint/cl_loss']:.4f}"
+            )
+
+        if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
+            _log_structural_matrices_phase2(dyn_model=dyn_model, writer=writer, epoch=epoch)
+            energy_fig, energy_r = _plot_learned_energy_landscape(
+                world_model, energy_grid_episodes, device=device,
+            )
+            writer.add_figure("val/energy_landscape", energy_fig, epoch)
+            writer.add_scalar("val/energy_landscape_r2", energy_r ** 2, epoch)
+            plt.close(energy_fig)
+            grad_mag_fig, grad_mag_r = _plot_gradient_magnitude_landscape(
+                world_model, energy_grid_episodes, device=device,
+            )
+            writer.add_figure("val/gradient_magnitude_landscape", grad_mag_fig, epoch)
+            writer.add_scalar("val/gradient_magnitude_landscape_r2", grad_mag_r ** 2, epoch)
+            plt.close(grad_mag_fig)
+
+            policy_val_trajs = (
+                (val_energy, "energy_pump"),
+                (val_random, "random"),
+                (val_spin, "spin"),
+            )
+            for val_trajs, label in policy_val_trajs:
+                if not val_trajs:
+                    continue
+                val_recon_metrics = _eval_loss_phase1(model, val_trajs, device)
+                for k, v in val_recon_metrics.items():
+                    writer.add_scalar(f"{k}/{label}", v, epoch)
+                val_dyn_metrics = _eval_loss_phase2(world_model, val_trajs, device)
+                for k, v in val_dyn_metrics.items():
+                    writer.add_scalar(f"{k}/{label}", v, epoch)
+                _log_reconstruction_lstm_video(
+                    model=model, val_traj=val_trajs[0],
+                    device=device, writer=writer, epoch=epoch,
+                    tag=f"val/reconstruction_lstm/{label}",
+                )
+                _log_dreamed_video_phase2(
+                    world_model=world_model, val_traj=val_trajs[0],
+                    writer=writer, epoch=epoch, seq_len=full_seq_len,
+                    context_frames=kwargs["val_context_frames"],
+                    tag=f"val/dreamed/{label}",
+                )
+            scatter_sets = [(vt, label) for vt, label in policy_val_trajs if len(vt) >= 2]
+            if scatter_sets:
+                _log_latent_scatter_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+                _log_half_latent_probes_phase1(
+                    model=model, val_traj_sets=scatter_sets,
+                    device=device, writer=writer, epoch=epoch,
+                )
+            for i, train_traj in enumerate(train_sample_trajs):
+                _log_dreamed_video_phase2(
+                    world_model=world_model, val_traj=train_traj,
+                    writer=writer, epoch=epoch, seq_len=full_seq_len,
+                    context_frames=kwargs["val_context_frames"],
+                    tag=f"train/dreamed/sample_{i}",
+                )
+
+        if (
+            kwargs["checkpoint_every"] > 0
+            and (epoch + 1) % kwargs["checkpoint_every"] == 0
+            and metrics["joint/loss"] < best_loss
+        ):
+            world_model.save(run_dir, "best", hparams, metrics, epoch)
+            best_loss = metrics["joint/loss"]
 
     world_model.save(run_dir, "final", hparams, metrics, epoch)
 
