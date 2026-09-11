@@ -3042,6 +3042,12 @@ def phase1_cmd(**kwargs):
               show_default=True,
               help="Dynamics integrator: 'leapfrog' (symplectic Strang split, requires "
                    "separable H) or 'rk4' (classic 4-stage, works for any structure)")
+@click.option("--phi-source", type=click.Choice(["learned", "identity"]), default="learned",
+              show_default=True,
+              help="'learned': phi is a trained normalizing flow mapping h -> (q, p). "
+                   "'identity': phi is fixed to the identity, so q, p = h itself split "
+                   "in half — only makes sense with the encoder trained too (--phase1-run "
+                   "with a frozen encoder gives phi nothing to work with)")
 @click.option("--active-phase-dims", type=int, default=None,
               help="Ablation: restrict H/R to the first K canonical (q_i, p_i) pairs of the "
                    "post-flow phase space as input; the remaining q_dim - K pairs are masked "
@@ -3253,6 +3259,7 @@ def phase2_cmd(**kwargs):
         quadratic_t=kwargs["quadratic_t"],
         state_dep_r=kwargs["state_dep_r"],
         active_phase_dims=kwargs["active_phase_dims"],
+        phi_source=kwargs["phi_source"],
     ).to(device)
     print(f"Phase 2 model parameters: {sum(p.numel() for p in dyn_model.parameters()):,}")
 
@@ -3968,6 +3975,13 @@ def phase3_cmd(**kwargs):
 @click.option("--state-dep-r/--no-state-dep-r", default=False, show_default=True)
 @click.option("--integrator", type=click.Choice(["rk4", "leapfrog"]), default="leapfrog",
               show_default=True)
+@click.option("--phi-source", type=click.Choice(["learned", "identity"]), default="learned",
+              show_default=True,
+              help="'learned': phi is a trained normalizing flow mapping h -> (q, p). "
+                   "'identity': phi is fixed to the identity, so q, p = h itself split "
+                   "in half, and the encoder alone has to organize h into phase space — "
+                   "every dynamics-loss gradient reaches it undiminished, with none "
+                   "absorbed by phi's own weights.")
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
 @click.option("--batch-size", type=int, default=8, show_default=True)
@@ -4114,6 +4128,7 @@ def joint_cmd(**kwargs):
         drag=kwargs["drag"],
         integrator=kwargs["integrator"],
         state_dep_r=kwargs["state_dep_r"],
+        phi_source=kwargs["phi_source"],
     ).to(device)
     print(
         f"Model parameters: autoencoder={sum(p.numel() for p in model.parameters()):,}"

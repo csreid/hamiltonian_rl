@@ -429,6 +429,33 @@ class NormalizingFlow(nn.Module):
         return y
 
 
+class IdentityFlow(nn.Module):
+    """No-op stand-in for NormalizingFlow: q/p are h itself, unchanged.
+
+    Selected via HamiltonianFlowModel(phi_source="identity") once the
+    encoder is trained jointly with the dynamics model — with h no longer
+    frozen, phi's original job (bridge an already-fixed h into phase space)
+    is gone, and keeping it learned just gives the model a second way to
+    satisfy the dynamics loss (warp phi) that doesn't require h itself to
+    become phase-space-like. Being parameter-free doesn't block gradient
+    flow: the identity's Jacobian is I, so 100% of the dynamics loss's
+    gradient reaches h (and so the encoder) undiminished, with none of it
+    absorbed by phi's own weights.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def forward_with_logdet(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        return y
+
+
 # ---------------------------------------------------------------------------
 # Hamiltonian nets
 # ---------------------------------------------------------------------------
@@ -1037,6 +1064,7 @@ class HamiltonianFlowModel(nn.Module):
         state_dep_r: bool = False,
         physics: str = "pendulum",
         active_phase_dims: int | None = None,
+        phi_source: str = "learned",
     ):
         super().__init__()
         if physics not in _PHYSICS_REGISTRY:
@@ -1052,6 +1080,7 @@ class HamiltonianFlowModel(nn.Module):
             ("h_source", h_source, ("learned", "canonical")),
             ("r_source", r_source, ("learned", "fixed_damping", "canonical")),
             ("b_source", b_source, ("learned", "fixed_ones", "canonical")),
+            ("phi_source", phi_source, ("learned", "identity")),
         ):
             if value not in choices:
                 raise ValueError(f"{name} must be one of {choices}, got {value!r}")
@@ -1071,6 +1100,7 @@ class HamiltonianFlowModel(nn.Module):
         self._learned_state_dep_r = state_dep_r
         self.block_mode = block_mode
         self.physics = physics
+        self.phi_source = phi_source
         _phys_cfg = _PHYSICS_REGISTRY[physics]
         self.config = {
             "latent_dim": latent_dim,
@@ -1087,6 +1117,7 @@ class HamiltonianFlowModel(nn.Module):
             "state_dep_r": state_dep_r,
             "physics": physics,
             "active_phase_dims": active_phase_dims,
+            "phi_source": phi_source,
         }
         q_dim = latent_dim // 2
         p_dim = latent_dim - q_dim
@@ -1112,8 +1143,13 @@ class HamiltonianFlowModel(nn.Module):
         # Independent flows over h_q = h[:, :q_dim] and h_p = h[:, q_dim:] —
         # block-diagonal by construction, so q can only ever come from h_q and
         # p only from h_p (matching the same split Phase 1's f_psi enforces).
-        self.phi_q = NormalizingFlow(q_dim)
-        self.phi_p = NormalizingFlow(p_dim)
+        # phi_source="identity" swaps in a parameter-free no-op (see
+        # IdentityFlow) — q, p become h itself, so the encoder alone has to
+        # organize h into phase space, with no learned phi to absorb the
+        # dynamics loss's gradient into its own weights instead.
+        _flow_cls = NormalizingFlow if phi_source == "learned" else IdentityFlow
+        self.phi_q = _flow_cls(q_dim)
+        self.phi_p = _flow_cls(p_dim)
 
         # ── H ──
         if not block_mode:
