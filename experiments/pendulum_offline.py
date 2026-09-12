@@ -1607,6 +1607,9 @@ def _train_epoch_joint(
     closed_loop_weight: float = 1.0,
     closed_loop_gamma: float = 1.0,
     deterministic: bool = False,
+    time_reversal_weight: float = 0.0,
+    energy_balance_weight: float = 0.0,
+    energy_balance_grad_to_phi: bool = False,
 ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
     """One epoch of blended autoencoder + Hamiltonian-dynamics training.
 
@@ -1633,6 +1636,13 @@ def _train_epoch_joint(
     thing keeping h from collapsing under the dynamics loss's pressure, so
     the dynamics_weight ramp needs to be slow enough that reconstruction has
     already gotten traction before dynamics pressure grows large.
+
+    time_reversal_weight > 0 adds the same reversed-frame data augmentation
+    as phase1 (see _train_epoch_phase1's docstring): mu_all's q/p split is
+    reinforced by re-encoding the frame sequence in reverse and requiring
+    q(-t)=q(t), p(-t)=-p(t). energy_balance_weight > 0 adds the same
+    port-Hamiltonian energy-balance consistency loss as phase2/phase3 (see
+    _energy_balance_loss), evaluated on this batch's own q_win/p_win.
     """
     model, dyn_model = world_model.autoencoder, world_model.dynamics
     model.train()
@@ -1642,6 +1652,7 @@ def _train_epoch_joint(
 
     total_recon = total_recon_next = total_kl = 0.0
     total_tf = total_cl = total_logdet_reg = total_dynamics = total_loss = 0.0
+    total_time_reversal = total_energy_balance = 0.0
     total_q_var = total_p_var = None
 
     for frames, actions, _ in loader:
@@ -1679,6 +1690,32 @@ def _train_epoch_joint(
         recon_next = F.mse_loss(pred_next, frames[:, 1:])
 
         loss = recon + recon_next + kl_weight * kl
+
+        # Time-reversal augmentation (see _train_epoch_phase1's docstring):
+        # re-encode the frames in reverse order and require q to match the
+        # (time-flipped) forward q and p to match its negation.
+        if time_reversal_weight > 0:
+            frames_rev = frames.flip(dims=[1])
+            mu_rev_all, logvar_rev_all = model.encoder.forward_all(frames_rev)
+            if deterministic:
+                z_rev_all = mu_rev_all
+            else:
+                logvar_rev_all = logvar_rev_all.clamp(-10, 2)
+                z_rev_all = mu_rev_all + torch.randn_like(mu_rev_all) * (0.5 * logvar_rev_all).exp()
+
+            s_rev_all = model.f_psi(z_rev_all.reshape(B_size * T1, -1)[:, :q_dim])
+            pred_curr_rev = model.decoder(s_rev_all).reshape(B_size, T1, *frames.shape[2:])
+            recon_rev = F.mse_loss(pred_curr_rev, frames_rev)
+
+            target_q = mu_all[:, :, :q_dim].flip(dims=[1]).detach()
+            target_p = -mu_all[:, :, q_dim:].flip(dims=[1]).detach()
+            time_reversal_consistency = (
+                F.mse_loss(mu_rev_all[:, :, :q_dim], target_q)
+                + F.mse_loss(mu_rev_all[:, :, q_dim:], target_p)
+            )
+            time_reversal = recon_rev + time_reversal_consistency
+            loss = loss + time_reversal_weight * time_reversal
+            total_time_reversal = total_time_reversal + time_reversal.detach()
 
         # --- Dynamics (Phase-2 style), on a sub-window of this batch's own
         # encoding (h = mu_all, not the sampled z) ---
@@ -1729,6 +1766,14 @@ def _train_epoch_joint(
             cl_loss = torch.zeros((), device=device)
 
         dynamics_loss = logdet_reg + teacher_force_weight * tf_loss + closed_loop_weight * cl_loss
+
+        if energy_balance_weight > 0:
+            eb_loss = _energy_balance_loss(
+                dyn_model, q_win, p_win, actions_win, grad_to_phi=energy_balance_grad_to_phi,
+            )
+            dynamics_loss = dynamics_loss + energy_balance_weight * eb_loss
+            total_energy_balance = total_energy_balance + eb_loss.detach()
+
         loss = loss + dynamics_weight * dynamics_loss
 
         optimizer.zero_grad()
@@ -1766,6 +1811,8 @@ def _train_epoch_joint(
         "joint/cl_loss": float(total_cl) / n,
         "joint/logdet_reg": float(total_logdet_reg) / n,
         "joint/dynamics_weight": dynamics_weight,
+        "joint/time_reversal": float(total_time_reversal) / n,
+        "joint/energy_balance": float(total_energy_balance) / n,
     }
     return metrics, total_q_var / n, total_p_var / n
 
@@ -3998,6 +4045,18 @@ def phase3_cmd(**kwargs):
 @click.option("--teacher-force-weight", type=float, default=1.0, show_default=True)
 @click.option("--closed-loop-weight", type=float, default=1.0, show_default=True)
 @click.option("--closed-loop-gamma", type=float, default=1.0, show_default=True)
+@click.option("--time-reversal-weight", type=float, default=0.0, show_default=True,
+              help="Weight on the time-reversal augmentation: re-encode frames "
+                   "in reverse order and require q unchanged / p negated "
+                   "(0 disables)")
+@click.option("--energy-balance-weight", type=float, default=0.0, show_default=True,
+              help="Weight on the port-Hamiltonian energy-balance consistency "
+                   "loss, scaled by the same dynamics-weight curriculum as the "
+                   "other dynamics losses (0 disables)")
+@click.option("--energy-balance-grad-to-phi/--no-energy-balance-grad-to-phi", default=False,
+              show_default=True,
+              help="Let the energy-balance loss backprop into phi (the h<->(q,p) "
+                   "flow) instead of shaping H/R/B only")
 @click.option("--seed-ctx-len", type=int, default=3, show_default=True,
               help="Context frames feeding phi's seed for the closed-loop rollout")
 @click.option("--seq-len-start", type=int, default=5, show_default=True,
@@ -4200,6 +4259,9 @@ def joint_cmd(**kwargs):
             closed_loop_weight=kwargs["closed_loop_weight"],
             closed_loop_gamma=kwargs["closed_loop_gamma"],
             deterministic=kwargs["deterministic"],
+            time_reversal_weight=kwargs["time_reversal_weight"],
+            energy_balance_weight=kwargs["energy_balance_weight"],
+            energy_balance_grad_to_phi=kwargs["energy_balance_grad_to_phi"],
         )
 
         alpha = kwargs["ema_alpha"]
