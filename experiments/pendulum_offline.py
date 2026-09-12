@@ -1615,6 +1615,9 @@ def _train_epoch_joint(
     time_reversal_weight: float = 0.0,
     energy_balance_weight: float = 0.0,
     energy_balance_grad_to_phi: bool = False,
+    pixel_cl_weight: float = 1.0,
+    huber_delta: float = 0.0,
+    decode_stride: int = 1,
 ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
     """One epoch of blended autoencoder + Hamiltonian-dynamics training.
 
@@ -1636,11 +1639,19 @@ def _train_epoch_joint(
     encoder pass. The closed-loop seed uses h = mu (not the sampled z), so
     the dynamics loss isn't also fighting VAE reparameterization noise.
 
-    No anti-collapse guards (stop-grad targets, a separate reconstruction
-    anchor weight) — the always-on reconstruction loss above is the only
-    thing keeping h from collapsing under the dynamics loss's pressure, so
-    the dynamics_weight ramp needs to be slow enough that reconstruction has
-    already gotten traction before dynamics pressure grows large.
+    h_tf_target/h_cl_target are stop-gradiented (as in Phase 3) — with the
+    encoder trainable, an MSE(pred, encoder(frames)) whose gradient also
+    flows into the target is minimised for free by shrinking h's scale
+    (both sides shrink together), independent of whether the dynamics model
+    predicts anything real. Detaching the target closes that loophole for
+    the h-space losses; pixel_cl_weight > 0 additionally decodes the
+    closed-loop rollout to pixels (as Phase 3's pix_cl) and compares against
+    the real frames, which closes it structurally rather than just via a
+    stop-grad: the encoder cannot rescale its way to a lower loss against a
+    fixed, externally-given target the way it can against its own encoding.
+    huber_delta and decode_stride mirror Phase 3's pixel closed-loop options
+    (Huber beyond `delta` so phase-drifted late steps don't dominate the
+    gradient; decode every Nth rollout step to bound decoder memory).
 
     time_reversal_weight > 0 adds the same reversed-frame data augmentation
     as phase1 (see _train_epoch_phase1's docstring): mu_all's q/p split is
@@ -1657,7 +1668,8 @@ def _train_epoch_joint(
 
     total_recon = total_recon_next = total_kl = 0.0
     total_tf = total_cl = total_logdet_reg = total_dynamics = total_loss = 0.0
-    total_time_reversal = total_energy_balance = 0.0
+    total_time_reversal = total_energy_balance = total_grad_H_norm = 0.0
+    total_pix_cl = 0.0
     total_q_var = total_p_var = None
 
     for frames, actions, _ in loader:
@@ -1748,7 +1760,7 @@ def _train_epoch_joint(
         a_tf = actions_win.reshape(B_size * T_tf, 1)
         q_tf_next, p_tf_next = dyn_model.controlled_step(q_tf, p_tf, a_tf)
         h_tf_pred = dyn_model.decode(q_tf_next, p_tf_next)
-        h_tf_target = h_win[:, 1:].reshape(B_size * T_tf, D)
+        h_tf_target = h_win[:, 1:].reshape(B_size * T_tf, D).detach()
         tf_loss = F.mse_loss(h_tf_pred, h_tf_target)
 
         k = ctx - 1
@@ -1766,15 +1778,41 @@ def _train_epoch_joint(
             h_cl_pred = dyn_model.decode(
                 q_traj.reshape(B_size * T, q_dim), p_traj.reshape(B_size * T, q_dim)
             ).reshape(B_size, T, D)
-            h_cl_target = h_win[:, k + 1:k + 1 + T]
+            h_cl_target = h_win[:, k + 1:k + 1 + T].detach()
             per_step_loss = (h_cl_pred - h_cl_target).pow(2).mean(dim=(0, 2))
             step_weights = closed_loop_gamma ** torch.arange(T, device=device, dtype=per_step_loss.dtype)
             cl_loss = (per_step_loss * step_weights).sum() / step_weights.sum()
+
+            # Pixel closed-loop (Phase-3 style): decode the dreamed rollout to
+            # pixels and compare against the real frames — a fixed, external
+            # target the encoder can't shrink its way to matching for free.
+            pix_idx = torch.arange(0, T, decode_stride, device=device)
+            h_pix = h_cl_pred[:, pix_idx].reshape(B_size * len(pix_idx), D)
+            s_pix = model.f_psi(h_pix[:, :q_dim])
+            frames_cl_pred = model.decoder(s_pix).reshape(
+                B_size, len(pix_idx), *frames.shape[2:]
+            )
+            frames_cl_target = frames[:, s + k + 1:s + k + 1 + T][:, pix_idx]
+            if huber_delta > 0:
+                pix_err = 2.0 * F.huber_loss(
+                    frames_cl_pred, frames_cl_target, reduction="none", delta=huber_delta
+                )
+            else:
+                pix_err = (frames_cl_pred - frames_cl_target).pow(2)
+            per_step_pix = pix_err.mean(dim=(0, 2, 3, 4))
+            w_pix = step_weights[pix_idx]
+            pix_cl = (per_step_pix * w_pix).sum() / w_pix.sum()
         else:
             q_traj, p_traj = q_k_log.unsqueeze(1), p_k_log.unsqueeze(1)
             cl_loss = torch.zeros((), device=device)
+            pix_cl = torch.zeros((), device=device)
 
-        dynamics_loss = logdet_reg + teacher_force_weight * tf_loss + closed_loop_weight * cl_loss
+        dynamics_loss = (
+            logdet_reg
+            + teacher_force_weight * tf_loss
+            + closed_loop_weight * cl_loss
+            + pixel_cl_weight * pix_cl
+        )
 
         if energy_balance_weight > 0:
             eb_loss = _energy_balance_loss(
@@ -1793,11 +1831,19 @@ def _train_epoch_joint(
             )
         optimizer.step()
 
+        # Gradient of H norm — use the saved seed point, no re-encoding needed
+        with torch.enable_grad():
+            z_eval = torch.cat([q_k_log, p_k_log], dim=-1).requires_grad_(True)
+            H_eval = dyn_model.hamiltonian(z_eval[:, :q_dim], z_eval[:, q_dim:]).sum()
+            grad_eval = torch.autograd.grad(H_eval, z_eval)[0]
+            total_grad_H_norm = total_grad_H_norm + grad_eval.norm(dim=-1).mean().detach()
+
         total_recon = total_recon + recon.detach()
         total_recon_next = total_recon_next + recon_next.detach()
         total_kl = total_kl + kl.detach()
         total_tf = total_tf + tf_loss.detach()
         total_cl = total_cl + cl_loss.detach()
+        total_pix_cl = total_pix_cl + pix_cl.detach()
         total_logdet_reg = total_logdet_reg + log_det_win.detach().pow(2).mean()
         total_dynamics = total_dynamics + dynamics_loss.detach()
         total_loss = total_loss + loss.detach()
@@ -1818,10 +1864,12 @@ def _train_epoch_joint(
         "joint/dynamics": float(total_dynamics) / n,
         "joint/tf_loss": float(total_tf) / n,
         "joint/cl_loss": float(total_cl) / n,
+        "joint/cl_pixel": float(total_pix_cl) / n,
         "joint/logdet_reg": float(total_logdet_reg) / n,
         "joint/dynamics_weight": dynamics_weight,
         "joint/time_reversal": float(total_time_reversal) / n,
         "joint/energy_balance": float(total_energy_balance) / n,
+        "joint/grad_H_norm": float(total_grad_H_norm) / n,
     }
     return metrics, total_q_var / n, total_p_var / n
 
@@ -4055,6 +4103,19 @@ def phase3_cmd(**kwargs):
 @click.option("--logdet-weight", type=float, default=1e-3, show_default=True)
 @click.option("--teacher-force-weight", type=float, default=1.0, show_default=True)
 @click.option("--closed-loop-weight", type=float, default=1.0, show_default=True)
+@click.option("--pixel-cl-weight", type=float, default=1.0, show_default=True,
+              help="Weight on the pixel-space closed-loop (dreaming) loss: decodes the "
+                   "closed-loop rollout to pixels and compares against the real frames "
+                   "(as Phase 3's pix_cl) — unlike the h-space losses, the encoder can't "
+                   "shrink h to cheat this for free, since the target is fixed pixel data")
+@click.option("--huber-delta", type=float, default=0.0, show_default=True,
+              help="Huber threshold (pixel units) for the pixel closed-loop per-element "
+                   "error: quadratic (= MSE scale) below delta, linear above, so "
+                   "phase-drifted late steps stop dominating the gradient. 0 = plain MSE.")
+@click.option("--decode-stride", type=int, default=1, show_default=True,
+              help="Decode only every Nth closed-loop rollout step to pixels, to bound "
+                   "decoder memory at long curriculum horizons; h-space losses still "
+                   "cover every step")
 @click.option("--closed-loop-gamma", type=float, default=1.0, show_default=True)
 @click.option("--time-reversal-weight", type=float, default=0.0, show_default=True,
               help="Weight on the time-reversal q/p consistency term only "
@@ -4075,8 +4136,10 @@ def phase3_cmd(**kwargs):
               help="Initial closed-loop rollout length")
 @click.option("--max-seq-len", type=int, default=0, show_default=True,
               help="Cap on closed-loop rollout length (0 = full window)")
-@click.option("--seq-len-advance-threshold", type=float, default=0.005, show_default=True,
-              help="EMA closed-loop loss below which seq_len advances by 1")
+@click.option("--seq-len-advance-threshold", type=float, default=2e-3, show_default=True,
+              help="EMA pixel closed-loop loss (joint/cl_pixel) below which seq_len "
+                   "advances by 1 — pixel MSE scale, not comparable to the old "
+                   "h-space threshold")
 @click.option("--dynamics-weight-start", type=float, default=0.0, show_default=True,
               help="Dynamics loss weight at epoch 0")
 @click.option("--dynamics-weight-end", type=float, default=1.0, show_default=True,
@@ -4274,6 +4337,9 @@ def joint_cmd(**kwargs):
             time_reversal_weight=kwargs["time_reversal_weight"],
             energy_balance_weight=kwargs["energy_balance_weight"],
             energy_balance_grad_to_phi=kwargs["energy_balance_grad_to_phi"],
+            pixel_cl_weight=kwargs["pixel_cl_weight"],
+            huber_delta=kwargs["huber_delta"],
+            decode_stride=kwargs["decode_stride"],
         )
 
         alpha = kwargs["ema_alpha"]
@@ -4284,9 +4350,9 @@ def joint_cmd(**kwargs):
             else alpha * ema_loss + (1.0 - alpha) * metrics["joint/loss"]
         )
         ema_cl = (
-            metrics["joint/cl_loss"]
+            metrics["joint/cl_pixel"]
             if ema_cl is None
-            else alpha * ema_cl + (1.0 - alpha) * metrics["joint/cl_loss"]
+            else alpha * ema_cl + (1.0 - alpha) * metrics["joint/cl_pixel"]
         )
 
         if prev_ema is not None and kwargs["convergence_patience"] > 0:
@@ -4321,6 +4387,7 @@ def joint_cmd(**kwargs):
                 f"  recon={metrics['joint/recon']:.4f}"
                 f"  tf={metrics['joint/tf_loss']:.4f}"
                 f"  cl={metrics['joint/cl_loss']:.4f}"
+                f"  cl_pix={metrics['joint/cl_pixel']:.4f}"
             )
 
         if kwargs["val_every"] > 0 and (epoch + 1) % kwargs["val_every"] == 0:
