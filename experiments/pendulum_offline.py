@@ -703,10 +703,15 @@ def _train_epoch_phase1(
 
         loss = recon + recon_next + kl_weight * kl
 
-        # Time-reversal augmentation: re-encode the frames in reverse order
-        # and require q to match the (time-flipped) forward q and p to match
-        # its negation. See the docstring above for why next_frame_decoder is
-        # excluded.
+        # Time-reversal augmentation: re-encode the frames in reverse order.
+        # recon_rev is plain data augmentation (same current-frame
+        # reconstruction as `recon`, just from the reversed-history encoding)
+        # and is folded into the main reconstruction loss at the same
+        # implicit weight of 1 as `recon` — it carries no q/p physics signal
+        # (f_psi only ever sees h_q). time_reversal_weight instead scales
+        # only time_reversal_consistency, which requires q to match the
+        # (time-flipped) forward q and p to match its negation. See the
+        # docstring above for why next_frame_decoder is excluded.
         if time_reversal_weight > 0:
             frames_rev = frames.flip(dims=[1])
             mu_rev_all, logvar_rev_all = model.encoder.forward_all(frames_rev)
@@ -718,6 +723,7 @@ def _train_epoch_phase1(
 
             pred_curr_rev = _decode(z_rev_all, B_size, T_full + 1)
             recon_rev = F.mse_loss(pred_curr_rev, frames_rev)
+            loss = loss + recon_rev
 
             target_q = mu_all[:, :, :q_dim].flip(dims=[1]).detach()
             target_p = -mu_all[:, :, q_dim:].flip(dims=[1]).detach()
@@ -725,9 +731,8 @@ def _train_epoch_phase1(
                 F.mse_loss(mu_rev_all[:, :, :q_dim], target_q)
                 + F.mse_loss(mu_rev_all[:, :, q_dim:], target_p)
             )
-            time_reversal = recon_rev + time_reversal_consistency
-            loss = loss + time_reversal_weight * time_reversal
-            total_time_reversal = total_time_reversal + time_reversal.detach()
+            loss = loss + time_reversal_weight * time_reversal_consistency
+            total_time_reversal = total_time_reversal + time_reversal_consistency.detach()
 
         # Sparsity regulariser: L1 on the latent mean pushes irrelevant
         # dimensions to exactly 0 (unlike the KL term, which only pulls
@@ -1692,7 +1697,11 @@ def _train_epoch_joint(
         loss = recon + recon_next + kl_weight * kl
 
         # Time-reversal augmentation (see _train_epoch_phase1's docstring):
-        # re-encode the frames in reverse order and require q to match the
+        # re-encode the frames in reverse order. recon_rev is plain data
+        # augmentation and is folded into the main reconstruction loss at
+        # the same implicit weight of 1 as `recon` — it carries no q/p
+        # physics signal. time_reversal_weight instead scales only
+        # time_reversal_consistency, which requires q to match the
         # (time-flipped) forward q and p to match its negation.
         if time_reversal_weight > 0:
             frames_rev = frames.flip(dims=[1])
@@ -1706,6 +1715,7 @@ def _train_epoch_joint(
             s_rev_all = model.f_psi(z_rev_all.reshape(B_size * T1, -1)[:, :q_dim])
             pred_curr_rev = model.decoder(s_rev_all).reshape(B_size, T1, *frames.shape[2:])
             recon_rev = F.mse_loss(pred_curr_rev, frames_rev)
+            loss = loss + recon_rev
 
             target_q = mu_all[:, :, :q_dim].flip(dims=[1]).detach()
             target_p = -mu_all[:, :, q_dim:].flip(dims=[1]).detach()
@@ -1713,9 +1723,8 @@ def _train_epoch_joint(
                 F.mse_loss(mu_rev_all[:, :, :q_dim], target_q)
                 + F.mse_loss(mu_rev_all[:, :, q_dim:], target_p)
             )
-            time_reversal = recon_rev + time_reversal_consistency
-            loss = loss + time_reversal_weight * time_reversal
-            total_time_reversal = total_time_reversal + time_reversal.detach()
+            loss = loss + time_reversal_weight * time_reversal_consistency
+            total_time_reversal = total_time_reversal + time_reversal_consistency.detach()
 
         # --- Dynamics (Phase-2 style), on a sub-window of this batch's own
         # encoding (h = mu_all, not the sampled z) ---
@@ -2757,9 +2766,11 @@ def cli():
 @click.option("--sparsity-weight", type=float, default=0.0, show_default=True,
               help="L1 penalty on latent mean, pushes irrelevant dims to 0 (0 to disable)")
 @click.option("--time-reversal-weight", type=float, default=0.0, show_default=True,
-              help="Weight on the time-reversal augmentation: re-encode frames "
-                   "in reverse order and require q unchanged / p negated "
-                   "relative to the forward encoding (0 to disable)")
+              help="Weight on the time-reversal q/p consistency term only "
+                   "(reversed-encoding reconstruction is always folded into "
+                   "the main reconstruction loss at weight 1): require q "
+                   "unchanged / p negated relative to the forward encoding "
+                   "(0 to disable the whole augmentation)")
 @click.option("--use-gate", is_flag=True, default=False, show_default=True,
               help="Replace/augment L1 sparsity with a learned per-dim L0 "
                    "hard-concrete gate on the latent mean")
@@ -4046,9 +4057,10 @@ def phase3_cmd(**kwargs):
 @click.option("--closed-loop-weight", type=float, default=1.0, show_default=True)
 @click.option("--closed-loop-gamma", type=float, default=1.0, show_default=True)
 @click.option("--time-reversal-weight", type=float, default=0.0, show_default=True,
-              help="Weight on the time-reversal augmentation: re-encode frames "
-                   "in reverse order and require q unchanged / p negated "
-                   "(0 disables)")
+              help="Weight on the time-reversal q/p consistency term only "
+                   "(reversed-encoding reconstruction is always folded into "
+                   "the main reconstruction loss at weight 1): require q "
+                   "unchanged / p negated (0 disables the whole augmentation)")
 @click.option("--energy-balance-weight", type=float, default=0.0, show_default=True,
               help="Weight on the port-Hamiltonian energy-balance consistency "
                    "loss, scaled by the same dynamics-weight curriculum as the "
