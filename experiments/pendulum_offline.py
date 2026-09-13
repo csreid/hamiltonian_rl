@@ -99,7 +99,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
-from scipy.interpolate import griddata
+from scipy.interpolate import griddata, RegularGridInterpolator
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -368,7 +368,60 @@ def _collect_grid_qp_samples(
     return {"q": q, "p": p, "H_true": H_true_vals, "theta": theta, "theta_dot": theta_dot}
 
 
-@torch.no_grad()
+def _finite_diff_grad(
+    field_dense: np.ndarray, theta_dense: torch.Tensor, theta_dot_dense: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate (∂field/∂θ, ∂field/∂θ̇) via finite differences on `field_dense`,
+    a scalar already known on the regular (θ, θ̇) grid (θ along axis=1 /
+    columns, θ̇ along axis=0 / rows, per the `indexing="xy"` meshgrid
+    convention used throughout this module).
+
+    This is how the *learned* side's gradient is obtained everywhere in this
+    module — never by autograd through the model's latent (q, p), which is
+    32-dim by default (16+16) while true phase space is 2-dim (θ, θ̇). There
+    is no canonical way to read a 2D direction off a 32D gradient vector, and
+    most of those 32 latent dims are off the (θ, θ̇) data manifold entirely
+    (H is never trained on them), so their gradient components are noise.
+
+    What *is* well-defined is H_learned viewed as a function of (θ, θ̇)
+    alone: (θ, θ̇) deterministically renders → encodes → phi's → H, so one
+    (θ, θ̇) always gives one H_learned value, same as `H_true`. We already
+    build that composed scalar function's values on this dense grid via
+    `griddata` (interpolated from the sampled points) — `np.gradient` here
+    just estimates its slope from neighboring grid values, exactly the way
+    the true side's closed-form ∇H_true is the calculus analog of the same
+    thing. NaNs outside griddata's convex hull propagate to neighboring
+    finite differences at the boundary, matching the existing "left
+    transparent" convention for extrapolated regions.
+    """
+    dtheta = float(theta_dense[1] - theta_dense[0])
+    dtheta_dot = float(theta_dot_dense[1] - theta_dot_dense[0])
+    g_theta_dot, g_theta = np.gradient(field_dense, dtheta_dot, dtheta)
+    return g_theta, g_theta_dot
+
+
+def _quiver_gradient_direction(
+    ax, grid_theta: np.ndarray, grid_theta_dot: np.ndarray,
+    gx_dense: np.ndarray, gy_dense: np.ndarray, landscape_resolution: int,
+) -> None:
+    """Overlay a subsampled, unit-normalized quiver of a gradient field's
+    direction on `ax` (which already holds an imshow of its magnitude/value).
+
+    Arrows are unit-normalized per field so direction reads clearly
+    regardless of the (possibly very different) true/learned magnitude
+    scales; `landscape_resolution` sets the stride so the arrow count stays
+    readable independent of grid density.
+    """
+    stride = max(landscape_resolution // 20, 1)
+    qx = grid_theta[::stride, ::stride]
+    qy = grid_theta_dot[::stride, ::stride]
+    u = gx_dense[::stride, ::stride]
+    v = gy_dense[::stride, ::stride]
+    mag = np.sqrt(u**2 + v**2)
+    mag = np.where(mag > 0, mag, 1.0)
+    ax.quiver(qx, qy, u / mag, v / mag, color="white", angles="xy", pivot="mid", scale=25, width=0.004)
+
+
 def _plot_learned_energy_landscape(
     model: WorldModel,
     episodes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
@@ -385,10 +438,12 @@ def _plot_learned_energy_landscape(
     Four panels, 2x2:
       1. Ground truth: the true energy, swept densely from its closed form
          (`landscape_resolution`, independent of how many grid points were
-         actually sampled/encoded through the model).
+         actually sampled/encoded through the model), with a quiver overlay
+         of ∇H_true's direction.
       2. Interpolated: the learned H at the sampled (theta, theta_dot) points,
          interpolated onto that same dense grid (via `scipy.griddata`) so it
-         can be compared shape-for-shape against panel 1.
+         can be compared shape-for-shape against panel 1, with a quiver
+         overlay of ∇H_learned's direction.
       3. The same interpolated surface with the measured (sampled) points
          overlaid, to show what data the interpolation was built from and
          where it's extrapolating past the convex hull of the samples (NaN,
@@ -409,16 +464,24 @@ def _plot_learned_energy_landscape(
     drag makes |theta_dot| beyond that rare, so a handful of outlier samples
     out there would otherwise dominate the interpolation/extrapolation at the
     plot's edges instead of showing the well-covered bulk of phase space.
+
+    Panels 1 and 2 are also overlaid with a subsampled quiver of the
+    gradient's direction (see `_quiver_gradient_direction`). The learned
+    side's gradient is obtained via `_finite_diff_grad` on the interpolated
+    H_learned_dense surface, not autograd through the model's 32-dim latent
+    (q, p) — see that helper's docstring for why: there's no canonical way to
+    read a 2D (θ, θ̇) direction off a 32D latent gradient, most of which is
+    off the data manifold entirely.
     """
     model.eval()
     if device is None:
         device = next(model.autoencoder.parameters()).device
+    dyn = model.dynamics
 
     vel_clip = max(abs(min_vel), abs(max_vel))
     samples = _collect_grid_qp_samples(model, episodes, device=device, vel_clip=vel_clip)
-    H_learned = model.dynamics.hamiltonian(
-        samples["q"].to(device), samples["p"].to(device)
-    ).cpu().numpy()
+    with torch.no_grad():
+        H_learned = dyn.hamiltonian(samples["q"].to(device), samples["p"].to(device)).cpu().numpy()
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
     H_true_vals = samples["H_true"].cpu().numpy()
@@ -427,12 +490,14 @@ def _plot_learned_energy_landscape(
     theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
     grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
     H_true_dense = H_true(grid_theta, grid_theta_dot).numpy()
+    g_theta_dense, g_theta_dot_dense = grad_H_true(grid_theta, grid_theta_dot)
+    g_theta_dense, g_theta_dot_dense = g_theta_dense.numpy(), g_theta_dot_dense.numpy()
 
-    H_learned_dense = griddata(
-        points=np.stack([theta, theta_dot], axis=-1),
-        values=H_learned,
-        xi=(grid_theta.numpy(), grid_theta_dot.numpy()),
-        method="cubic",
+    points = np.stack([theta, theta_dot], axis=-1)
+    xi = (grid_theta.numpy(), grid_theta_dot.numpy())
+    H_learned_dense = griddata(points=points, values=H_learned, xi=xi, method="cubic")
+    g_theta_learned_dense, g_theta_dot_learned_dense = _finite_diff_grad(
+        H_learned_dense, theta_dense, theta_dot_dense
     )
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
@@ -444,12 +509,20 @@ def _plot_learned_energy_landscape(
     )
     axes[0].set_title("Ground truth")
     fig.colorbar(im0, ax=axes[0], label="H_true", pad=0.02)
+    _quiver_gradient_direction(
+        axes[0], grid_theta.numpy(), grid_theta_dot.numpy(),
+        g_theta_dense, g_theta_dot_dense, landscape_resolution,
+    )
 
     im1 = axes[1].imshow(
         H_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
     )
     axes[1].set_title("Learned H (interpolated)")
     fig.colorbar(im1, ax=axes[1], label="H_learned", pad=0.02)
+    _quiver_gradient_direction(
+        axes[1], grid_theta.numpy(), grid_theta_dot.numpy(),
+        g_theta_learned_dense, g_theta_dot_learned_dense, landscape_resolution,
+    )
 
     im2 = axes[2].imshow(
         H_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
@@ -513,41 +586,32 @@ def _plot_gradient_magnitude_landscape(
     True gradient (closed form): H_true = θ̇²/2 + 1.5·g·(1+cosθ), so
     ∇H_true = (∂H/∂θ, ∂H/∂θ̇) = (−1.5·g·sinθ, θ̇).
 
-    Learned gradient: ∇_z H_learned(q, p) via autograd, at the same encoded
-    (q, p) points used for the energy-landscape plot, mapped onto the same
-    (θ, θ̇) grid via `griddata` so the two panels are directly comparable in
-    *shape* (own color scales, like the energy-landscape plot — the gauge
-    freedom on H means only relative structure, not absolute magnitude, is
-    meaningful).
+    Learned gradient: obtained via `_finite_diff_grad` on the interpolated
+    H_learned_dense surface (same one built for the energy-landscape plot),
+    not autograd through the model's latent (q, p) — see that helper's
+    docstring for why (latent (q, p) is 32-dim by default while true phase
+    space is 2-dim, so there's no canonical direction to read off a 32D
+    gradient, and most of it is off the (θ, θ̇) data manifold anyway).
+    Per-sample values (for the "measured points" and regression panels) are
+    then read back off that same dense field via bilinear interpolation
+    (`RegularGridInterpolator`) at the original sampled (θ, θ̇) locations.
 
     Direction: the magnitude heatmaps are overlaid with a subsampled quiver
     of the (signed) gradient components, and a 5th panel shows cosine
-    similarity between ∇H_true and ∇H_learned across the dense grid. This is
-    a meaningful comparison (not just magnitude) because phi_q/phi_p are
-    independent per-axis flows (q = phi_q(h_q), p = phi_p(h_p), no q/p
-    mixing) — so the learned gradient's direction is only per-axis warped
-    relative to the true (θ, θ̇) gradient, not arbitrarily rotated the way a
-    general canonical transformation could. Cosine similarity near 1
-    everywhere indicates the learned H's level sets are the right shape
-    (increasing/decreasing in the right places along each axis) even where
-    magnitude is off by a per-axis scale factor.
+    similarity between ∇H_true and ∇H_learned across the dense grid. Cosine
+    similarity near 1 everywhere indicates the learned H's level sets are the
+    right shape (increasing/decreasing in the right places) even where
+    magnitude is off.
     """
     model.eval()
     if device is None:
         device = next(model.autoencoder.parameters()).device
     dyn = model.dynamics
-    q_dim = dyn.latent_dim // 2
 
     vel_clip = max(abs(min_vel), abs(max_vel))
     samples = _collect_grid_qp_samples(model, episodes, device=device, vel_clip=vel_clip)
-    q = samples["q"].to(device)
-    p = samples["p"].to(device)
-    with torch.enable_grad():
-        z = torch.cat([q, p], dim=-1).requires_grad_(True)
-        H_val = dyn.hamiltonian(z[:, :q_dim], z[:, q_dim:]).sum()
-        grad_H = torch.autograd.grad(H_val, z)[0]
-    grad_H_learned = grad_H.detach().cpu().numpy()
-    grad_mag_learned = np.linalg.norm(grad_H_learned, axis=-1)
+    with torch.no_grad():
+        H_learned = dyn.hamiltonian(samples["q"].to(device), samples["p"].to(device)).cpu().numpy()
 
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
@@ -564,50 +628,53 @@ def _plot_gradient_magnitude_landscape(
 
     points = np.stack([theta, theta_dot], axis=-1)
     xi = (grid_theta.numpy(), grid_theta_dot.numpy())
-    grad_mag_learned_dense = griddata(points=points, values=grad_mag_learned, xi=xi, method="cubic")
-    # Learned gradient components (∂H/∂q, ∂H/∂p), interpolated the same way as
-    # the magnitude so the quiver/cosine-similarity panels sit on the same
-    # dense grid. Each axis is warped independently by phi_q/phi_p (see
-    # docstring), so these components are directionally comparable to
-    # (∂H_true/∂θ, ∂H_true/∂θ̇) even though their absolute scale isn't.
-    gq_learned_dense = griddata(points=points, values=grad_H_learned[:, 0], xi=xi, method="cubic")
-    gp_learned_dense = griddata(points=points, values=grad_H_learned[:, 1], xi=xi, method="cubic")
+    H_learned_dense = griddata(points=points, values=H_learned, xi=xi, method="cubic")
+    g_theta_learned_dense, g_theta_dot_learned_dense = _finite_diff_grad(
+        H_learned_dense, theta_dense, theta_dot_dense
+    )
+    grad_mag_learned_dense = np.sqrt(g_theta_learned_dense**2 + g_theta_dot_learned_dense**2)
 
     cos_sim_dense = (
-        (g_theta_dense * gq_learned_dense + g_theta_dot_dense * gp_learned_dense)
-        / (grad_mag_true_dense * np.sqrt(gq_learned_dense**2 + gp_learned_dense**2))
+        (g_theta_dense * g_theta_learned_dense + g_theta_dot_dense * g_theta_dot_learned_dense)
+        / (grad_mag_true_dense * grad_mag_learned_dense)
     )
+
+    # Read the dense finite-difference field back off at the original sample
+    # locations (bilinear interpolation), for the "measured points" overlay
+    # and the true-vs-learned regression below — these are no longer directly
+    # measured per sample (gradient only exists on the interpolated surface).
+    grid_interp = RegularGridInterpolator(
+        (theta_dot_dense.numpy(), theta_dense.numpy()), grad_mag_learned_dense,
+        bounds_error=False, fill_value=np.nan,
+    )
+    grad_mag_learned_at_samples = grid_interp(np.stack([theta_dot, theta], axis=-1))
+    valid = ~np.isnan(grad_mag_learned_at_samples)
+    theta, theta_dot = theta[valid], theta_dot[valid]
+    grad_mag_true = grad_mag_true[valid]
+    grad_mag_learned = grad_mag_learned_at_samples[valid]
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
     fig, axes = plt.subplots(2, 3, figsize=(20, 12))
     axes = axes.ravel()
 
-    # Subsample the dense grid for a readable quiver (every `stride`-th point
-    # in each axis); arrows are unit-normalized per field so direction reads
-    # clearly regardless of the (very different) true/learned magnitude scales.
-    stride = max(landscape_resolution // 20, 1)
-    qx = grid_theta.numpy()[::stride, ::stride]
-    qy = grid_theta_dot.numpy()[::stride, ::stride]
-
-    def _unit(u, v):
-        mag = np.sqrt(u**2 + v**2)
-        mag = np.where(mag > 0, mag, 1.0)
-        return u / mag, v / mag
-
     im0 = axes[0].imshow(
         grad_mag_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
     )
     fig.colorbar(im0, ax=axes[0], label="‖∇H_true‖", pad=0.02)
-    uu, vv = _unit(g_theta_dense[::stride, ::stride], g_theta_dot_dense[::stride, ::stride])
-    axes[0].quiver(qx, qy, uu, vv, color="white", angles="xy", pivot="mid", scale=25, width=0.004)
+    _quiver_gradient_direction(
+        axes[0], grid_theta.numpy(), grid_theta_dot.numpy(),
+        g_theta_dense, g_theta_dot_dense, landscape_resolution,
+    )
     axes[0].set_title("Ground truth")
 
     im1 = axes[1].imshow(
         grad_mag_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
     )
     fig.colorbar(im1, ax=axes[1], label="‖∇H_learned‖", pad=0.02)
-    uu, vv = _unit(gq_learned_dense[::stride, ::stride], gp_learned_dense[::stride, ::stride])
-    axes[1].quiver(qx, qy, uu, vv, color="white", angles="xy", pivot="mid", scale=25, width=0.004)
+    _quiver_gradient_direction(
+        axes[1], grid_theta.numpy(), grid_theta_dot.numpy(),
+        g_theta_learned_dense, g_theta_dot_learned_dense, landscape_resolution,
+    )
     axes[1].set_title("Learned ‖∇H‖ (interpolated)")
 
     im2 = axes[2].imshow(
