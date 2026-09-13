@@ -519,6 +519,18 @@ def _plot_gradient_magnitude_landscape(
     *shape* (own color scales, like the energy-landscape plot — the gauge
     freedom on H means only relative structure, not absolute magnitude, is
     meaningful).
+
+    Direction: the magnitude heatmaps are overlaid with a subsampled quiver
+    of the (signed) gradient components, and a 5th panel shows cosine
+    similarity between ∇H_true and ∇H_learned across the dense grid. This is
+    a meaningful comparison (not just magnitude) because phi_q/phi_p are
+    independent per-axis flows (q = phi_q(h_q), p = phi_p(h_p), no q/p
+    mixing) — so the learned gradient's direction is only per-axis warped
+    relative to the true (θ, θ̇) gradient, not arbitrarily rotated the way a
+    general canonical transformation could. Cosine similarity near 1
+    everywhere indicates the learned H's level sets are the right shape
+    (increasing/decreasing in the right places along each axis) even where
+    magnitude is off by a per-axis scale factor.
     """
     model.eval()
     if device is None:
@@ -534,73 +546,108 @@ def _plot_gradient_magnitude_landscape(
         z = torch.cat([q, p], dim=-1).requires_grad_(True)
         H_val = dyn.hamiltonian(z[:, :q_dim], z[:, q_dim:]).sum()
         grad_H = torch.autograd.grad(H_val, z)[0]
-    grad_mag_learned = grad_H.norm(dim=-1).detach().cpu().numpy()
+    grad_H_learned = grad_H.detach().cpu().numpy()
+    grad_mag_learned = np.linalg.norm(grad_H_learned, axis=-1)
 
     theta = samples["theta"].cpu().numpy()
     theta_dot = samples["theta_dot"].cpu().numpy()
     g_theta_true, g_theta_dot_true = grad_H_true(torch.as_tensor(theta), torch.as_tensor(theta_dot))
-    grad_mag_true = torch.sqrt(g_theta_true**2 + g_theta_dot_true**2).numpy()
+    g_theta_true, g_theta_dot_true = g_theta_true.numpy(), g_theta_dot_true.numpy()
+    grad_mag_true = np.sqrt(g_theta_true**2 + g_theta_dot_true**2)
 
     theta_dense = torch.linspace(-torch.pi, torch.pi, landscape_resolution)
     theta_dot_dense = torch.linspace(min_vel, max_vel, landscape_resolution)
     grid_theta, grid_theta_dot = torch.meshgrid(theta_dense, theta_dot_dense, indexing="xy")
     g_theta_dense, g_theta_dot_dense = grad_H_true(grid_theta, grid_theta_dot)
-    grad_mag_true_dense = torch.sqrt(g_theta_dense**2 + g_theta_dot_dense**2).numpy()
+    g_theta_dense, g_theta_dot_dense = g_theta_dense.numpy(), g_theta_dot_dense.numpy()
+    grad_mag_true_dense = np.sqrt(g_theta_dense**2 + g_theta_dot_dense**2)
 
-    grad_mag_learned_dense = griddata(
-        points=np.stack([theta, theta_dot], axis=-1),
-        values=grad_mag_learned,
-        xi=(grid_theta.numpy(), grid_theta_dot.numpy()),
-        method="cubic",
+    points = np.stack([theta, theta_dot], axis=-1)
+    xi = (grid_theta.numpy(), grid_theta_dot.numpy())
+    grad_mag_learned_dense = griddata(points=points, values=grad_mag_learned, xi=xi, method="cubic")
+    # Learned gradient components (∂H/∂q, ∂H/∂p), interpolated the same way as
+    # the magnitude so the quiver/cosine-similarity panels sit on the same
+    # dense grid. Each axis is warped independently by phi_q/phi_p (see
+    # docstring), so these components are directionally comparable to
+    # (∂H_true/∂θ, ∂H_true/∂θ̇) even though their absolute scale isn't.
+    gq_learned_dense = griddata(points=points, values=grad_H_learned[:, 0], xi=xi, method="cubic")
+    gp_learned_dense = griddata(points=points, values=grad_H_learned[:, 1], xi=xi, method="cubic")
+
+    cos_sim_dense = (
+        (g_theta_dense * gq_learned_dense + g_theta_dot_dense * gp_learned_dense)
+        / (grad_mag_true_dense * np.sqrt(gq_learned_dense**2 + gp_learned_dense**2))
     )
 
     extent = [-np.pi, np.pi, min_vel, max_vel]
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
     axes = axes.ravel()
+
+    # Subsample the dense grid for a readable quiver (every `stride`-th point
+    # in each axis); arrows are unit-normalized per field so direction reads
+    # clearly regardless of the (very different) true/learned magnitude scales.
+    stride = max(landscape_resolution // 20, 1)
+    qx = grid_theta.numpy()[::stride, ::stride]
+    qy = grid_theta_dot.numpy()[::stride, ::stride]
+
+    def _unit(u, v):
+        mag = np.sqrt(u**2 + v**2)
+        mag = np.where(mag > 0, mag, 1.0)
+        return u / mag, v / mag
 
     im0 = axes[0].imshow(
         grad_mag_true_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
     )
-    axes[0].set_title("Ground truth")
     fig.colorbar(im0, ax=axes[0], label="‖∇H_true‖", pad=0.02)
+    uu, vv = _unit(g_theta_dense[::stride, ::stride], g_theta_dot_dense[::stride, ::stride])
+    axes[0].quiver(qx, qy, uu, vv, color="white", angles="xy", pivot="mid", scale=25, width=0.004)
+    axes[0].set_title("Ground truth")
 
     im1 = axes[1].imshow(
         grad_mag_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
     )
-    axes[1].set_title("Learned ‖∇H‖ (interpolated)")
     fig.colorbar(im1, ax=axes[1], label="‖∇H_learned‖", pad=0.02)
+    uu, vv = _unit(gq_learned_dense[::stride, ::stride], gp_learned_dense[::stride, ::stride])
+    axes[1].quiver(qx, qy, uu, vv, color="white", angles="xy", pivot="mid", scale=25, width=0.004)
+    axes[1].set_title("Learned ‖∇H‖ (interpolated)")
 
     im2 = axes[2].imshow(
+        cos_sim_dense, origin="lower", aspect="auto", extent=extent, cmap="RdBu_r", vmin=-1, vmax=1,
+    )
+    fig.colorbar(im2, ax=axes[2], label="cos(∇H_true, ∇H_learned)", pad=0.02)
+    axes[2].set_title("Gradient direction agreement")
+
+    im3 = axes[3].imshow(
         grad_mag_learned_dense, origin="lower", aspect="auto", extent=extent, cmap="viridis",
     )
-    axes[2].scatter(
-        theta, theta_dot, c=grad_mag_learned, cmap="viridis", vmin=im2.norm.vmin, vmax=im2.norm.vmax,
+    axes[3].scatter(
+        theta, theta_dot, c=grad_mag_learned, cmap="viridis", vmin=im3.norm.vmin, vmax=im3.norm.vmax,
         s=30, edgecolors="white", linewidths=0.6,
     )
-    axes[2].set_title("Learned ‖∇H‖ (interpolated + measured points)")
-    fig.colorbar(im2, ax=axes[2], label="‖∇H_learned‖", pad=0.02)
+    axes[3].set_title("Learned ‖∇H‖ (interpolated + measured points)")
+    fig.colorbar(im3, ax=axes[3], label="‖∇H_learned‖", pad=0.02)
 
-    for ax in axes[:3]:
+    for ax in (axes[0], axes[1], axes[2], axes[3]):
         ax.set_xlabel("θ (rad)")
+        ax.set_ylabel("θ̇ (rad/s)")
         ax.set_xlim(-np.pi, np.pi)
         ax.set_ylim(min_vel, max_vel)
-    axes[0].set_ylabel("θ̇ (rad/s)")
-    axes[2].set_ylabel("θ̇ (rad/s)")
 
     r = np.corrcoef(grad_mag_true, grad_mag_learned)[0, 1]
 
     slope, intercept = np.polyfit(grad_mag_true, grad_mag_learned, 1)
     fit_x = np.array([grad_mag_true.min(), grad_mag_true.max()])
-    ax3 = axes[3]
-    ax3.scatter(grad_mag_true, grad_mag_learned, s=10, alpha=0.3)
-    ax3.plot(
+    ax4 = axes[4]
+    ax4.scatter(grad_mag_true, grad_mag_learned, s=10, alpha=0.3)
+    ax4.plot(
         fit_x, slope * fit_x + intercept, color="crimson",
         label=f"fit: y = {slope:.2f}x + {intercept:.2f}\nR² = {r**2:.3f}",
     )
-    ax3.set_xlabel("‖∇H_true‖")
-    ax3.set_ylabel("‖∇H_learned‖")
-    ax3.set_title("True vs. learned gradient magnitude")
-    ax3.legend(loc="best", fontsize=9)
+    ax4.set_xlabel("‖∇H_true‖")
+    ax4.set_ylabel("‖∇H_learned‖")
+    ax4.set_title("True vs. learned gradient magnitude")
+    ax4.legend(loc="best", fontsize=9)
+
+    axes[5].axis("off")
 
     fig.suptitle(f"‖∇H_true‖ vs. ‖∇H_learned‖, Pearson r={r:.3f}")
     fig.tight_layout()
