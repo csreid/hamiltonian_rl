@@ -1,8 +1,10 @@
 """Linear probes on Phase 2/3's post-phi phase space, mirroring
 `_log_latent_scatter_phase1` (which probes Phase 1's `f_psi(h)`) but for
-`dynamics.phi(h)` instead -- the flow actually used for the Hamiltonian
-rollout, and the one `h_source="canonical"` depends on being physically
-meaningful.
+`dynamics.encode(h)` instead -- the block-diagonal (phi_q, phi_p) flow
+actually used for the Hamiltonian rollout, and the one `h_source="canonical"`
+depends on being physically meaningful. With `phi_source="identity"` these
+flows are no-ops, so this probe degenerates to checking the raw encoder
+split `q = h[:, :q_dim]`, `p = h[:, q_dim:]` directly.
 
 Two probes are fit and plotted side by side:
 
@@ -60,7 +62,8 @@ def _encode_trajectories(
         ctx = frames.unsqueeze(0).to(device)
         mu_all, _ = model.autoencoder.encoder.forward_all(ctx)
         h_all = mu_all.squeeze(0)
-        s_all = model.dynamics.phi(h_all).cpu()
+        q_all, p_all = model.dynamics.encode(h_all)
+        s_all = torch.cat([q_all, p_all], dim=-1).cpu()
         all_s.append(s_all)
         all_st.append(states.float())
     return all_s, all_st

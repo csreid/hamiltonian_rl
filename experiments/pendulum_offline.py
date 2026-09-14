@@ -721,6 +721,38 @@ def _plot_gradient_magnitude_landscape(
 
     return fig, r
 
+def _hsic_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Biased HSIC estimate of statistical dependence between x and y's rows.
+
+    Unlike a cross-covariance/correlation penalty, HSIC (with RBF kernels)
+    also catches nonlinear/multiplicative dependence -- e.g. a p-dimension
+    shaped like theta_dot * f(theta), which is antisymmetric under time
+    reversal (so the reversal loss doesn't penalise it) but still leaks
+    position through the theta-dependent factor. Minimising it is a
+    tractable proxy for minimising mutual information between the q and p
+    halves of the latent, not an exact MI estimator.
+
+    x: (N, d_x), y: (N, d_y) -- rows are samples (pool batch and time).
+    Kernel bandwidths use the per-batch median-distance heuristic, detached
+    so the loss can't cheat by inflating the bandwidth.
+    """
+    n = x.shape[0]
+    if n < 2:
+        return x.new_zeros(())
+
+    def _gram(z: torch.Tensor) -> torch.Tensor:
+        d2 = torch.cdist(z, z).pow(2)
+        med = d2.detach().flatten().median().clamp(min=1e-6)
+        return torch.exp(-d2 / (2 * med))
+
+    kx = _gram(x)
+    ky = _gram(y)
+    h = torch.eye(n, device=x.device, dtype=x.dtype) - 1.0 / n
+    kxc = h @ kx @ h
+    kyc = h @ ky @ h
+    return (kxc * kyc).sum() / ((n - 1) ** 2)
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: autoencoder training
 # ---------------------------------------------------------------------------
@@ -741,6 +773,7 @@ def _train_epoch_phase1(
     max_context_len: int = 0,
     deterministic: bool = False,
     time_reversal_weight: float = 0.0,
+    mi_weight: float = 0.0,
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
 
@@ -766,9 +799,16 @@ def _train_epoch_phase1(
     deliberately *not* through next_frame_decoder: "next frame" under a
     reversed action sequence isn't a real physical transition (the actions
     weren't negated to match), so that signal would be wrong.
+
+    mi_weight > 0 adds an HSIC-based dependence penalty between the q-half
+    and p-half of mu_all (see _hsic_loss): unlike time_reversal_weight,
+    which only requires p to flip sign under reversal, this directly
+    attacks position information smuggled into p in a way that happens to
+    still be antisymmetric (e.g. theta_dot * f(theta)) by penalising any
+    detectable statistical dependence between the two halves, linear or not.
     """
     model.train()
-    total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_gate = total_time_reversal = total_loss = 0.0
+    total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_gate = total_time_reversal = total_mi = total_loss = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
@@ -848,6 +888,15 @@ def _train_epoch_phase1(
             loss = loss + time_reversal_weight * time_reversal_consistency
             total_time_reversal = total_time_reversal + time_reversal_consistency.detach()
 
+        # Mutual-information penalty between q and p (see _hsic_loss):
+        # pooled over batch and time so the kernel has enough samples.
+        if mi_weight > 0:
+            flat_q = mu_all[:, :, :q_dim].reshape(-1, q_dim)
+            flat_p = mu_all[:, :, q_dim:].reshape(-1, mu_all.shape[-1] - q_dim)
+            mi_loss = _hsic_loss(flat_q, flat_p)
+            loss = loss + mi_weight * mi_loss
+            total_mi = total_mi + mi_loss.detach()
+
         # Sparsity regulariser: L1 on the latent mean pushes irrelevant
         # dimensions to exactly 0 (unlike the KL term, which only pulls
         # every dimension toward the unit prior). A sparse h also encourages
@@ -905,6 +954,7 @@ def _train_epoch_phase1(
         "phase1/sparsity": float(total_sparsity) / n,
         "phase1/gate_l0": float(total_gate) / n,
         "phase1/time_reversal": float(total_time_reversal) / n,
+        "phase1/mi": float(total_mi) / n,
         "phase1/effective_dim": (
             model.encoder.gate.effective_dim() if model.encoder.gate is not None else float("nan")
         ),
@@ -1732,6 +1782,7 @@ def _train_epoch_joint(
     pixel_cl_weight: float = 1.0,
     huber_delta: float = 0.0,
     decode_stride: int = 1,
+    mi_weight: float = 0.0,
 ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
     """One epoch of blended autoencoder + Hamiltonian-dynamics training.
 
@@ -1773,6 +1824,8 @@ def _train_epoch_joint(
     q(-t)=q(t), p(-t)=-p(t). energy_balance_weight > 0 adds the same
     port-Hamiltonian energy-balance consistency loss as phase2/phase3 (see
     _energy_balance_loss), evaluated on this batch's own q_win/p_win.
+    mi_weight > 0 adds the HSIC dependence penalty between mu_all's q/p
+    halves (see _hsic_loss and _train_epoch_phase1's docstring).
     """
     model, dyn_model = world_model.autoencoder, world_model.dynamics
     model.train()
@@ -1782,7 +1835,7 @@ def _train_epoch_joint(
 
     total_recon = total_recon_next = total_kl = 0.0
     total_tf = total_cl = total_logdet_reg = total_dynamics = total_loss = 0.0
-    total_time_reversal = total_energy_balance = total_grad_H_norm = 0.0
+    total_time_reversal = total_energy_balance = total_grad_H_norm = total_mi = 0.0
     total_pix_cl = 0.0
     total_q_var = total_p_var = None
 
@@ -1851,6 +1904,15 @@ def _train_epoch_joint(
             )
             loss = loss + time_reversal_weight * time_reversal_consistency
             total_time_reversal = total_time_reversal + time_reversal_consistency.detach()
+
+        # Mutual-information penalty between q and p (see _hsic_loss):
+        # pooled over batch and time so the kernel has enough samples.
+        if mi_weight > 0:
+            flat_q = mu_all[:, :, :q_dim].reshape(-1, q_dim)
+            flat_p = mu_all[:, :, q_dim:].reshape(-1, D - q_dim)
+            mi_loss = _hsic_loss(flat_q, flat_p)
+            loss = loss + mi_weight * mi_loss
+            total_mi = total_mi + mi_loss.detach()
 
         # --- Dynamics (Phase-2 style), on a sub-window of this batch's own
         # encoding (h = mu_all, not the sampled z) ---
@@ -1984,6 +2046,7 @@ def _train_epoch_joint(
         "joint/time_reversal": float(total_time_reversal) / n,
         "joint/energy_balance": float(total_energy_balance) / n,
         "joint/grad_H_norm": float(total_grad_H_norm) / n,
+        "joint/mi": float(total_mi) / n,
     }
     return metrics, total_q_var / n, total_p_var / n
 
@@ -2933,6 +2996,13 @@ def cli():
                    "the main reconstruction loss at weight 1): require q "
                    "unchanged / p negated relative to the forward encoding "
                    "(0 to disable the whole augmentation)")
+@click.option("--mi-weight", type=float, default=0.0, show_default=True,
+              help="Weight on an HSIC dependence penalty between the q-half "
+                   "and p-half of the latent (0 to disable): unlike "
+                   "time-reversal-weight, penalises any detectable "
+                   "statistical dependence (linear or not) between the two "
+                   "halves, not just violations of the antisymmetry-under- "
+                   "reversal identity")
 @click.option("--use-gate", is_flag=True, default=False, show_default=True,
               help="Replace/augment L1 sparsity with a learned per-dim L0 "
                    "hard-concrete gate on the latent mean")
@@ -3103,6 +3173,7 @@ def phase1_cmd(**kwargs):
             max_context_len=kwargs["max_context_len"],
             deterministic=kwargs["deterministic"],
             time_reversal_weight=kwargs["time_reversal_weight"],
+            mi_weight=kwargs["mi_weight"],
         )
         metrics["phase1/gate_weight_effective"] = gate_weight_epoch
 
@@ -4236,6 +4307,13 @@ def phase3_cmd(**kwargs):
                    "(reversed-encoding reconstruction is always folded into "
                    "the main reconstruction loss at weight 1): require q "
                    "unchanged / p negated (0 disables the whole augmentation)")
+@click.option("--mi-weight", type=float, default=0.0, show_default=True,
+              help="Weight on an HSIC dependence penalty between the q-half "
+                   "and p-half of the latent (0 to disable): unlike "
+                   "time-reversal-weight, penalises any detectable "
+                   "statistical dependence (linear or not) between the two "
+                   "halves, not just violations of the antisymmetry-under- "
+                   "reversal identity")
 @click.option("--energy-balance-weight", type=float, default=0.0, show_default=True,
               help="Weight on the port-Hamiltonian energy-balance consistency "
                    "loss, scaled by the same dynamics-weight curriculum as the "
@@ -4454,6 +4532,7 @@ def joint_cmd(**kwargs):
             pixel_cl_weight=kwargs["pixel_cl_weight"],
             huber_delta=kwargs["huber_delta"],
             decode_stride=kwargs["decode_stride"],
+            mi_weight=kwargs["mi_weight"],
         )
 
         alpha = kwargs["ema_alpha"]
