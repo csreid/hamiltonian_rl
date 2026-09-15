@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -721,6 +722,26 @@ def _plot_gradient_magnitude_landscape(
 
     return fig, r
 
+
+def _safe_lstsq(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """torch.linalg.lstsq, but non-finite input raises a clear error instead
+    of crashing deep in MKL's LAPACK backend.
+
+    On CPU, a NaN/Inf anywhere in `A` makes the LAPACK SGELSY/DGELSY driver
+    return an internal error code that torch.linalg.lstsq doesn't know how
+    to translate, so it surfaces as "RuntimeError: false INTERNAL ASSERT
+    FAILED ... Argument 4 has illegal value" — which looks like a PyTorch
+    bug report but actually just means the model diverged upstream (e.g. a
+    NaN loss during training) and produced NaN activations.
+    """
+    if not (torch.isfinite(A).all() and torch.isfinite(B).all()):
+        raise ValueError(
+            "lstsq input contains NaN/Inf — the model likely diverged "
+            "during training (check for a NaN loss earlier in the run) "
+            "rather than this being a torch.linalg.lstsq bug."
+        )
+    return torch.linalg.lstsq(A, B).solution
+
 def _hsic_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Biased HSIC estimate of statistical dependence between x and y's rows.
 
@@ -741,7 +762,13 @@ def _hsic_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return x.new_zeros(())
 
     def _gram(z: torch.Tensor) -> torch.Tensor:
-        d2 = torch.cdist(z, z).pow(2)
+        # Squared distance computed directly (no sqrt) -- torch.cdist takes
+        # sqrt(sum sq diff) internally, whose backward is 0/0 = NaN at
+        # exactly-zero distance (any point against itself, or converged/
+        # near-duplicate latents), and clip_grad_norm_ then broadcasts that
+        # single NaN gradient into every parameter in the same step.
+        sq = (z * z).sum(dim=-1, keepdim=True)
+        d2 = (sq + sq.transpose(-2, -1) - 2 * z @ z.transpose(-2, -1)).clamp(min=0)
         med = d2.detach().flatten().median().clamp(min=1e-6)
         return torch.exp(-d2 / (2 * med))
 
@@ -930,6 +957,15 @@ def _train_epoch_phase1(
             temporal_reg = F.relu(temporal_scale * dt - dist).mean()
             loss = loss + temporal_reg_weight * temporal_reg
             total_temporal = total_temporal + temporal_reg.detach()
+
+        if not torch.isfinite(loss):
+            # A single non-finite gradient makes clip_grad_norm_'s total_norm
+            # NaN, which then scales *every* parameter's gradient by NaN in
+            # this same step -- one bad batch would otherwise permanently
+            # corrupt the model instead of just being skipped.
+            warnings.warn(f"phase1: non-finite loss ({loss.item()}) — skipping batch")
+            optimizer.zero_grad()
+            continue
 
         optimizer.zero_grad()
         loss.backward()
@@ -1354,7 +1390,7 @@ def _log_latent_scatter_phase1(
     # frames within a trajectory are highly correlated).
     train_s = torch.cat([s for all_s in per_policy_s.values() for s in all_s[0::2]], dim=0)
     train_st = torch.cat([st for all_st in per_policy_st.values() for st in all_st[0::2]], dim=0)
-    A = torch.linalg.lstsq(train_s, train_st).solution
+    A = _safe_lstsq(train_s, train_st)
 
     val_pred, val_true = {}, {}
     for label in per_policy_s:
@@ -1429,8 +1465,8 @@ def _log_half_latent_probes_phase1(
     train_hq = torch.cat([h for hs in per_policy_hq.values() for h in hs[0::2]], dim=0)
     train_hp = torch.cat([h for hs in per_policy_hp.values() for h in hs[0::2]], dim=0)
     train_st = torch.cat([s for ss in per_policy_st.values() for s in ss[0::2]], dim=0)
-    A_q = torch.linalg.lstsq(train_hq, train_st).solution
-    A_p = torch.linalg.lstsq(train_hp, train_st).solution
+    A_q = _safe_lstsq(train_hq, train_st)
+    A_p = _safe_lstsq(train_hp, train_st)
 
     val_pred_q, val_pred_p, val_true = {}, {}, {}
     for label in per_policy_hq:
@@ -1514,11 +1550,11 @@ def _log_h_state_regression_coeffs_phase1(
     st_pool = torch.cat(all_st, dim=0)
 
     # h → state: (dim_h, 3); row i = h_i's contribution to each state comp.
-    A = torch.linalg.lstsq(h_pool, st_pool).solution
+    A = _safe_lstsq(h_pool, st_pool)
 
     # state → h: (3, dim_h) -> transpose to (dim_h, 3) so row i holds the
     # three state coefficients of the regression fit onto h_i alone.
-    B_t = torch.linalg.lstsq(st_pool, h_pool).solution.T
+    B_t = _safe_lstsq(st_pool, h_pool).T
 
     dim_h = A.shape[0]
     labels = ["cos(θ)", "sin(θ)", "θ̇"]
@@ -1623,7 +1659,7 @@ def _log_cnn_feature_regression_phase1(
 
     train_feat = torch.cat([f for all_f in per_policy_feat.values() for f in all_f[0::2]], dim=0)
     train_theta = torch.cat([t for all_t in per_policy_theta.values() for t in all_t[0::2]], dim=0)
-    A = torch.linalg.lstsq(train_feat, train_theta).solution
+    A = _safe_lstsq(train_feat, train_theta)
 
     val_pred, val_true = {}, {}
     for label in per_policy_feat:
@@ -1998,6 +2034,14 @@ def _train_epoch_joint(
             total_energy_balance = total_energy_balance + eb_loss.detach()
 
         loss = loss + dynamics_weight * dynamics_loss
+
+        if not torch.isfinite(loss):
+            # See _train_epoch_phase1: a single non-finite gradient makes
+            # clip_grad_norm_'s total_norm NaN, corrupting every parameter
+            # in this step rather than just this batch.
+            warnings.warn(f"joint: non-finite loss ({loss.item()}) — skipping batch")
+            optimizer.zero_grad()
+            continue
 
         optimizer.zero_grad()
         loss.backward()
@@ -2633,7 +2677,7 @@ def _log_phase_space_regression_phase2(
         torch.arange(n_steps, dtype=torch.float32).repeat(all_qp[1::2].shape[0]).numpy()
     )
 
-    A = torch.linalg.lstsq(train_qp, train_st).solution
+    A = _safe_lstsq(train_qp, train_st)
     st_pred = (val_qp @ A).numpy()
     st_true = val_st.numpy()
 
