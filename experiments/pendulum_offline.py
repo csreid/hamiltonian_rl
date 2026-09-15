@@ -1051,6 +1051,63 @@ def _log_reconstruction_lstm_video(
 
 
 @torch.no_grad()
+def _log_context_prediction_phase1(
+    model: TemporalAutoencoder,
+    dataset: Dataset,
+    device: torch.device,
+    writer: SummaryWriter,
+    epoch: int,
+    context_frames: int = 3,
+    n_samples: int = 4,
+    tag: str = "val/context_prediction",
+) -> None:
+    """Static grid of one-step predictions, isolating `recon_next` visually.
+
+    For each of a few freshly-sampled training windows: the encoder consumes
+    `context_frames` frames of context plus one more ("frame t", still
+    ground truth, extending the causal LSTM by one step), then
+    `next_frame_decoder(h_t, a_t)` predicts frame t+1. Each row shows
+    given frame t-1, given frame t, the predicted frame t+1, and (for
+    comparison) the true frame t+1 — the same one-step predictive signal
+    `_train_epoch_phase1` trains against, but at a fixed context length
+    instead of averaged over the whole loss curve.
+    """
+    model.eval()
+
+    col_labels = ["t-1 (given)", "t (given)", "t+1 (predicted)", "t+1 (true)"]
+    rows = []
+    n_found = 0
+    n_tries = 0
+    while n_found < n_samples and n_tries < n_samples * 5:
+        n_tries += 1
+        frames, actions, _ = dataset[0]  # fresh random window each call
+        if frames.shape[0] < context_frames + 2:
+            continue
+        n_found += 1
+
+        window = frames[: context_frames + 2].unsqueeze(0).to(device)  # (1, ctx+2, C, H, W)
+        a_t = actions[context_frames].to(device=device, dtype=window.dtype).view(1, 1)
+
+        mu_all, _ = model.encoder.forward_all(window[:, : context_frames + 1])
+        h_t = mu_all[:, -1]
+        pred_next = model.next_frame_decoder(h_t, a_t).squeeze(0).clamp(0, 1).cpu()
+
+        frame_tm1 = frames[context_frames - 1]
+        frame_t = frames[context_frames]
+        frame_tp1_true = frames[context_frames + 1]
+
+        row_imgs = [frame_tm1, frame_t, pred_next, frame_tp1_true]
+        if n_found == 1:
+            row_imgs = [_annotate_frame(img, label) for img, label in zip(row_imgs, col_labels)]
+        rows.append(torch.cat(row_imgs, dim=2))  # concat along width
+
+    if not rows:
+        return
+    grid = torch.cat(rows, dim=1)  # concat along height
+    writer.add_image(tag, grid.clamp(0, 1), epoch)
+
+
+@torch.no_grad()
 def _log_latent_distribution_phase1(
     model: TemporalAutoencoder,
     val_traj_sets: list,
@@ -3028,6 +3085,12 @@ def cli():
 @click.option("--max-context-len", type=int, default=0, show_default=True,
               help="Max frames fed to LSTM per batch step (0 = full sequence). "
                    "Sampled uniformly from [2, max-context-len] each step.")
+@click.option("--diag-context-frames", type=int, default=3, show_default=True,
+              help="Context length (frames before 'frame t') for the "
+                   "val/context_prediction diagnostic image.")
+@click.option("--diag-n-samples", type=int, default=4, show_default=True,
+              help="Number of sampled windows shown in the "
+                   "val/context_prediction diagnostic image.")
 @click.option("--temporal-reg-weight", type=float, default=0.1, show_default=True,
               help="Temporal metric regulariser weight (0 to disable)")
 @click.option("--temporal-scale", type=float, default=0.01, show_default=True,
@@ -3313,6 +3376,13 @@ def phase1_cmd(**kwargs):
                 model=model, val_traj=dataset[0],  # a fresh random window
                 device=device, writer=writer, epoch=epoch,
                 tag="train/reconstruction_lstm",
+            )
+            _log_context_prediction_phase1(
+                model=model, dataset=dataset,
+                device=device, writer=writer, epoch=epoch,
+                context_frames=kwargs["diag_context_frames"],
+                n_samples=kwargs["diag_n_samples"],
+                tag="train/context_prediction",
             )
 
         if (
