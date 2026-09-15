@@ -377,6 +377,8 @@ def _save_bridge(run_dir: Path, stem: str, bridge: PhaseSpaceBridge, hidden_dim:
 @click.option("--separable/--no-separable", default=True, show_default=True)
 @click.option("--h-source", type=click.Choice(["learned", "canonical"]), default="learned",
               show_default=True)
+@click.option("--phi-source", type=click.Choice(["learned", "identity"]), default="learned",
+              show_default=True)
 @click.option("--r-source", type=click.Choice(["learned", "fixed_damping", "canonical"]),
               default="learned", show_default=True)
 @click.option("--b-source", type=click.Choice(["learned", "fixed_ones", "canonical"]),
@@ -517,6 +519,7 @@ def main(**kwargs):
         control_dim=1,
         separable=kwargs["separable"],
         h_source=kwargs["h_source"],
+        phi_source=kwargs["phi_source"],
         r_source=kwargs["r_source"],
         b_source=kwargs["b_source"],
         dt=kwargs["dt"],
