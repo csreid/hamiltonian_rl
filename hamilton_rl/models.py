@@ -1056,7 +1056,7 @@ class HamiltonianFlowModel(nn.Module):
         h_source: str = "learned",
         r_source: str = "learned",
         b_source: str = "learned",
-        dt: float = 0.05,
+        dt: float = 0.1,
         damping: float = 0.0,
         drag: float = _DRAG_COEFF,
         integrator: str = "rk4",
@@ -1671,8 +1671,8 @@ class StatePHGN(nn.Module):
 
     Args:
         hidden_dim:   width of Hamiltonian MLP hidden layers
-        dt:           integration step size (should match env timestep, 0.05
-                      for Pendulum-v1)
+        dt:           integration step size (should match env timestep, 0.1
+                      for Pendulum-v1 here)
         control_dim:  dimension of control input u (1 for Pendulum-v1)
         separable:    use T(p) + V(q) Hamiltonian decomposition
         quadratic_t:  T(p) = ½pᵀM⁻¹p with a learned constant mass, instead of
@@ -1702,7 +1702,7 @@ class StatePHGN(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 256,
-        dt: float = 0.05,
+        dt: float = 0.1,
         control_dim: int = 1,
         separable: bool = True,
         h_source: str = "learned",

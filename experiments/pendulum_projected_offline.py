@@ -483,7 +483,7 @@ def _plot_dissipation_landscape(
 # model
 @click.option("--hidden-dim", type=int, default=256, show_default=True,
               help="Width of Hamiltonian MLP hidden layers (via MLPHamiltonianNet default)")
-@click.option("--dt", type=float, default=0.05, show_default=True)
+@click.option("--dt", type=float, default=0.1, show_default=True)
 @click.option("--separable/--no-separable", default=True, show_default=True)
 @click.option("--h-source", type=click.Choice(["learned", "canonical"]), default="learned",
               show_default=True)

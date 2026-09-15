@@ -373,7 +373,7 @@ def _save_bridge(run_dir: Path, stem: str, bridge: PhaseSpaceBridge, hidden_dim:
               help="Path to a Phase 2 or cheater checkpoint (.pt) whose dynamics weights to "
                    "warm-start from; training still writes to a fresh run dir")
 # dynamics model (HamiltonianFlowModel — same as Phase 2)
-@click.option("--dt", type=float, default=0.05, show_default=True)
+@click.option("--dt", type=float, default=0.1, show_default=True)
 @click.option("--separable/--no-separable", default=True, show_default=True)
 @click.option("--h-source", type=click.Choice(["learned", "canonical"]), default="learned",
               show_default=True)

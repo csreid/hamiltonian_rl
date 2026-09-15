@@ -15,7 +15,7 @@ from tqdm import tqdm
 # Pendulum-v1 physical constants (gymnasium defaults)
 _G = 10.0
 _H_STAR = 20.0  # 2 * m * g * l  with m=l=1, g=10
-_DT = 0.05  # integration timestep (matches Pendulum-v1's default)
+_DT = 0.1  # integration timestep (2x Pendulum-v1's default 0.05, for easier velocity ID)
 _MAX_SPEED = 8.0  # nominal velocity scale used for normalization/plot ranges
                    # (Pendulum-v1's old hard clip value; no longer physically
                    # enforced — see _DRAG_COEFF, which bounds speed smoothly

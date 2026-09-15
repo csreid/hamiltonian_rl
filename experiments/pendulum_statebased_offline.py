@@ -737,7 +737,7 @@ def _log_rollout_videos(
     show_default=True,
     help="Width of Hamiltonian MLP hidden layers",
 )
-@click.option("--dt", type=float, default=0.05, show_default=True)
+@click.option("--dt", type=float, default=0.1, show_default=True)
 @click.option("--separable/--no-separable", default=True, show_default=True)
 @click.option(
     "--h-source",

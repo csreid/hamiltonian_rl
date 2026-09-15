@@ -3419,7 +3419,7 @@ def phase1_cmd(**kwargs):
                    "from; training still writes to a fresh run dir, and the optimizer "
                    "and epoch count both restart from scratch")
 # dynamics model
-@click.option("--dt", type=float, default=0.05, show_default=True,
+@click.option("--dt", type=float, default=0.1, show_default=True,
               help="Integration step size (should match the env frame interval)")
 @click.option("--separable/--no-separable", default=True, show_default=True,
               help="Use a separable Hamiltonian H = T(p) + V(q); required for --integrator leapfrog")
@@ -4368,7 +4368,7 @@ def phase3_cmd(**kwargs):
 @click.option("--encoder-type", type=click.Choice(["lstm", "framestack"]), default="lstm",
               show_default=True)
 # dynamics architecture
-@click.option("--dt", type=float, default=0.05, show_default=True,
+@click.option("--dt", type=float, default=0.1, show_default=True,
               help="Integration timestep for the Hamiltonian flow")
 @click.option("--separable/--no-separable", default=True, show_default=True)
 @click.option("--h-source", type=click.Choice(["learned", "canonical"]), default="learned",
