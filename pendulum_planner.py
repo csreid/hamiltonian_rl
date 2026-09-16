@@ -677,7 +677,7 @@ def rollout_plan_on_env(img_size: int, damping: float, theta0: float, theta_dot0
         for t in range(actions.shape[0]):
             u = float(actions[t, 0])
             env.step(np.array([u], dtype=np.float32))
-            frames.append(env.render_with_action(u))
+            frames.append(env.render_with_action(u).transpose(1, 2, 0))
     finally:
         env.close()
     return frames
