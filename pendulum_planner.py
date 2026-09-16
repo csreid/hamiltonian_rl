@@ -660,6 +660,29 @@ def decode_plan_frames(
     return to_uint8(torch.stack(decoded)) if decoded else []
 
 
+@torch.no_grad()
+def rollout_plan_on_env(img_size: int, damping: float, theta0: float, theta_dot0: float, actions: torch.Tensor) -> list:
+    """Step the real env open-loop through one control step's committed action
+    sequence, starting from the real physical state that step planned from.
+
+    Counterpart to `decode_plan_frames`: same actions, but applied to the real
+    `PendulumPixelEnv` dynamics instead of the learned dynamics, so the two can
+    be compared frame-for-frame against the same real starting state.
+    """
+    env = PendulumPixelEnv(img_size=img_size, damping=damping)
+    env.reset()
+    env.set_state(theta0, theta_dot0)
+    frames = []
+    try:
+        for t in range(actions.shape[0]):
+            u = float(actions[t, 0])
+            env.step(np.array([u], dtype=np.float32))
+            frames.append(env.render_with_action(u))
+    finally:
+        env.close()
+    return frames
+
+
 # ── Phase-space animation ────────────────────────────────────────────────────
 
 
@@ -1000,11 +1023,12 @@ if result_model_kind == "pixel":
         "Control step to inspect", min_value=0, max_value=n_control_steps - 1, value=0
     )
     with st.spinner("Decoding imagined plan…"):
+        plan_actions = latent_result["plan_actions"][plan_step]
         plan_frames_u8 = decode_plan_frames(
             world_model=world_model,
             q0=latent_result["plan_q0"][plan_step],
             p0=latent_result["plan_p0"][plan_step],
-            actions=latent_result["plan_actions"][plan_step],
+            actions=plan_actions,
         )
         plan_pil = [
             Image.fromarray(f).resize((display_size, display_size), Image.BILINEAR)
@@ -1012,7 +1036,19 @@ if result_model_kind == "pixel":
         ]
         plan_gif = frames_to_gif(plan_pil, fps)
 
-    col_real, col_plan = st.columns(2)
+    with st.spinner("Rolling the plan's actions through the real env…"):
+        actual_frames_u8 = rollout_plan_on_env(
+            img_size=img_size, damping=damping,
+            theta0=latent_result["theta"][plan_step], theta_dot0=latent_result["theta_dot"][plan_step],
+            actions=plan_actions,
+        )
+        actual_pil = [
+            Image.fromarray(f).resize((display_size, display_size), Image.BILINEAR)
+            for f in actual_frames_u8
+        ]
+        actual_gif = frames_to_gif(actual_pil, fps)
+
+    col_real, col_plan, col_actual = st.columns(3)
     with col_real:
         st.caption(f"Real frame at t={plan_step} (start of this step's plan)")
         real_frame = Image.fromarray(latent_frames_u8[max(plan_step - 1, 0)]).resize(
@@ -1020,9 +1056,12 @@ if result_model_kind == "pixel":
         )
         st.image(real_frame, use_container_width=False)
     with col_plan:
-        horizon_len = len(latent_result["plan_actions"][plan_step])
-        st.caption(f"Imagined {horizon_len}-step plan from t={plan_step}")
+        horizon_len = len(plan_actions)
+        st.caption(f"Imagined {horizon_len}-step plan from t={plan_step} (learned dynamics)")
         st.image(plan_gif, use_container_width=False)
+    with col_actual:
+        st.caption(f"Same {horizon_len}-step actions, actual dynamics from t={plan_step}")
+        st.image(actual_gif, use_container_width=False)
 else:
     st.caption(
         "Decoded-plan preview is pixel-model only — the state-based model's imagined "
