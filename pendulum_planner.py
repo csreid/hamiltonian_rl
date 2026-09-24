@@ -644,6 +644,7 @@ def run_autoencoder_mppi(
     thetas = [float(angle_normalize(torch.tensor(float(theta_b))))]
     theta_dots = [float(theta_dot_b)]
     plan_thetas, plan_theta_dots = [], []
+    plan_context, plan_actions_hist = [], []
 
     try:
         for step in range(total_steps):
@@ -653,6 +654,13 @@ def run_autoencoder_mppi(
             else:
                 cost_fn = _autoencoder_rollout_cost_fn(autoencoder, ctx_stack, A, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
+
+            # Snapshot the real context window this step planned from, plus
+            # the chosen action sequence, so a single step's plan can later be
+            # decoded to pixels on demand (see decode_plan_frames_autoencoder_only)
+            # — the autoencoder-only counterpart to plan_q0/plan_p0/plan_actions.
+            plan_context.append(ctx_stack.clone().cpu())
+            plan_actions_hist.append(mean.clone().cpu())
 
             # Roll the chosen (noise-free) plan forward once, purely to show
             # "what does the controller currently intend to do" — never
@@ -700,6 +708,8 @@ def run_autoencoder_mppi(
         "theta_dot": theta_dots,
         "plan_theta": plan_thetas,
         "plan_theta_dot": plan_theta_dots,
+        "plan_context": plan_context,        # len total_steps; real context window each step planned from
+        "plan_actions": plan_actions_hist,   # len total_steps; the chosen (noise-free) H-step action sequence
     }
 
 
@@ -826,6 +836,33 @@ def decode_plan_frames(
         q, p = dynamics.controlled_step(q, p, actions[t : t + 1].to(device))
         h_pred = dynamics.decode(q, p)
         decoded.append(autoencoder.decode_latent(h_pred).squeeze(0).cpu())
+    return to_uint8(torch.stack(decoded)) if decoded else []
+
+
+@torch.no_grad()
+def decode_plan_frames_autoencoder_only(
+    autoencoder, context_frames: torch.Tensor, actions: torch.Tensor
+) -> list:
+    """Decode one control step's imagined H-step plan to pixels — no dynamics model.
+
+    Counterpart to `decode_plan_frames`: `next_frame_decoder(h_t, a_t)` +
+    re-encoding stands in for `controlled_step` + `decode`, same pipeline as
+    `TemporalAutoencoder.dream_frames` / `_autoencoder_rollout_cost_fn`.
+    Starts from the real context window that step planned from; `actions[t]`
+    directly produces frame t+1 (no offset, unlike `dream_frames`, since this
+    is always a single self-contained H-step plan, not a slice of a longer
+    action tape).
+    """
+    device = next(autoencoder.parameters()).device
+    buffer = context_frames.to(device).unsqueeze(0)  # (1, n_context, C, H, W)
+    decoded = []
+    for t in range(actions.shape[0]):
+        mu_all, _ = autoencoder.encoder.forward_all(buffer)
+        h = mu_all[:, -1]
+        u = actions[t : t + 1].to(device)
+        frame = autoencoder.next_frame_decoder(h, u)
+        buffer = torch.cat([buffer, frame.unsqueeze(1)], dim=1)
+        decoded.append(frame.squeeze(0).cpu())
     return to_uint8(torch.stack(decoded)) if decoded else []
 
 
@@ -1240,28 +1277,48 @@ st.markdown(
 )
 st.image(phase_gif, use_container_width=False)
 
-if result_model_kind == "pixel":
+if result_model_kind in ("pixel", "autoencoder_only"):
     st.subheader("Decoded imagined plan at one control step")
-    st.markdown(
-        "MPPI replans from scratch every control step, so the imagined horizon can look "
-        "completely different step to step — averaging or animating across steps would just "
-        "blur that together. Instead, pick one step below to decode *that step's* full "
-        "H-frame plan straight from the learned dynamics (`controlled_step` → `decode` → "
-        "`decode_latent`, the same pipeline `WorldModel.dream` uses), and compare it against "
-        "the real frame the pendulum was actually in when that plan was made."
-    )
+    if result_model_kind == "pixel":
+        st.markdown(
+            "MPPI replans from scratch every control step, so the imagined horizon can look "
+            "completely different step to step — averaging or animating across steps would just "
+            "blur that together. Instead, pick one step below to decode *that step's* full "
+            "H-frame plan straight from the learned dynamics (`controlled_step` → `decode` → "
+            "`decode_latent`, the same pipeline `WorldModel.dream` uses), and compare it against "
+            "the real frame the pendulum was actually in when that plan was made."
+        )
+    else:
+        st.markdown(
+            "MPPI replans from scratch every control step, so the imagined horizon can look "
+            "completely different step to step — averaging or animating across steps would just "
+            "blur that together. Instead, pick one step below to decode *that step's* full "
+            "H-frame plan with **no dynamics model**: iteratively predict "
+            "`next_frame_decoder(h_t, a_t)` and re-encode, then compare it against the actual "
+            "real-dynamics rollout of the exact same actions. Since every dreamed step is itself "
+            "re-encoded to produce the next h, this is exactly where you'd see the autoencoder's "
+            "own predictions drift off the manifold the encoder was actually trained on — the gap "
+            "between the two GIFs *is* that drift, growing (or not) with each iterated step."
+        )
     n_control_steps = len(latent_result["plan_actions"])
     plan_step = st.slider(
         "Control step to inspect", min_value=0, max_value=n_control_steps - 1, value=0
     )
     with st.spinner("Decoding imagined plan…"):
         plan_actions = latent_result["plan_actions"][plan_step]
-        plan_frames_u8 = decode_plan_frames(
-            world_model=world_model,
-            q0=latent_result["plan_q0"][plan_step],
-            p0=latent_result["plan_p0"][plan_step],
-            actions=plan_actions,
-        )
+        if result_model_kind == "pixel":
+            plan_frames_u8 = decode_plan_frames(
+                world_model=world_model,
+                q0=latent_result["plan_q0"][plan_step],
+                p0=latent_result["plan_p0"][plan_step],
+                actions=plan_actions,
+            )
+        else:
+            plan_frames_u8 = decode_plan_frames_autoencoder_only(
+                autoencoder=world_model.autoencoder,
+                context_frames=latent_result["plan_context"][plan_step],
+                actions=plan_actions,
+            )
         plan_pil = [
             Image.fromarray(f).resize((display_size, display_size), Image.BILINEAR)
             for f in plan_frames_u8
@@ -1289,14 +1346,14 @@ if result_model_kind == "pixel":
         st.image(real_frame, use_container_width=False)
     with col_plan:
         horizon_len = len(plan_actions)
-        st.caption(f"Imagined {horizon_len}-step plan from t={plan_step} (learned dynamics)")
+        dyn_label = "learned dynamics" if result_model_kind == "pixel" else "no dynamics — iterated autoencoder"
+        st.caption(f"Imagined {horizon_len}-step plan from t={plan_step} ({dyn_label})")
         st.image(plan_gif, use_container_width=False)
     with col_actual:
         st.caption(f"Same {horizon_len}-step actions, actual dynamics from t={plan_step}")
         st.image(actual_gif, use_container_width=False)
 else:
     st.caption(
-        "Decoded-plan preview is pixel-model only — both the state-based and "
-        "autoencoder-only models' imagined horizons are already shown as the dashed "
-        "line in the phase-space plot above."
+        "Decoded-plan preview isn't available for the state-based model — its imagined "
+        "horizon is already shown as the dashed line in the phase-space plot above."
     )
