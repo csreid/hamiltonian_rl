@@ -593,6 +593,37 @@ def _autoencoder_pixel_cost_fn(autoencoder, context_frames, target, action_weigh
     return cost_fn
 
 
+def _autoencoder_cv_cost_fn(autoencoder, context_frames, v_prev0, action_weight):
+    """CV analogue of `_autoencoder_rollout_cost_fn`: read an implied (θ, θ̇)
+    off each predicted frame with `frames_to_direction`, instead of the
+    h → state linear probe — same as `_latent_cv_cost_fn`'s cost shape, but
+    with `next_frame_decoder` + re-encoding standing in for
+    `dynamics.controlled_step` + `dynamics.decode` (no separate `decode_latent`
+    pass needed, since `next_frame_decoder` already outputs a pixel frame).
+    """
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        K, H, _ = candidates.shape
+        buffer = context_frames.unsqueeze(0).expand(K, -1, -1, -1, -1).clone()
+        mu_all, _ = autoencoder.encoder.forward_all(buffer)
+        h = mu_all[:, -1]
+        v_prev = v_prev0.expand(K, -1)
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
+        for t in range(H):
+            u = candidates[:, t, :]
+            frame = autoencoder.next_frame_decoder(h, u)
+            v = frames_to_direction(frame)
+            theta_hat = implied_theta(v)
+            theta_dot_hat = implied_theta_dot(v, v_prev)
+            v_prev = v
+            total = total + theta_hat**2 + 0.1 * theta_dot_hat**2 + action_weight * u.squeeze(-1) ** 2
+            buffer = torch.cat([buffer, frame.unsqueeze(1)], dim=1)
+            mu_all, _ = autoencoder.encoder.forward_all(buffer)
+            h = mu_all[:, -1]
+        return total
+
+    return cost_fn
+
+
 @torch.no_grad()
 def run_autoencoder_mppi(
     world_model: WorldModel,
@@ -651,6 +682,11 @@ def run_autoencoder_mppi(
             ctx_stack = torch.stack(list(context)).to(device)  # (n_context, C, H, W)
             if cost_mode == "pixel":
                 cost_fn = _autoencoder_pixel_cost_fn(autoencoder, ctx_stack, target_frame, action_weight)
+            elif cost_mode == "cv":
+                # Seed the finite-difference velocity with the implied
+                # direction of the newest *real* frame in the context window.
+                v0 = frames_to_direction(context[-1].unsqueeze(0).to(device))
+                cost_fn = _autoencoder_cv_cost_fn(autoencoder, ctx_stack, v0, action_weight)
             else:
                 cost_fn = _autoencoder_rollout_cost_fn(autoencoder, ctx_stack, A, action_weight)
             mean = mppi_plan(mean, cost_fn, cfg)
@@ -1052,22 +1088,26 @@ with st.sidebar:
     elif model_kind == "autoencoder_only":
         # No dynamics model: imagination re-encodes next_frame_decoder's own
         # predicted frames, so there's no separate "decode" step to skip —
-        # the pixel-distance cost mode is essentially free here, but there's
-        # no analogue of the CV cost (would need identical machinery).
+        # the pixel-distance and CV costs are essentially free here.
         cost_mode_options = {
             "Linear probe (θ, θ̇)": "probe",
             "Pixel distance": "pixel",
+            "CV on predicted frames": "cv",
         }
         cost_mode_label = st.selectbox(
             "Cost function (learned, no dynamics)",
             options=list(cost_mode_options),
             index=0,
-            help="How the autoencoder-only MPPI scores imagined rollouts. Both "
+            help="How the autoencoder-only MPPI scores imagined rollouts. All "
             "options roll forward by predicting next_frame_decoder(h_t, a_t) "
             "and re-encoding to get h_{t+1} — no HamiltonianFlowModel. Linear "
             "probe: apply the h → state regression and use the same angle² + "
             "velocity² cost as ground truth. Pixel distance: MSE of the "
-            "predicted frame against a rendered upright target frame.",
+            "predicted frame against a rendered upright target frame. CV on "
+            "predicted frames: read an implied (θ, θ̇) off each predicted frame "
+            "via a soft rod-direction centroid (θ̇ by finite differences) and "
+            "use the probe-style angle² + velocity² cost — no privileged state "
+            "regression involved.",
         )
         cost_mode = cost_mode_options[cost_mode_label]
     else:
