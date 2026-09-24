@@ -878,6 +878,60 @@ class TemporalAutoencoder(nn.Module):
         s = self.f_psi(h[:, :self.q_dim])
         return self.decoder(s)
 
+    @torch.no_grad()
+    def dream_frames(
+        self,
+        context_frames: torch.Tensor,
+        actions: torch.Tensor,
+        n_steps: int | None = None,
+        max_context_len: int = 0,
+    ) -> torch.Tensor:
+        """Dynamics-free rollout: iteratively predict frame_{t+1} from (h_t, a_t).
+
+        No Hamiltonian/dynamics model involved — h_t comes from re-encoding
+        the frame buffer through this autoencoder's own encoder, and
+        frame_{t+1} = next_frame_decoder(h_t, a_t), the same
+        action-conditioned one-step predictor trained alongside
+        reconstruction in ``_train_epoch_phase1``. This is the baseline
+        counterpart to ``WorldModel.dream``'s Hamiltonian rollout.
+
+        Args:
+            context_frames:  (n_context, C, H, W) real frames seeding the buffer.
+            actions:         (T,) actions; action at rollout step k is
+                              actions[n_context - 1 + k], matching WorldModel.dream.
+            n_steps:         rollout length; clipped to the available actions
+                              (None = as far as the actions allow).
+            max_context_len: if > 0, re-encode only the most recent
+                              max_context_len frames of the buffer each step
+                              (sliding window) instead of the whole growing
+                              buffer.
+
+        Returns:
+            (n, C, H, W) dreamed frames on CPU; n may be 0 if no actions remain.
+        """
+        device = next(self.parameters()).device
+        n_context = context_frames.shape[0]
+        buffer = [f.to(device) for f in context_frames]
+
+        max_steps = len(actions) - (n_context - 1)
+        n = max_steps if n_steps is None else min(n_steps, max_steps)
+
+        dreamed = []
+        for k in range(max(n, 0)):
+            window = buffer if max_context_len <= 0 else buffer[-max_context_len:]
+            ctx = torch.stack(window).unsqueeze(0)  # (1, L, C, H, W)
+            mu_all, _ = self.encoder.forward_all(ctx)
+            h = mu_all[:, -1]  # (1, latent_dim)
+            u = actions[n_context - 1 + k].view(1, 1).to(device=device, dtype=torch.float32)
+            frame_pred = self.next_frame_decoder(h, u)  # (1, C, H, W)
+            buffer.append(frame_pred.squeeze(0))
+            dreamed.append(frame_pred.squeeze(0).cpu())
+
+        if not dreamed:
+            C, H, W = context_frames.shape[1:]
+            return torch.empty(0, C, H, W)
+        return torch.stack(dreamed)
+
 
 # ---------------------------------------------------------------------------
 # HamiltonianFlowModel — Phase 2: dynamics-only model
@@ -1648,6 +1702,33 @@ class _HamiltonianMLP(nn.Module):
         return self.net(torch.cat([q_enc, p], dim=-1)).squeeze(-1)
 
 
+class _StackedPositionEncoder(nn.Module):
+    """Maps a window of stacked (cosθ, sinθ) position frames to a (q, p) seed.
+
+    Position-only analog of the pixel pipeline's frame-stacking-to-latent
+    encoder (see TemporalAutoencoder): θ̇ is never handed to the model
+    directly, so it has to infer momentum from how position moves across the
+    window, the same way the LSTM encoder infers it from consecutive frames.
+    """
+
+    def __init__(self, context_frames: int, q_dim: int, p_dim: int, hidden: int = 64):
+        super().__init__()
+        self.context_frames = context_frames
+        self.q_dim = q_dim
+        self.net = nn.Sequential(
+            nn.Linear(2 * q_dim * context_frames, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, q_dim + p_dim),
+        )
+
+    def forward(self, pos_window: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """pos_window: (B, context_frames, 2*q_dim) stacked (cosθ, sinθ). Returns (q, p)."""
+        out = self.net(pos_window.reshape(pos_window.shape[0], -1))
+        return out[:, : self.q_dim], out[:, self.q_dim :]
+
+
 class StatePHGN(nn.Module):
     """Controlled port-Hamiltonian model operating on ground-truth pendulum state.
 
@@ -1713,6 +1794,8 @@ class StatePHGN(nn.Module):
         quadratic_t: bool = True,
         state_dep_r: bool = False,
         integrator: str = "auto",
+        input_mode: str = "full_state",
+        context_frames: int = 2,
     ):
         super().__init__()
         if integrator not in ("auto", "rk4", "leapfrog"):
@@ -1726,9 +1809,14 @@ class StatePHGN(nn.Module):
             ("h_source", h_source, ("learned", "canonical")),
             ("r_source", r_source, ("learned", "fixed_damping", "canonical")),
             ("b_source", b_source, ("learned", "fixed_ones", "canonical")),
+            ("input_mode", input_mode, ("full_state", "stacked_position")),
         ):
             if value not in choices:
                 raise ValueError(f"{name} must be one of {choices}, got {value!r}")
+        if input_mode == "stacked_position" and context_frames < 2:
+            raise ValueError(
+                f"context_frames must be >= 2 to disambiguate velocity, got {context_frames!r}"
+            )
         if integrator == "auto":
             integrator = "leapfrog" if separable else "rk4"
 
@@ -1740,6 +1828,8 @@ class StatePHGN(nn.Module):
         self.separable = separable
         self._learned_state_dep_r = state_dep_r
         self.integrator = integrator
+        self.input_mode = input_mode
+        self.context_frames = context_frames
         self.config = {
             "hidden_dim": hidden_dim,
             "dt": dt,
@@ -1753,6 +1843,8 @@ class StatePHGN(nn.Module):
             "quadratic_t": quadratic_t,
             "state_dep_r": state_dep_r,
             "integrator": integrator,  # resolved value, never "auto"
+            "input_mode": input_mode,
+            "context_frames": context_frames,
         }
 
         self.hamiltonian = (
@@ -1765,6 +1857,17 @@ class StatePHGN(nn.Module):
                 separable=separable,
                 quadratic_t=quadratic_t,
             )
+        )
+
+        self.position_encoder = (
+            _StackedPositionEncoder(
+                context_frames=context_frames,
+                q_dim=self.Q_DIM,
+                p_dim=self.P_DIM,
+                hidden=hidden_dim // 4,
+            )
+            if input_mode == "stacked_position"
+            else None
         )
 
         # J is ALWAYS the canonical symplectic structure. A learned constant J
@@ -1850,6 +1953,26 @@ class StatePHGN(nn.Module):
     def split(self, s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Split flat state s (B, 3) → q (B, 2), p (B, 1)."""
         return s[:, : self.Q_DIM], s[:, self.Q_DIM :]
+
+    @property
+    def seed_len(self) -> int:
+        """Number of leading timesteps ``encode_seed`` consumes to produce (q, p)."""
+        return self.context_frames if self.input_mode == "stacked_position" else 1
+
+    def encode_seed(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """states: (B, seed_len, STATE_DIM) window immediately preceding a rollout.
+
+        full_state: split() the last frame's ground-truth (θ, θ̇) directly.
+        stacked_position: encode the window's (cosθ, sinθ) positions with
+        position_encoder — θ̇ is never exposed to the model, which has to
+        infer it from how position moves across the window (see
+        _StackedPositionEncoder).
+        """
+        if self.input_mode == "full_state":
+            return self.split(states[:, -1])
+        theta = states[:, :, : self.Q_DIM]  # (B, seed_len, Q_DIM)
+        pos = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1)  # (B, seed_len, 2*Q_DIM)
+        return self.position_encoder(pos)
 
     @staticmethod
     def encode_q(q: torch.Tensor) -> torch.Tensor:
@@ -2390,6 +2513,41 @@ class WorldModel(nn.Module):
             C, H, W = frames.shape[1:]
             return torch.empty(0, C, H, W)
         return torch.stack(dreamed)
+
+    @torch.no_grad()
+    def dream_autoencoder_only(
+        self,
+        frames: torch.Tensor,
+        actions: torch.Tensor,
+        n_context: int,
+        n_steps: int | None = None,
+        max_context_len: int = 0,
+    ) -> torch.Tensor:
+        """Dynamics-free counterpart to ``dream()`` — no HamiltonianFlowModel needed.
+
+        Rolls forward using only the autoencoder's own next_frame_decoder,
+        re-encoding each predicted frame to get the next h (see
+        ``TemporalAutoencoder.dream_frames``). Usable whenever
+        ``self.dynamics is None`` (the autoencoder-only baseline), and also
+        on a full model to see what the autoencoder alone would have
+        predicted.
+
+        Args:
+            frames:    (T+1, C, H, W) ground-truth frames (any device)
+            actions:   (T,) actions
+            n_context: frames fed to the encoder before dreaming
+            n_steps:   rollout length; clipped to the available actions
+            max_context_len: sliding re-encode window (0 = full growing buffer)
+
+        Returns:
+            (n, C, H, W) dreamed frames on CPU; n may be 0 if no actions remain.
+        """
+        return self.autoencoder.dream_frames(
+            context_frames=frames[:n_context],
+            actions=actions,
+            n_steps=n_steps,
+            max_context_len=max_context_len,
+        )
 
     def save(
         self,

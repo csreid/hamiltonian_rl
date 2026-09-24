@@ -1,12 +1,21 @@
-"""Streamlit visualiser: ground-truth vs port-Hamiltonian dreamed rollout.
+"""Streamlit visualiser: ground-truth vs dreamed rollout (Hamiltonian or autoencoder-only).
 
 Usage:
     streamlit run pendulum_dreamer.py
 
-Loads a unified world-model checkpoint (LSTM autoencoder + Hamiltonian flow
-dynamics in one .pt), collects one Pendulum-v1 episode under a selectable
-policy, encodes N context frames via the LSTM, then rolls out port-Hamiltonian
-dynamics in phase space and decodes back to pixels for comparison.
+Loads a unified world-model checkpoint (LSTM autoencoder, optionally +
+Hamiltonian flow dynamics, in one .pt), collects one Pendulum-v1 episode
+under a selectable policy, encodes N context frames via the LSTM, then dreams
+forward and decodes back to pixels for comparison. Two dreaming modes:
+
+  - Port-Hamiltonian dynamics (``WorldModel.dream``): rolls (q, p) forward
+    through the checkpoint's ``HamiltonianFlowModel``. Requires a Phase
+    2/3/joint checkpoint.
+  - Autoencoder-only, no dynamics model (``WorldModel.dream_autoencoder_only``):
+    iteratively predicts frame_{t+1} from (h_t, a_t) via the autoencoder's own
+    ``next_frame_decoder`` and re-encodes. Works on any checkpoint, including
+    a Phase-1-only one (``dynamics is None``), and can also be selected on a
+    full checkpoint to see what the autoencoder alone would have predicted.
 """
 
 from __future__ import annotations
@@ -91,17 +100,29 @@ def run_dreamed_rollout(
     actions: torch.Tensor,
     n_context: int,
     rollout_length: int,
+    mode: str = "dynamics",
 ) -> dict:
     """Encode n_context frames, dream rollout_length steps, return numpy arrays.
+
+    Args:
+        mode: "dynamics" rolls forward through ``world_model.dream`` (the
+              checkpoint's HamiltonianFlowModel); "autoencoder_only" rolls
+              forward through ``world_model.dream_autoencoder_only`` (no
+              dynamics model — see module docstring).
 
     Returns a dict with:
         gt_frames    : list of (H, W, 3) uint8 arrays  (n_steps frames starting at n_context)
         dream_frames : list of (H, W, 3) uint8 arrays  (same length)
         n_steps      : actual number of dreamed steps
     """
-    dreamed = world_model.dream(
-        frames, actions, n_context=n_context, n_steps=rollout_length
-    )
+    if mode == "autoencoder_only":
+        dreamed = world_model.dream_autoencoder_only(
+            frames, actions, n_context=n_context, n_steps=rollout_length
+        )
+    else:
+        dreamed = world_model.dream(
+            frames, actions, n_context=n_context, n_steps=rollout_length
+        )
     n_steps = len(dreamed)
     gt_slice = frames[n_context : n_context + n_steps]  # (n_steps, C, H, W)
     return {
@@ -157,25 +178,43 @@ except Exception as exc:
     st.error(f"Failed to load checkpoint:\n\n```\n{exc}\n```")
     st.stop()
 
-if world_model.dynamics is None:
-    st.warning(
-        f"`{ckpt_path}` is a Phase-1-only checkpoint (no dynamics). "
-        "Pick a Phase 2 checkpoint to dream."
-    )
-    st.stop()
+has_dynamics = world_model.dynamics is not None
+
+with st.sidebar:
+    st.divider()
+    st.header("Dreaming mode")
+    if has_dynamics:
+        dream_mode_label = st.radio(
+            "Mode",
+            ["Port-Hamiltonian dynamics", "Autoencoder-only (no dynamics)"],
+            index=0,
+            help="Port-Hamiltonian: roll (q, p) forward through the checkpoint's "
+            "HamiltonianFlowModel. Autoencoder-only: iteratively predict "
+            "next_frame_decoder(h_t, a_t) and re-encode — no dynamics model, "
+            "usable for comparison even though this checkpoint has one.",
+        )
+        dream_mode = "dynamics" if dream_mode_label.startswith("Port-Hamiltonian") else "autoencoder_only"
+    else:
+        st.info(
+            f"`{ckpt_path}` is a Phase-1-only checkpoint (no dynamics) — "
+            "dreaming with the autoencoder-only mode (no dynamics model)."
+        )
+        dream_mode = "autoencoder_only"
 
 data_cfg = world_model.data_config
 latent_dim = world_model.latent_dim
 img_size = data_cfg.get("img_size", 64)
-dt = world_model.dynamics.dt
 damping = data_cfg.get("damping", 0.0)
 
 with st.sidebar:
-    st.caption(
-        f"latent_dim={latent_dim}  img_size={img_size}  "
-        f"dt={dt}  damping={damping}  "
-        f"integrator={world_model.dynamics.integrator}  device={device}"
-    )
+    if dream_mode == "dynamics":
+        st.caption(
+            f"latent_dim={latent_dim}  img_size={img_size}  "
+            f"dt={world_model.dynamics.dt}  damping={damping}  "
+            f"integrator={world_model.dynamics.integrator}  device={device}"
+        )
+    else:
+        st.caption(f"latent_dim={latent_dim}  img_size={img_size}  damping={damping}  device={device}")
 
 
 # ── Generation ────────────────────────────────────────────────────────────────
@@ -202,6 +241,7 @@ if generate_btn:
                 actions=actions,
                 n_context=int(n_context),
                 rollout_length=int(rollout_length),
+                mode=dream_mode,
             )
         except Exception as exc:
             st.error(f"Rollout failed:\n\n```\n{exc}\n```")
@@ -212,6 +252,7 @@ if generate_btn:
         ckpt_path=str(ckpt_path),
         policy=policy,
         n_context=int(n_context),
+        dream_mode=dream_mode,
     )
 
 
@@ -224,8 +265,14 @@ if rollout is None:
     st.stop()
 
 n_steps = rollout["n_steps"]
+result_dream_mode = st.session_state.get("dream_mode", "dynamics")
+_dream_mode_labels = {
+    "dynamics": "Port-Hamiltonian dynamics",
+    "autoencoder_only": "Autoencoder-only (no dynamics)",
+}
 st.success(
     f"Dreamed **{n_steps}** steps after **{st.session_state['n_context']}** context frames  |  "
+    f"Mode: **{_dream_mode_labels[result_dream_mode]}**  |  "
     f"Policy: `{_POLICY_LABELS[st.session_state['policy']]}`  |  "
     f"Checkpoint: `{st.session_state['ckpt_path']}`"
 )
@@ -239,16 +286,17 @@ with col_size:
     )
 
 with st.spinner("Rendering GIF…"):
+    right_label = "PHn" if result_dream_mode == "dynamics" else "AE"
     composite = build_sidebyside_frames(
         left_frames=rollout["gt_frames"],
         right_frames=rollout["dream_frames"],
         display_size=display_size,
         left_label="GT",
-        right_label="PHn",
+        right_label=right_label,
     )
     gif_bytes = frames_to_gif(composite, fps)
 
-st.subheader("Ground truth  (left)  |  Port-Hamiltonian dream  (right)")
+st.subheader(f"Ground truth  (left)  |  {_dream_mode_labels[result_dream_mode]} dream  (right)")
 st.markdown(
     "Blue label = GT frame · Orange label = dreamed frame · "
     "Both indexed from t=0 after context window."

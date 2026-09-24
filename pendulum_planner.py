@@ -534,6 +534,175 @@ def run_latent_mppi(
     }
 
 
+# ── Autoencoder-only MPPI (no dynamics model) ───────────────────────────────
+
+
+def _autoencoder_rollout_cost_fn(autoencoder, context_frames, regression, action_weight):
+    """Imagined-rollout cost in angle-space, with NO dynamics model.
+
+    The dynamics-free analogue of `_latent_rollout_cost_fn`:
+    `next_frame_decoder(h_t, u_t)` + re-encoding stands in for
+    `dynamics.controlled_step` + `dynamics.decode`. `context_frames` is the
+    current real-frame context window, (n_context, C, H, W); the per-candidate
+    frame buffer starts there and grows by one predicted frame per step,
+    exactly like `TemporalAutoencoder.dream_frames`.
+    """
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        K, H, _ = candidates.shape
+        buffer = context_frames.unsqueeze(0).expand(K, -1, -1, -1, -1).clone()
+        mu_all, _ = autoencoder.encoder.forward_all(buffer)
+        h = mu_all[:, -1]
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
+        for t in range(H):
+            u = candidates[:, t, :]
+            frame = autoencoder.next_frame_decoder(h, u)
+            buffer = torch.cat([buffer, frame.unsqueeze(1)], dim=1)
+            mu_all, _ = autoencoder.encoder.forward_all(buffer)
+            h = mu_all[:, -1]
+            st = h @ regression
+            theta_hat = torch.atan2(st[:, 1], st[:, 0])
+            theta_dot_hat = st[:, 2].clamp(-_DISPLAY_VEL_LIMIT, _DISPLAY_VEL_LIMIT)
+            total = total + angle_normalize(theta_hat) ** 2 + 0.1 * theta_dot_hat**2 + action_weight * u.squeeze(-1) ** 2
+        return total
+
+    return cost_fn
+
+
+def _autoencoder_pixel_cost_fn(autoencoder, context_frames, target, action_weight):
+    """Pixel-distance analogue of `_autoencoder_rollout_cost_fn`.
+
+    `next_frame_decoder` already outputs a pixel frame directly each step, so
+    unlike `_latent_pixel_cost_fn` there's no separate decode pass needed.
+    """
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        K, H, _ = candidates.shape
+        buffer = context_frames.unsqueeze(0).expand(K, -1, -1, -1, -1).clone()
+        mu_all, _ = autoencoder.encoder.forward_all(buffer)
+        h = mu_all[:, -1]
+        total = torch.zeros(K, device=candidates.device, dtype=candidates.dtype)
+        for t in range(H):
+            u = candidates[:, t, :]
+            frame = autoencoder.next_frame_decoder(h, u)
+            pixel_mse = ((frame - target) ** 2).mean(dim=(1, 2, 3))
+            total = total + pixel_mse + action_weight * u.squeeze(-1) ** 2
+            buffer = torch.cat([buffer, frame.unsqueeze(1)], dim=1)
+            mu_all, _ = autoencoder.encoder.forward_all(buffer)
+            h = mu_all[:, -1]
+        return total
+
+    return cost_fn
+
+
+@torch.no_grad()
+def run_autoencoder_mppi(
+    world_model: WorldModel,
+    theta0: float,
+    theta_dot0: float,
+    n_context: int,
+    total_steps: int,
+    cfg: MPPIConfig,
+    action_weight: float,
+    regression: torch.Tensor,
+    cost_mode: str = "probe",
+    progress_cb=None,
+) -> dict:
+    """Closed-loop receding-horizon MPPI with NO dynamics model — the
+    autoencoder-only baseline.
+
+    Imagination = iteratively predicting frame_{t+1} from (h_t, a_t) via
+    `autoencoder.next_frame_decoder` and re-encoding, instead of stepping a
+    `HamiltonianFlowModel` through latent phase space (see
+    `_autoencoder_rollout_cost_fn`, `TemporalAutoencoder.dream_frames`).
+    Otherwise identical control loop to `run_latent_mppi`: only real frames
+    are ever executed on, and the context window is re-grounded from real
+    frames every control step.
+    """
+    device = next(world_model.autoencoder.parameters()).device
+    data_cfg = world_model.data_config
+    img_size = data_cfg.get("img_size", 64)
+    damping = data_cfg.get("damping", 0.0)
+    autoencoder = world_model.autoencoder
+    A = regression.to(device)
+
+    env = PendulumPixelEnv(img_size=img_size, damping=damping)
+    env.reset()
+
+    target_frame = None
+    if cost_mode == "pixel":
+        target_obs = env.set_state(0.0, 0.0)
+        target_frame = (torch.from_numpy(target_obs).float() / 255.0).unsqueeze(0).to(device)
+
+    obs0 = env.set_state(theta0, theta_dot0)
+    context = deque([torch.from_numpy(obs0).float() / 255.0], maxlen=n_context)
+    for _ in range(max(n_context - 1, 0)):
+        obs, _, _, _, _ = env.step(np.array([0.0], dtype=np.float32))
+        context.append(torch.from_numpy(obs).float() / 255.0)
+
+    theta_b, theta_dot_b = env.unwrapped.state
+    mean = torch.zeros(cfg.horizon, 1, device=device)
+    frames = []
+    thetas = [float(angle_normalize(torch.tensor(float(theta_b))))]
+    theta_dots = [float(theta_dot_b)]
+    plan_thetas, plan_theta_dots = [], []
+
+    try:
+        for step in range(total_steps):
+            ctx_stack = torch.stack(list(context)).to(device)  # (n_context, C, H, W)
+            if cost_mode == "pixel":
+                cost_fn = _autoencoder_pixel_cost_fn(autoencoder, ctx_stack, target_frame, action_weight)
+            else:
+                cost_fn = _autoencoder_rollout_cost_fn(autoencoder, ctx_stack, A, action_weight)
+            mean = mppi_plan(mean, cost_fn, cfg)
+
+            # Roll the chosen (noise-free) plan forward once, purely to show
+            # "what does the controller currently intend to do" — never
+            # executed. Same one-decode-per-horizon-step preview pattern as
+            # run_latent_mppi, just with next_frame_decoder + re-encoding
+            # standing in for controlled_step + decode.
+            pf_buffer = ctx_stack.unsqueeze(0)  # (1, n_context, C, H, W)
+            mu_all, _ = autoencoder.encoder.forward_all(pf_buffer)
+            h_p = mu_all[:, -1]
+            v_prev = frames_to_direction(context[-1].unsqueeze(0).to(device))
+            plan_t, plan_td = [], []
+            for t in range(cfg.horizon):
+                u_p = mean[t : t + 1, :]
+                frame_p = autoencoder.next_frame_decoder(h_p, u_p)
+                pf_buffer = torch.cat([pf_buffer, frame_p.unsqueeze(1)], dim=1)
+                mu_all, _ = autoencoder.encoder.forward_all(pf_buffer)
+                h_p = mu_all[:, -1]
+                v_p = frames_to_direction(frame_p)
+                plan_t.append(float(implied_theta(v_p)))
+                plan_td.append(float(implied_theta_dot(v_p, v_prev)))
+                v_prev = v_p
+            plan_thetas.append(plan_t)
+            plan_theta_dots.append(plan_td)
+
+            u0 = float(mean[0, 0].clamp(cfg.action_low, cfg.action_high))
+
+            obs, _, _, _, _ = env.step(np.array([u0], dtype=np.float32))
+            context.append(torch.from_numpy(obs).float() / 255.0)
+            display_obs = env.render_with_action(u0)
+            frames.append(torch.from_numpy(display_obs).float() / 255.0)
+
+            theta_new, theta_dot_new = env.unwrapped.state
+            thetas.append(float(angle_normalize(torch.tensor(float(theta_new)))))
+            theta_dots.append(float(theta_dot_new))
+
+            mean = shift_mean(mean)
+            if progress_cb is not None:
+                progress_cb(step + 1, total_steps)
+    finally:
+        env.close()
+
+    return {
+        "frames": frames,
+        "theta": thetas,
+        "theta_dot": theta_dots,
+        "plan_theta": plan_thetas,
+        "plan_theta_dot": plan_theta_dots,
+    }
+
+
 # ── State-based MPPI ─────────────────────────────────────────────────────────
 
 
@@ -775,14 +944,27 @@ with st.sidebar:
     st.header("Checkpoint")
     model_kind_label = st.radio(
         "Model type",
-        ["Pixel (autoencoder + flow)", "State-based (ground-truth phase space)"],
+        [
+            "Pixel (autoencoder + flow)",
+            "Autoencoder-only (no dynamics)",
+            "State-based (ground-truth phase space)",
+        ],
         index=0,
         help="Both are compared against the same analytic ground-truth MPPI — "
         "this toggles which learned checkpoint plays the 'learned' role. "
-        "Pixel needs an encoder/decoder and a fitted h→state probe; "
-        "state-based operates on (θ, θ̇) directly, same as ground truth.",
+        "Pixel needs an encoder/decoder, a HamiltonianFlowModel, and a fitted "
+        "h→state probe; autoencoder-only needs only the encoder/decoder (a "
+        "Phase-1-only checkpoint) and imagines forward by iteratively "
+        "predicting next_frame_decoder(h_t, a_t) and re-encoding, with no "
+        "dynamics model at all; state-based operates on (θ, θ̇) directly, "
+        "same as ground truth.",
     )
-    model_kind = "pixel" if model_kind_label.startswith("Pixel") else "state"
+    if model_kind_label.startswith("Pixel"):
+        model_kind = "pixel"
+    elif model_kind_label.startswith("Autoencoder-only"):
+        model_kind = "autoencoder_only"
+    else:
+        model_kind = "state"
     models_root = Path("models")
     ckpt_path = pick_checkpoint(models_root, "Model", "ckpt")
 
@@ -791,7 +973,7 @@ with st.sidebar:
     theta0 = st.slider("θ₀ (rad)", -float(np.pi), float(np.pi), float(np.pi), step=0.05,
                         help="π = hanging straight down (swing-up); 0 = upright")
     theta_dot0 = st.slider("θ̇₀ (rad/s)", -8.0, 8.0, 0.0, step=0.1)
-    if model_kind == "pixel":
+    if model_kind in ("pixel", "autoencoder_only"):
         n_context = st.slider("Encoder context frames", min_value=2, max_value=20, value=5, step=1)
     else:
         n_context = 1  # no encoder window to fill for the state-based model
@@ -830,6 +1012,27 @@ with st.sidebar:
             "+ velocity² cost — no privileged state regression involved.",
         )
         cost_mode = cost_mode_options[cost_mode_label]
+    elif model_kind == "autoencoder_only":
+        # No dynamics model: imagination re-encodes next_frame_decoder's own
+        # predicted frames, so there's no separate "decode" step to skip —
+        # the pixel-distance cost mode is essentially free here, but there's
+        # no analogue of the CV cost (would need identical machinery).
+        cost_mode_options = {
+            "Linear probe (θ, θ̇)": "probe",
+            "Pixel distance": "pixel",
+        }
+        cost_mode_label = st.selectbox(
+            "Cost function (learned, no dynamics)",
+            options=list(cost_mode_options),
+            index=0,
+            help="How the autoencoder-only MPPI scores imagined rollouts. Both "
+            "options roll forward by predicting next_frame_decoder(h_t, a_t) "
+            "and re-encoding to get h_{t+1} — no HamiltonianFlowModel. Linear "
+            "probe: apply the h → state regression and use the same angle² + "
+            "velocity² cost as ground truth. Pixel distance: MSE of the "
+            "predicted frame against a rendered upright target frame.",
+        )
+        cost_mode = cost_mode_options[cost_mode_label]
     else:
         cost_mode = None  # state-based cost is always the direct angle² + velocity² form
 
@@ -855,6 +1058,14 @@ try:
         data_cfg = world_model.data_config
         img_size = data_cfg.get("img_size", 64)
         damping = data_cfg.get("damping", 0.0)
+    elif model_kind == "autoencoder_only":
+        world_model = load_model(str(ckpt_path))
+        device = next(world_model.autoencoder.parameters()).device
+        # No dynamics needed for this mode — a Phase-1-only checkpoint is the
+        # expected/typical case, but a full checkpoint's autoencoder works too.
+        data_cfg = world_model.data_config
+        img_size = data_cfg.get("img_size", 64)
+        damping = data_cfg.get("damping", 0.0)
     else:
         state_model = load_state_checkpoint(str(ckpt_path))
         device = next(state_model.parameters()).device
@@ -866,7 +1077,7 @@ except Exception as exc:
     st.stop()
 
 with st.sidebar:
-    if model_kind == "pixel":
+    if model_kind in ("pixel", "autoencoder_only"):
         st.caption(f"img_size={img_size}  damping={damping}  device={device}")
     else:
         st.caption(
@@ -906,6 +1117,15 @@ if generate_btn:
                 total_steps=total_steps, cfg=cfg, action_weight=w_u_latent, regression=A,
                 cost_mode=cost_mode,
                 progress_cb=lambda i, n: latent_progress.progress(i / n, text=f"Learned-dynamics MPPI… {i}/{n}"),
+            )
+        elif model_kind == "autoencoder_only":
+            with st.spinner("Fitting h → state regression on fresh held-out episodes…"):
+                A, r2 = fit_h_state_regression(str(ckpt_path))
+            latent_result = run_autoencoder_mppi(
+                world_model=world_model, theta0=theta0, theta_dot0=theta_dot0, n_context=n_context,
+                total_steps=total_steps, cfg=cfg, action_weight=w_u_latent, regression=A,
+                cost_mode=cost_mode,
+                progress_cb=lambda i, n: latent_progress.progress(i / n, text=f"Autoencoder-only MPPI… {i}/{n}"),
             )
         else:
             latent_result = run_state_mppi(
@@ -947,9 +1167,14 @@ if result_model_kind != model_kind:
     st.stop()
 
 r2 = st.session_state["r2"]
+_model_kind_labels = {
+    "pixel": "Pixel",
+    "autoencoder_only": "Autoencoder-only (no dynamics)",
+    "state": "State-based",
+}
 summary = (
     f"Planned **{st.session_state['total_steps']}** control steps  |  "
-    f"Model: **{'Pixel' if result_model_kind == 'pixel' else 'State-based'}**  |  "
+    f"Model: **{_model_kind_labels[result_model_kind]}**  |  "
     f"Checkpoint: `{st.session_state['ckpt_path']}`"
 )
 if r2 is not None:
@@ -981,6 +1206,13 @@ if result_model_kind == "pixel":
         "Both panels render real `PendulumPixelEnv` frames — the learned side plans with the "
         "checkpoint's dynamics but only ever executes on the real pendulum, re-grounding its "
         "latent state from real frames every step."
+    )
+elif result_model_kind == "autoencoder_only":
+    st.markdown(
+        "Both panels render real `PendulumPixelEnv` frames — the learned side plans with **no "
+        "dynamics model**: imagination iteratively predicts `next_frame_decoder(h_t, a_t)` and "
+        "re-encodes, but only ever executes on the real pendulum, re-grounding from real frames "
+        "every step."
     )
 else:
     st.markdown(
@@ -1064,6 +1296,7 @@ if result_model_kind == "pixel":
         st.image(actual_gif, use_container_width=False)
 else:
     st.caption(
-        "Decoded-plan preview is pixel-model only — the state-based model's imagined "
-        "horizon is already shown as the dashed line in the phase-space plot above."
+        "Decoded-plan preview is pixel-model only — both the state-based and "
+        "autoencoder-only models' imagined horizons are already shown as the dashed "
+        "line in the phase-space plot above."
     )

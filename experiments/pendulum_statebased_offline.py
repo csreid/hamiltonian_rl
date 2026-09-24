@@ -71,16 +71,19 @@ def _train_epoch(
 ) -> dict[str, float]:
     model.train()
     total_loss = total_q_var = total_p_var = 0.0
+    seed_len = model.seed_len
+    k0 = seed_len - 1  # ground-truth index the seed represents
 
     for states, actions in loader:
         states = states.to(device)  # (B, T+1, 3)
         actions = actions.to(device)  # (B, T)
 
-        q, p = model.split(states[:, 0])
+        q, p = model.encode_seed(states[:, :seed_len])
 
         loss = torch.zeros(1, device=device)
         qs, ps = [q], [p]
-        for t in range(seq_len):
+        for i in range(seq_len):
+            t = k0 + i
             u = actions[:, t].unsqueeze(-1)
             q, p = model.step(q, p, u)
             pred = torch.cat([q, p], dim=-1)
@@ -411,13 +414,16 @@ def _eval_loss(
 ) -> float:
     model.eval()
     total = 0.0
+    seed_len = model.seed_len
+    k0 = seed_len - 1  # ground-truth index the seed represents
     for states, actions in val_trajs:
         states = states.to(device)
         actions = actions.to(device)
-        T = len(actions)
-        q, p = model.split(states[0:1])
+        T = len(actions) - k0
+        q, p = model.encode_seed(states[:seed_len].unsqueeze(0))
         loss = 0.0
-        for t in range(T):
+        for i in range(T):
+            t = k0 + i
             u = actions[t].reshape(1, 1)
             q, p = model.step(q, p, u)
             pred = torch.cat([q, p], dim=-1)
@@ -553,15 +559,18 @@ def _log_state_rollout(
     state_names = ["θ (rad)", "θ̇ (rad/s)"]
 
     all_true, all_pred = [], []
+    seed_len = model.seed_len
+    k0 = seed_len - 1  # ground-truth index the seed represents
     for states, actions in val_trajs:
-        q, p = model.split(states[0:1].to(device))
+        states = states.to(device)
+        q, p = model.encode_seed(states[:seed_len].unsqueeze(0))
         pred = [torch.cat([q, p], dim=-1).squeeze(0).cpu()]
-        for t in range(len(actions)):
+        for t in range(k0, len(actions)):
             u = actions[t].reshape(1, 1).to(device)
             q, p = model.step(q, p, u)
             pred.append(torch.cat([q, p], dim=-1).squeeze(0).cpu())
         all_pred.append(torch.stack(pred).numpy())
-        all_true.append(states.numpy())
+        all_true.append(states[k0:].cpu().numpy())
 
     pred_all = np.concatenate(all_pred, axis=0)
     true_all = np.concatenate(all_true, axis=0)
@@ -651,7 +660,8 @@ def _log_rollout_videos(
     """Log side-by-side ground-truth and Hamiltonian-rollout videos to TensorBoard."""
     model.eval()
     states, actions = val_traj  # (T+1, 2), (T,)
-    T = len(actions)
+    seed_len = model.seed_len
+    k0 = seed_len - 1  # ground-truth index the seed represents
 
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
     env.reset()
@@ -665,16 +675,15 @@ def _log_rollout_videos(
         env.unwrapped.last_u = np.float32(u) if u is not None else None
         return env.render()  # (H, W, 3) uint8
 
-    gt_frames = [_render_at(states[0, 0].item(), states[0, 1].item())]
-    for t in range(T):
+    gt_frames = [_render_at(states[k0, 0].item(), states[k0, 1].item())]
+    for t in range(k0, len(actions)):
         gt_frames.append(
             _render_at(states[t + 1, 0].item(), states[t + 1, 1].item(), u=actions[t].item())
         )
 
-    q = states[0:1, : model.Q_DIM].to(device)
-    p = states[0:1, model.Q_DIM :].to(device)
+    q, p = model.encode_seed(states[:seed_len].unsqueeze(0).to(device))
     hgn_frames = [_render_at(q.item(), p.item())]
-    for t in range(T):
+    for t in range(k0, len(actions)):
         u = actions[t].reshape(1, 1).to(device)
         q, p = model.step(q, p, u)
         hgn_frames.append(_render_at(q.item(), p.item(), u=actions[t].item()))
@@ -781,6 +790,26 @@ def _log_rollout_videos(
     default="auto",
     show_default=True,
     help="'auto' = leapfrog if separable else rk4",
+)
+@click.option(
+    "--input-mode",
+    type=click.Choice(["full_state", "stacked_position"]),
+    default="full_state",
+    show_default=True,
+    help=(
+        "'full_state' hands the model ground-truth (theta, theta_dot) directly. "
+        "'stacked_position' hides theta_dot: a small learned encoder must infer "
+        "the (q, p) seed from --context-frames stacked (cos theta, sin theta) "
+        "position frames, mirroring how the pixel pipeline infers velocity from "
+        "stacked frames instead of being given it."
+    ),
+)
+@click.option(
+    "--context-frames",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Position frames stacked to seed (q, p) when --input-mode=stacked_position",
 )
 # training
 @click.option("--epochs", type=int, default=3000, show_default=True)
@@ -911,8 +940,13 @@ def main(**kwargs):
         quadratic_t=kwargs["quadratic_t"],
         state_dep_r=kwargs["state_dep_r"],
         integrator=kwargs["integrator"],
+        input_mode=kwargs["input_mode"],
+        context_frames=kwargs["context_frames"],
     ).to(device)
     print(f"Integrator: {model.integrator}")
+    print(f"Input mode: {model.input_mode}" + (
+        f" (context_frames={model.context_frames})" if model.input_mode == "stacked_position" else ""
+    ))
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     hparams = dict(kwargs)
@@ -925,6 +959,8 @@ def main(**kwargs):
     }
     groups = []
     h_params = list(model.hamiltonian.parameters())
+    if model.position_encoder is not None:
+        h_params += list(model.position_encoder.parameters())
     if h_params:
         groups.append({"params": h_params, "lr": kwargs["h_lr"]})
     struct_params = model.structural_parameters()
@@ -938,7 +974,7 @@ def main(**kwargs):
     optimizer = torch.optim.Adam(groups)
     best_loss = float("inf")
 
-    full_seq_len = train_episodes[0][1].shape[0]
+    full_seq_len = train_episodes[0][1].shape[0] - (model.seed_len - 1)
     seq_len = kwargs["seq_len_start"]
     ema_loss = None
 
