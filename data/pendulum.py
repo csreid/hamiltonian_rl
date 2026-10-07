@@ -652,6 +652,97 @@ def collect_seeded_random_rollouts(
     return rollouts
 
 
+@torch.no_grad()
+def collect_mppi_upright_rollouts(
+    n_rollouts: int,
+    rollout_len: int,
+    img_size: int,
+    damping: float = 0.0,
+    drag: float = _DRAG_COEFF,
+    theta_range: float = 0.6,
+    theta_dot_range: float = 1.5,
+    dither_std: float = 0.5,
+    action_weight: float = 0.001,
+    horizon: int = 20,
+    n_samples: int = 256,
+    n_iterations: int = 2,
+    noise_std: float = 1.0,
+    temperature: float = 1.0,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Closed-loop ground-truth MPPI rollouts seeded near the unstable equilibrium.
+
+    Complements ``collect_seeded_random_rollouts``, whose covering-grid seeds and
+    random torques put few samples near upright (theta=0, theta_dot=0). Each
+    rollout starts at theta0 ~ U(-theta_range, theta_range), theta_dot0 ~
+    U(-theta_dot_range, theta_dot_range) and is driven by receding-horizon MPPI
+    on the real dynamics (same cost as the planner, via ``_mppi_gt_cost_fn``).
+
+    The executed torque is the MPPI action plus Gaussian dither
+    (``dither_std``), clipped to [-2, 2]. Without it, a balancing policy makes
+    action a near-deterministic function of state, which degrades Phase 2's
+    B-matrix identification. The *executed* action is what's recorded.
+
+    Returns the same (frames, actions, states) tuples as
+    ``collect_seeded_random_rollouts``.
+    """
+    from hamilton_rl.mppi import MPPIConfig, mppi_plan, shift_mean
+
+    cfg = MPPIConfig(
+        horizon=horizon,
+        n_samples=n_samples,
+        n_iterations=n_iterations,
+        noise_std=noise_std,
+        temperature=temperature,
+    )
+
+    env = PendulumPixelEnv(img_size=img_size, damping=damping, drag=drag)
+    rollouts = []
+    try:
+        for _ in tqdm(range(n_rollouts), desc="Collecting MPPI upright rollouts", dynamic_ncols=True):
+            theta0 = float(np.random.uniform(-theta_range, theta_range))
+            theta_dot0 = float(np.random.uniform(-theta_dot_range, theta_dot_range))
+            env.reset()
+            obs = env.set_state(theta0, theta_dot0)
+            frames = [torch.from_numpy(obs).float() / 255.0]
+            actions = []
+            states = [np.array([np.cos(theta0), np.sin(theta0), theta_dot0], dtype=np.float32)]
+
+            theta_cur = torch.tensor(theta0)
+            theta_dot_cur = torch.tensor(theta_dot0)
+            mean = torch.zeros(cfg.horizon, 1)
+
+            for _ in range(rollout_len):
+                cost_fn = _mppi_gt_cost_fn(theta_cur, theta_dot_cur, damping, action_weight, drag)
+                mean = mppi_plan(mean, cost_fn, cfg)
+                u = float(mean[0, 0]) + dither_std * float(np.random.randn())
+                action = float(np.clip(u, cfg.action_low, cfg.action_high))
+
+                obs, _, _, _, _ = env.step(np.array([action], dtype=np.float32))
+                theta_next, theta_dot_next = env.unwrapped.state  # type: ignore[union-attr]
+                # Plan from the true (unwrapped) env state; dynamics only use theta via trig.
+                theta_cur = torch.tensor(float(theta_next))
+                theta_dot_cur = torch.tensor(float(theta_dot_next))
+                mean = shift_mean(mean)
+
+                frames.append(torch.from_numpy(obs).float() / 255.0)
+                actions.append(action)
+                states.append(
+                    np.array([np.cos(theta_next), np.sin(theta_next), theta_dot_next], dtype=np.float32)
+                )
+
+            rollouts.append(
+                (
+                    torch.stack(frames),
+                    torch.tensor(actions, dtype=torch.float32),
+                    torch.from_numpy(np.stack(states)),
+                )
+            )
+    finally:
+        env.close()
+
+    return rollouts
+
+
 class PendulumMultiRolloutDataset(Dataset):
     """Random windows drawn from many short seeded rollouts.
 

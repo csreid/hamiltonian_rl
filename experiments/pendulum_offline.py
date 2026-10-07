@@ -108,6 +108,7 @@ from tqdm import tqdm
 from data.pendulum import (
     PendulumMultiRolloutDataset,
     H_true,
+    collect_mppi_upright_rollouts,
     collect_random_trajectories,
     collect_seeded_random_rollouts,
     collect_spin_trajectories,
@@ -4355,6 +4356,16 @@ def phase3_cmd(**kwargs):
 @click.option("--rollout-len", type=int, default=0, show_default=True,
               help="Steps per seeded rollout (0 = 2x --max-steps); must be "
                    ">= --max-steps")
+@click.option("--n-mppi-upright", type=int, default=0, show_default=True,
+              help="Extra closed-loop MPPI rollouts seeded near the upright "
+                   "equilibrium, added to the random rollouts (0 = none)")
+@click.option("--mppi-theta-range", type=float, default=0.6, show_default=True,
+              help="MPPI upright seeds: theta0 ~ U(-r, r) rad")
+@click.option("--mppi-dot-range", type=float, default=1.5, show_default=True,
+              help="MPPI upright seeds: theta_dot0 ~ U(-r, r) rad/s")
+@click.option("--mppi-dither", type=float, default=0.5, show_default=True,
+              help="Gaussian torque dither added to the MPPI action, so action "
+                   "isn't a deterministic function of state (B identifiability)")
 @click.option("--damping", type=float, default=0.0, show_default=True,
               help="Linear viscous damping coefficient")
 @click.option("--drag", type=float, default=_DRAG_COEFF, show_default=True,
@@ -4506,6 +4517,18 @@ def joint_cmd(**kwargs):
         damping=kwargs["damping"],
         drag=kwargs["drag"],
     )
+    if kwargs["n_mppi_upright"] > 0:
+        print(f"Collecting {kwargs['n_mppi_upright']} MPPI rollouts seeded near upright...")
+        rollouts += collect_mppi_upright_rollouts(
+            n_rollouts=kwargs["n_mppi_upright"],
+            rollout_len=rollout_len,
+            img_size=kwargs["img_size"],
+            damping=kwargs["damping"],
+            drag=kwargs["drag"],
+            theta_range=kwargs["mppi_theta_range"],
+            theta_dot_range=kwargs["mppi_dot_range"],
+            dither_std=kwargs["mppi_dither"],
+        )
     rollout_cache_path = run_dir / "rollout_cache.pt"
     torch.save(rollouts, rollout_cache_path)
     print(f"Saved rollout cache ({len(rollouts)} rollouts x {rollout_len} steps) to {rollout_cache_path}")
