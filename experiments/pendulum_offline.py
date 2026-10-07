@@ -786,6 +786,36 @@ def _hsic_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _parse_contrastive_offsets(spec: str) -> tuple[int, ...]:
+    """'-3,-2,0,2,3' -> (1, -1, -3, -2, 0, 2, 3).
+
+    +1 (the positive) is always first and -1 (the momentum-flipped negative)
+    is always included, regardless of what the spec says.
+    """
+    extra = [int(s) for s in spec.split(",") if s.strip()]
+    extra = [k for k in dict.fromkeys(extra) if k not in (1, -1)]
+    return (1, -1, *extra)
+
+
+def _contrastive_next_frame_loss(
+    model: TemporalAutoencoder,
+    h_curr: torch.Tensor,
+    actions: torch.Tensor,
+    frames: torch.Tensor,
+    offsets: tuple[int, ...],
+    detach_q: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """InfoNCE next-frame loss (see NextFrameCritic) for anchors h_curr (B, T, D).
+
+    detach_q stops the critic's gradient into the q-half of h so the
+    pressure lands on the momentum half.
+    """
+    if detach_q:
+        q_dim = model.latent_dim // 2
+        h_curr = torch.cat([h_curr[..., :q_dim].detach(), h_curr[..., q_dim:]], dim=-1)
+    return model.next_frame_critic.nce_loss(h_curr, actions, frames, offsets)
+
+
 def _train_epoch_phase1(
     model: TemporalAutoencoder,
     loader: DataLoader,
@@ -802,6 +832,9 @@ def _train_epoch_phase1(
     deterministic: bool = False,
     time_reversal_weight: float = 0.0,
     mi_weight: float = 0.0,
+    contrastive_weight: float = 0.0,
+    contrastive_offsets: tuple[int, ...] = (1, -1, -3, -2, 0, 2, 3),
+    contrastive_detach_q: bool = False,
 ) -> dict[str, float]:
     """Reconstruction-only epoch: encoder + f_psi + decoder, no Hamiltonian.
 
@@ -834,9 +867,15 @@ def _train_epoch_phase1(
     attacks position information smuggled into p in a way that happens to
     still be antisymmetric (e.g. theta_dot * f(theta)) by penalising any
     detectable statistical dependence between the two halves, linear or not.
+
+    contrastive_weight > 0 adds an InfoNCE next-frame critic alongside (not
+    instead of) the next-frame decoder: given (h_t, a_t) it must pick the
+    true frame_{t+1} out of same-trajectory frames t+k (see NextFrameCritic).
+    The model must have been built with contrastive=True.
     """
     model.train()
     total_recon = total_recon_next = total_kl = total_temporal = total_sparsity = total_gate = total_time_reversal = total_mi = total_loss = 0.0
+    total_nce = total_nce_acc = 0.0
 
     for frames, actions, _ in loader:
         frames = frames.to(device)    # (B, T+1, C, H, W)
@@ -884,6 +923,15 @@ def _train_epoch_phase1(
             kl = _kl(mu_all, logvar_all)
 
         loss = recon + recon_next + kl_weight * kl
+
+        if contrastive_weight > 0:
+            nce, nce_acc = _contrastive_next_frame_loss(
+                model, z_all[:, :-1], a_curr.reshape(B_size, T_full), frames,
+                contrastive_offsets, contrastive_detach_q,
+            )
+            loss = loss + contrastive_weight * nce
+            total_nce = total_nce + nce.detach()
+            total_nce_acc = total_nce_acc + nce_acc
 
         # Time-reversal augmentation: re-encode the frames in reverse order.
         # recon_rev is plain data augmentation (same current-frame
@@ -992,6 +1040,8 @@ def _train_epoch_phase1(
         "phase1/gate_l0": float(total_gate) / n,
         "phase1/time_reversal": float(total_time_reversal) / n,
         "phase1/mi": float(total_mi) / n,
+        "phase1/nce": float(total_nce) / n,
+        "phase1/nce_acc": float(total_nce_acc) / n,
         "phase1/effective_dim": (
             model.encoder.gate.effective_dim() if model.encoder.gate is not None else float("nan")
         ),
@@ -1877,6 +1927,9 @@ def _train_epoch_joint(
     huber_delta: float = 0.0,
     decode_stride: int = 1,
     mi_weight: float = 0.0,
+    contrastive_weight: float = 0.0,
+    contrastive_offsets: tuple[int, ...] = (1, -1, -3, -2, 0, 2, 3),
+    contrastive_detach_q: bool = False,
 ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor]:
     """One epoch of blended autoencoder + Hamiltonian-dynamics training.
 
@@ -1920,6 +1973,8 @@ def _train_epoch_joint(
     _energy_balance_loss), evaluated on this batch's own q_win/p_win.
     mi_weight > 0 adds the HSIC dependence penalty between mu_all's q/p
     halves (see _hsic_loss and _train_epoch_phase1's docstring).
+    contrastive_weight > 0 adds the InfoNCE next-frame critic loss (see
+    _train_epoch_phase1's docstring).
     """
     model, dyn_model = world_model.autoencoder, world_model.dynamics
     model.train()
@@ -1931,6 +1986,7 @@ def _train_epoch_joint(
     total_tf = total_cl = total_logdet_reg = total_dynamics = total_loss = 0.0
     total_time_reversal = total_energy_balance = total_grad_H_norm = total_mi = 0.0
     total_pix_cl = 0.0
+    total_nce = total_nce_acc = 0.0
     total_q_var = total_p_var = None
 
     for frames, actions, _ in loader:
@@ -1968,6 +2024,15 @@ def _train_epoch_joint(
         recon_next = F.mse_loss(pred_next, frames[:, 1:])
 
         loss = recon + recon_next + kl_weight * kl
+
+        if contrastive_weight > 0:
+            nce, nce_acc = _contrastive_next_frame_loss(
+                model, z_all[:, :-1], actions, frames,
+                contrastive_offsets, contrastive_detach_q,
+            )
+            loss = loss + contrastive_weight * nce
+            total_nce = total_nce + nce.detach()
+            total_nce_acc = total_nce_acc + nce_acc
 
         # Time-reversal augmentation (see _train_epoch_phase1's docstring):
         # re-encode the frames in reverse order. recon_rev is plain data
@@ -2149,6 +2214,8 @@ def _train_epoch_joint(
         "joint/energy_balance": float(total_energy_balance) / n,
         "joint/grad_H_norm": float(total_grad_H_norm) / n,
         "joint/mi": float(total_mi) / n,
+        "joint/nce": float(total_nce) / n,
+        "joint/nce_acc": float(total_nce_acc) / n,
     }
     return metrics, total_q_var / n, total_p_var / n
 
@@ -3027,6 +3094,30 @@ def cli():
     pass
 
 
+def _contrastive_options(fn):
+    """Shared click options for the InfoNCE next-frame critic (phase1, joint)."""
+    for opt in reversed([
+        click.option("--contrastive-weight", type=float, default=0.0, show_default=True,
+                     help="Weight on the InfoNCE next-frame critic (0 disables it "
+                          "and doesn't build the critic). Runs alongside the "
+                          "next-frame decoder: given (h_t, a_t) it must pick the "
+                          "true frame_{t+1} out of same-trajectory frames, "
+                          "giving the momentum half of h a sharper signal than "
+                          "pixel MSE"),
+        click.option("--contrastive-offsets", type=str, default="-3,-2,0,2,3", show_default=True,
+                     help="Extra candidate offsets k (frame t+k) used as negatives. "
+                          "+1 (positive) and -1 (momentum-flipped negative) are "
+                          "always included"),
+        click.option("--contrastive-temp", type=float, default=0.1, show_default=True,
+                     help="Initial critic temperature (learned thereafter)"),
+        click.option("--contrastive-detach-q", is_flag=True, default=False, show_default=True,
+                     help="Stop the critic's gradient into the q-half of h so "
+                          "it only shapes the momentum half"),
+    ]):
+        fn = opt(fn)
+    return fn
+
+
 @cli.command("phase1")
 @config_option
 @click.option("--resume-from", type=str, default=None,
@@ -3143,6 +3234,7 @@ def cli():
 @click.option("--val-max-steps", type=int, default=0, show_default=True,
               help="Steps per val episode (0 = 2x --max-steps)")
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
+@_contrastive_options
 def phase1_cmd(**kwargs):
     """Phase 1: train the LSTM autoencoder (encoder + f_psi + decoder)."""
     assert kwargs["img_size"] % 8 == 0
@@ -3224,6 +3316,8 @@ def phase1_cmd(**kwargs):
         num_layers=kwargs["lstm_layers"],
         encoder_type=kwargs["encoder_type"],
         use_gate=kwargs["use_gate"],
+        contrastive=kwargs["contrastive_weight"] > 0,
+        contrastive_temp=kwargs["contrastive_temp"],
     ).to(device)
     print(f"Phase 1 model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -3282,6 +3376,9 @@ def phase1_cmd(**kwargs):
             deterministic=kwargs["deterministic"],
             time_reversal_weight=kwargs["time_reversal_weight"],
             mi_weight=kwargs["mi_weight"],
+            contrastive_weight=kwargs["contrastive_weight"],
+            contrastive_offsets=_parse_contrastive_offsets(kwargs["contrastive_offsets"]),
+            contrastive_detach_q=kwargs["contrastive_detach_q"],
         )
         metrics["phase1/gate_weight_effective"] = gate_weight_epoch
 
@@ -4480,6 +4577,7 @@ def phase3_cmd(**kwargs):
               help="Steps per val episode (0 = 2x --max-steps)")
 @click.option("--val-context-frames", type=int, default=5, show_default=True)
 @click.option("--checkpoint-every", type=int, default=10, show_default=True)
+@_contrastive_options
 def joint_cmd(**kwargs):
     """Joint: train the autoencoder and Hamiltonian dynamics together, with a
     linear curriculum ramping the dynamics loss weight from 0 up to
@@ -4578,6 +4676,8 @@ def joint_cmd(**kwargs):
         control_dim=1,
         num_layers=kwargs["lstm_layers"],
         encoder_type=kwargs["encoder_type"],
+        contrastive=kwargs["contrastive_weight"] > 0,
+        contrastive_temp=kwargs["contrastive_temp"],
     ).to(device)
     dyn_model = HamiltonianFlowModel(
         latent_dim=kwargs["latent_dim"],
@@ -4670,6 +4770,9 @@ def joint_cmd(**kwargs):
             huber_delta=kwargs["huber_delta"],
             decode_stride=kwargs["decode_stride"],
             mi_weight=kwargs["mi_weight"],
+            contrastive_weight=kwargs["contrastive_weight"],
+            contrastive_offsets=_parse_contrastive_offsets(kwargs["contrastive_offsets"]),
+            contrastive_detach_q=kwargs["contrastive_detach_q"],
         )
 
         alpha = kwargs["ema_alpha"]

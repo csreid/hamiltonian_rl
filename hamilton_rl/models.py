@@ -779,6 +779,94 @@ class NextFrameDecoder(nn.Module):
         return _leaky_hard_sigmoid(self.out_conv(x))
 
 
+class NextFrameCritic(nn.Module):
+    """InfoNCE critic: scores whether a candidate frame is the true frame_{t+1}.
+
+    A pixel-MSE next-frame decoder gets almost no gradient on the momentum
+    half of h, since adjacent frames differ very little. This critic instead
+    asks "which of these frames follows (h_t, a_t)?" with hard negatives
+    drawn from the same trajectory, which can only be answered by using the
+    velocity information in h.
+
+    Candidates for the anchor at time t are frames t+k for a fixed offset
+    list ``ks``; ``ks[0]`` must be +1 (the positive). Offset -1 is the
+    momentum-flipped negative: for undamped dynamics, frame t-1 is where the
+    system would be one step on if p were reversed. With damping it is
+    still a hard negative (same position neighbourhood, opposite direction).
+    Candidates that fall outside the window are masked out.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        control_dim: int = 1,
+        img_ch: int = 3,
+        img_size: int = 64,
+        embed_dim: int = 128,
+        hidden_dim: int = 256,
+        init_temp: float = 0.1,
+    ):
+        super().__init__()
+        self.proj_h = nn.Sequential(
+            nn.Linear(latent_dim + control_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.frame_cnn = FlexFrameCNN(img_ch=img_ch, feat_dim=hidden_dim, img_size=img_size)
+        self.proj_f = nn.Linear(hidden_dim, embed_dim)
+        self.log_scale = nn.Parameter(torch.tensor(math.log(1.0 / init_temp)))
+
+    def embed_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """(B, T1, C, H, W) -> (B, T1, E), L2-normalised."""
+        B, T1 = frames.shape[:2]
+        f = self.proj_f(self.frame_cnn(frames.reshape(B * T1, *frames.shape[2:])))
+        return F.normalize(f.reshape(B, T1, -1), dim=-1)
+
+    def embed_anchor(self, h: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """(B, T, D), (B, T) or (B, T, A) -> (B, T, E), L2-normalised."""
+        if a.dim() == 2:
+            a = a.unsqueeze(-1)
+        return F.normalize(self.proj_h(torch.cat([h, a], dim=-1)), dim=-1)
+
+    def nce_loss(
+        self,
+        h: torch.Tensor,
+        a: torch.Tensor,
+        frames: torch.Tensor,
+        offsets: tuple[int, ...] = (1, -1),
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """InfoNCE over same-trajectory candidates.
+
+        Args:
+            h:       (B, T, D) latents for anchors t = 0..T-1
+            a:       (B, T) or (B, T, A) actions at those anchors
+            frames:  (B, T+1, C, H, W) the full window; frame t+1 is the positive
+            offsets: candidate offsets k; offsets[0] must be +1
+
+        Returns:
+            (loss, top1_accuracy), both scalar tensors.
+        """
+        assert offsets[0] == 1, "offsets[0] is the positive and must be +1"
+        B, T = h.shape[:2]
+        anchor = self.embed_anchor(h, a)                       # (B, T, E)
+        cand_all = self.embed_frames(frames)                   # (B, T+1, E)
+
+        ks = torch.tensor(offsets, device=h.device)            # (K,)
+        idx = torch.arange(T, device=h.device)[:, None] + ks[None]   # (T, K)
+        valid = (idx >= 0) & (idx <= T)                        # (T, K)
+        cand = cand_all[:, idx.clamp(0, T)]                    # (B, T, K, E)
+
+        scale = self.log_scale.clamp(max=math.log(100.0)).exp()
+        logits = scale * torch.einsum("bte,btke->btk", anchor, cand)
+        logits = logits.masked_fill(~valid[None], float("-inf"))
+
+        target = torch.zeros(B * T, dtype=torch.long, device=h.device)
+        flat = logits.reshape(B * T, -1)
+        loss = F.cross_entropy(flat, target)
+        acc = (flat.argmax(dim=-1) == target).float().mean()
+        return loss, acc.detach()
+
+
 # ---------------------------------------------------------------------------
 # TemporalAutoencoder — Phase 1: reconstruction-only model
 # ---------------------------------------------------------------------------
@@ -820,6 +908,8 @@ class TemporalAutoencoder(nn.Module):
         num_layers: int = 1,
         encoder_type: str = "lstm",
         use_gate: bool = False,
+        contrastive: bool = False,
+        contrastive_temp: float = 0.1,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -833,6 +923,8 @@ class TemporalAutoencoder(nn.Module):
             "num_layers": num_layers,
             "encoder_type": encoder_type,
             "use_gate": use_gate,
+            "contrastive": contrastive,
+            "contrastive_temp": contrastive_temp,
         }
         q_dim = latent_dim // 2
 
@@ -862,6 +954,17 @@ class TemporalAutoencoder(nn.Module):
         self.next_frame_decoder = NextFrameDecoder(
             latent_dim=latent_dim, control_dim=control_dim,
             pos_ch=pos_ch, img_ch=img_ch, img_size=img_size,
+        )
+        # Optional InfoNCE critic giving h_p a sharper momentum signal than
+        # next-frame pixel MSE (see NextFrameCritic). Phase 1 / joint only;
+        # nothing downstream of the encoder uses it.
+        self.next_frame_critic = (
+            NextFrameCritic(
+                latent_dim=latent_dim, control_dim=control_dim, img_ch=img_ch,
+                img_size=img_size, init_temp=contrastive_temp,
+            )
+            if contrastive
+            else None
         )
 
     @property
